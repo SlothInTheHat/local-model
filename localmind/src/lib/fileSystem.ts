@@ -1,0 +1,214 @@
+export interface FileEntry {
+  name: string;
+  path: string;
+  kind: "file" | "directory";
+  children?: FileEntry[];
+}
+
+export interface WorkspaceResult {
+  handle: FileSystemDirectoryHandle;
+  path: string | null;  // real OS path, only in Tauri mode
+  name: string;
+}
+
+// Tauri invoke shim
+async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const tauri = (window as unknown as Record<string, unknown>).__TAURI__;
+  if (!tauri) throw new Error("not in tauri");
+  const core = (tauri as Record<string, unknown>).core as {
+    invoke?: (cmd: string, args?: unknown) => Promise<T>;
+  };
+  if (typeof core?.invoke !== "function") throw new Error("no invoke");
+  return core.invoke(cmd, args);
+}
+
+// File System Access API — not in all TypeScript DOM lib versions
+type ShowDirectoryPickerOpts = { mode?: "read" | "readwrite" };
+const showDirectoryPicker = (opts?: ShowDirectoryPickerOpts): Promise<FileSystemDirectoryHandle> =>
+  (window as unknown as { showDirectoryPicker: (o?: ShowDirectoryPickerOpts) => Promise<FileSystemDirectoryHandle> })
+    .showDirectoryPicker(opts);
+
+/**
+ * Open a workspace folder. In Tauri mode uses a native dialog to get the real
+ * OS path (needed for terminal sandboxing). In browser mode falls back to the
+ * File System Access API (no real path, but file tools still work via dirHandle).
+ */
+export async function openWorkspace(): Promise<WorkspaceResult> {
+  // Try Tauri native dialog first — gives us the real path
+  try {
+    const osPath = await tauriInvoke<string | null>("open_workspace_dialog");
+    if (osPath) {
+      // Also open the browser-facing handle for file tools
+      const handle = await showDirectoryPicker({ mode: "readwrite" });
+      const name = osPath.split(/[\\/]/).filter(Boolean).pop() ?? handle.name;
+      return { handle, path: osPath, name };
+    }
+    // User cancelled the native dialog — fall through to browser picker
+  } catch {
+    // Not in Tauri mode or dialog failed — fall through
+  }
+
+  // Browser fallback
+  const handle = await showDirectoryPicker({ mode: "readwrite" });
+  return { handle, path: null, name: handle.name };
+}
+
+/** @deprecated use openWorkspace() */
+export async function openDirectory(): Promise<FileSystemDirectoryHandle> {
+  return showDirectoryPicker({ mode: "readwrite" });
+}
+
+async function resolveDirHandle(
+  root: FileSystemDirectoryHandle,
+  parts: string[]
+): Promise<FileSystemDirectoryHandle | null> {
+  let handle: FileSystemDirectoryHandle = root;
+  for (const part of parts) {
+    try {
+      handle = await handle.getDirectoryHandle(part, { create: false });
+    } catch {
+      return null;
+    }
+  }
+  return handle;
+}
+
+export async function readFileFromHandle(
+  dirHandle: FileSystemDirectoryHandle,
+  path: string
+): Promise<string> {
+  const parts = path.split("/").filter(Boolean);
+  const fileName = parts.pop();
+  if (!fileName) throw new Error("Empty file path");
+
+  let parentHandle = dirHandle;
+  if (parts.length > 0) {
+    const resolved = await resolveDirHandle(dirHandle, parts);
+    if (!resolved) throw new Error(`Directory not found: ${parts.join("/")}`);
+    parentHandle = resolved;
+  }
+
+  const fileHandle = await parentHandle.getFileHandle(fileName, { create: false });
+  const file = await fileHandle.getFile();
+  return file.text();
+}
+
+export async function writeFileToHandle(
+  dirHandle: FileSystemDirectoryHandle,
+  path: string,
+  content: string
+): Promise<void> {
+  const parts = path.split("/").filter(Boolean);
+  const fileName = parts.pop();
+  if (!fileName) throw new Error("Empty file path");
+
+  let parentHandle = dirHandle;
+  if (parts.length > 0) {
+    let cursor: FileSystemDirectoryHandle = dirHandle;
+    for (const part of parts) {
+      cursor = await cursor.getDirectoryHandle(part, { create: true });
+    }
+    parentHandle = cursor;
+  }
+
+  const fileHandle = await parentHandle.getFileHandle(fileName, { create: true });
+  const writable = await fileHandle.createWritable();
+  await writable.write(content);
+  await writable.close();
+}
+
+async function buildEntries(
+  handle: FileSystemDirectoryHandle,
+  basePath: string,
+  depth: number,
+  maxDepth: number
+): Promise<FileEntry[]> {
+  const entries: FileEntry[] = [];
+  for await (const [name, entry] of handle.entries()) {
+    const entryPath = basePath ? `${basePath}/${name}` : name;
+    if (entry.kind === "directory" && depth < maxDepth) {
+      const children = await buildEntries(
+        entry as FileSystemDirectoryHandle,
+        entryPath,
+        depth + 1,
+        maxDepth
+      );
+      entries.push({ name, path: entryPath, kind: "directory", children });
+    } else {
+      entries.push({ name, path: entryPath, kind: entry.kind });
+    }
+  }
+  entries.sort((a, b) => {
+    // Directories first, then files
+    if (a.kind !== b.kind) return a.kind === "directory" ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+  return entries;
+}
+
+export async function listDirectory(
+  dirHandle: FileSystemDirectoryHandle,
+  maxDepth = 3
+): Promise<FileEntry[]> {
+  return buildEntries(dirHandle, "", 0, maxDepth);
+}
+
+export async function fileExists(
+  dirHandle: FileSystemDirectoryHandle,
+  path: string
+): Promise<boolean> {
+  const parts = path.split("/").filter(Boolean);
+  const fileName = parts.pop();
+  if (!fileName) return false;
+  let parentHandle = dirHandle;
+  if (parts.length > 0) {
+    const resolved = await resolveDirHandle(dirHandle, parts);
+    if (!resolved) return false;
+    parentHandle = resolved;
+  }
+  try {
+    await parentHandle.getFileHandle(fileName, { create: false });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function backupFile(
+  dirHandle: FileSystemDirectoryHandle,
+  path: string,
+  content: string
+): Promise<string> {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)
+    + "_" + Math.random().toString(16).slice(2, 6);
+  const backupPath = `.localmind-backups/${timestamp}/${path}`;
+  await writeFileToHandle(dirHandle, backupPath, content);
+  return backupPath;
+}
+
+export async function deleteEntry(
+  dirHandle: FileSystemDirectoryHandle,
+  path: string
+): Promise<void> {
+  const parts = path.split("/").filter(Boolean);
+  const name = parts.pop();
+  if (!name) throw new Error("Empty path");
+  let parentHandle = dirHandle;
+  if (parts.length > 0) {
+    const resolved = await resolveDirHandle(dirHandle, parts);
+    if (!resolved) throw new Error(`Parent directory not found: ${parts.join("/")}`);
+    parentHandle = resolved;
+  }
+  await parentHandle.removeEntry(name, { recursive: true });
+}
+
+export async function createDirectory(
+  dirHandle: FileSystemDirectoryHandle,
+  path: string
+): Promise<void> {
+  const parts = path.split("/").filter(Boolean);
+  let cursor: FileSystemDirectoryHandle = dirHandle;
+  for (const part of parts) {
+    cursor = await cursor.getDirectoryHandle(part, { create: true });
+  }
+}

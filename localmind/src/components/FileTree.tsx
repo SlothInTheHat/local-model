@@ -1,0 +1,405 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+import {
+  ChevronRight, ChevronDown, Folder, FileText, FolderOpen,
+  FilePlus, FolderPlus, Pencil, Trash2,
+} from "lucide-react";
+import { toast } from "sonner";
+import { cn } from "./ui/utils";
+import { Button } from "./ui/button";
+import {
+  listDirectory, writeFileToHandle, deleteEntry, createDirectory,
+  readFileFromHandle,
+  type FileEntry,
+} from "../lib/fileSystem";
+
+interface Props {
+  dirHandle: FileSystemDirectoryHandle | null;
+  onOpenFile: (handle: FileSystemFileHandle, path: string) => void;
+  onOpenDir?: () => void;
+  refreshKey?: number;
+  onRefresh?: () => void;
+}
+
+interface PendingCreate {
+  parentPath: string;
+  kind: "file" | "directory";
+}
+
+// ─── Inline create input ──────────────────────────────────────────────────────
+
+function InlineCreateInput({
+  dirHandle,
+  parentPath,
+  kind,
+  depth,
+  onDone,
+}: {
+  dirHandle: FileSystemDirectoryHandle;
+  parentPath: string;
+  kind: "file" | "directory";
+  depth: number;
+  onDone: () => void;
+}) {
+  const [value, setValue] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+  const paddingLeft = depth * 12 + 8;
+
+  useEffect(() => {
+    setTimeout(() => inputRef.current?.focus(), 0);
+  }, []);
+
+  async function commit() {
+    const name = value.trim();
+    if (!name || name.includes("/") || name === "." || name === "..") {
+      onDone();
+      return;
+    }
+    const fullPath = parentPath ? `${parentPath}/${name}` : name;
+    try {
+      if (kind === "file") {
+        await writeFileToHandle(dirHandle, fullPath, "");
+      } else {
+        await createDirectory(dirHandle, fullPath);
+      }
+      onDone();
+    } catch (err) {
+      toast.error(`Could not create ${kind}: ${(err as Error).message}`);
+      onDone();
+    }
+  }
+
+  return (
+    <div style={{ paddingLeft }} className="flex items-center gap-1.5 py-0.5 pr-2">
+      {kind === "file"
+        ? <FileText className="size-3.5 shrink-0 text-muted-foreground" />
+        : <Folder className="size-3.5 shrink-0 text-amber-500" />
+      }
+      <input
+        ref={inputRef}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onBlur={() => void commit()}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") { e.preventDefault(); void commit(); }
+          if (e.key === "Escape") onDone();
+        }}
+        className="flex-1 text-xs px-1 py-0.5 rounded border border-ring bg-background text-foreground outline-none focus:ring-1 focus:ring-ring"
+        placeholder={kind === "file" ? "filename.ts" : "folder-name"}
+      />
+    </div>
+  );
+}
+
+// ─── Tree node ────────────────────────────────────────────────────────────────
+
+interface TreeNodeProps {
+  entry: FileEntry;
+  dirHandle: FileSystemDirectoryHandle;
+  onOpenFile: (handle: FileSystemFileHandle, path: string) => void;
+  depth: number;
+  pendingCreate: PendingCreate | null;
+  onPendingCreate: (p: PendingCreate | null) => void;
+  onRefresh: () => void;
+}
+
+function TreeNode({
+  entry, dirHandle, onOpenFile, depth,
+  pendingCreate, onPendingCreate, onRefresh,
+}: TreeNodeProps) {
+  const [expanded, setExpanded] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [renameValue, setRenameValue] = useState(entry.name);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const renameInputRef = useRef<HTMLInputElement>(null);
+  const paddingLeft = depth * 12 + 8;
+
+  // Auto-expand when a create is pending inside this folder
+  useEffect(() => {
+    if (pendingCreate?.parentPath === entry.path) setExpanded(true);
+  }, [pendingCreate, entry.path]);
+
+  async function handleClick() {
+    if (renaming) return;
+    if (entry.kind === "directory") {
+      setExpanded((v) => !v);
+    } else {
+      try {
+        const parts = entry.path.split("/").filter(Boolean);
+        const fileName = parts.pop()!;
+        let parent: FileSystemDirectoryHandle = dirHandle;
+        for (const part of parts) {
+          parent = await parent.getDirectoryHandle(part, { create: false });
+        }
+        const fileHandle = await parent.getFileHandle(fileName, { create: false });
+        onOpenFile(fileHandle, entry.path);
+      } catch (err) {
+        toast.error(`Could not open file: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  function startRename() {
+    setRenameValue(entry.name);
+    setRenaming(true);
+    setTimeout(() => renameInputRef.current?.select(), 0);
+  }
+
+  async function commitRename() {
+    const newName = renameValue.trim();
+    setRenaming(false);
+    if (!newName || newName === entry.name) return;
+    if (entry.kind === "directory") {
+      toast.error("Directory rename not supported — move files manually");
+      return;
+    }
+    const parts = entry.path.split("/");
+    parts[parts.length - 1] = newName;
+    const newPath = parts.join("/");
+    try {
+      const content = await readFileFromHandle(dirHandle, entry.path);
+      await writeFileToHandle(dirHandle, newPath, content);
+      await deleteEntry(dirHandle, entry.path);
+      onRefresh();
+    } catch (err) {
+      toast.error(`Rename failed: ${(err as Error).message}`);
+    }
+  }
+
+  async function handleDelete() {
+    if (!confirmDelete) { setConfirmDelete(true); return; }
+    try {
+      await deleteEntry(dirHandle, entry.path);
+      onRefresh();
+      toast.success(`Deleted ${entry.name}`);
+    } catch (err) {
+      toast.error(`Delete failed: ${(err as Error).message}`);
+    }
+  }
+
+  const showCreateInside = entry.kind === "directory" && expanded
+    && pendingCreate?.parentPath === entry.path;
+
+  return (
+    <div>
+      {/* Row */}
+      <div
+        className="group relative flex items-center"
+        onMouseLeave={() => setConfirmDelete(false)}
+      >
+        <button
+          type="button"
+          onClick={handleClick}
+          style={{ paddingLeft }}
+          className={cn(
+            "flex-1 flex items-center gap-1.5 py-0.5 pr-1 text-xs rounded hover:bg-accent text-foreground/80 hover:text-foreground transition-colors text-left min-w-0"
+          )}
+        >
+          {entry.kind === "directory" ? (
+            <>
+              {expanded
+                ? <ChevronDown className="size-3 shrink-0 text-muted-foreground" />
+                : <ChevronRight className="size-3 shrink-0 text-muted-foreground" />
+              }
+              {expanded
+                ? <FolderOpen className="size-3.5 shrink-0 text-amber-500" />
+                : <Folder className="size-3.5 shrink-0 text-amber-500" />
+              }
+            </>
+          ) : (
+            <>
+              <span className="size-3 shrink-0" />
+              <FileText className="size-3.5 shrink-0 text-muted-foreground" />
+            </>
+          )}
+
+          {renaming ? (
+            <input
+              ref={renameInputRef}
+              value={renameValue}
+              onClick={(e) => e.stopPropagation()}
+              onChange={(e) => setRenameValue(e.target.value)}
+              onBlur={() => void commitRename()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") { e.preventDefault(); void commitRename(); }
+                if (e.key === "Escape") setRenaming(false);
+              }}
+              className="flex-1 text-xs px-1 py-0 rounded border border-ring bg-background text-foreground outline-none focus:ring-1 focus:ring-ring"
+            />
+          ) : (
+            <span className="truncate">{entry.name}</span>
+          )}
+        </button>
+
+        {/* Hover actions */}
+        {!renaming && (
+          <div className="opacity-0 group-hover:opacity-100 flex items-center gap-0.5 pr-1 shrink-0">
+            {entry.kind === "directory" && (
+              <>
+                <button
+                  type="button"
+                  title="New file inside"
+                  onClick={(e) => { e.stopPropagation(); setExpanded(true); onPendingCreate({ parentPath: entry.path, kind: "file" }); }}
+                  className="size-4 flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-accent"
+                >
+                  <FilePlus className="size-3" />
+                </button>
+                <button
+                  type="button"
+                  title="New folder inside"
+                  onClick={(e) => { e.stopPropagation(); setExpanded(true); onPendingCreate({ parentPath: entry.path, kind: "directory" }); }}
+                  className="size-4 flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-accent"
+                >
+                  <FolderPlus className="size-3" />
+                </button>
+              </>
+            )}
+            <button
+              type="button"
+              title="Rename"
+              onClick={(e) => { e.stopPropagation(); startRename(); }}
+              className="size-4 flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-accent"
+            >
+              <Pencil className="size-3" />
+            </button>
+            <button
+              type="button"
+              title={confirmDelete ? "Click again to confirm" : "Delete"}
+              onClick={(e) => { e.stopPropagation(); void handleDelete(); }}
+              className={cn(
+                "size-4 flex items-center justify-center rounded hover:bg-accent",
+                confirmDelete ? "text-destructive" : "text-muted-foreground hover:text-destructive"
+              )}
+            >
+              <Trash2 className="size-3" />
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Children */}
+      {entry.kind === "directory" && expanded && (
+        <div>
+          {showCreateInside && (
+            <InlineCreateInput
+              dirHandle={dirHandle}
+              parentPath={entry.path}
+              kind={pendingCreate!.kind}
+              depth={depth + 1}
+              onDone={() => { onPendingCreate(null); onRefresh(); }}
+            />
+          )}
+          {entry.children?.map((child) => (
+            <TreeNode
+              key={child.path}
+              entry={child}
+              dirHandle={dirHandle}
+              onOpenFile={onOpenFile}
+              depth={depth + 1}
+              pendingCreate={pendingCreate}
+              onPendingCreate={onPendingCreate}
+              onRefresh={onRefresh}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── FileTree root ────────────────────────────────────────────────────────────
+
+export function FileTree({ dirHandle, onOpenFile, onOpenDir, refreshKey, onRefresh }: Props) {
+  const [entries, setEntries] = useState<FileEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [pendingCreate, setPendingCreate] = useState<PendingCreate | null>(null);
+
+  const refresh = useCallback(() => {
+    if (!dirHandle) { setEntries([]); return; }
+    setLoading(true);
+    setError(null);
+    listDirectory(dirHandle, 3)
+      .then(setEntries)
+      .catch((err: Error) => setError(err.message))
+      .finally(() => setLoading(false));
+  }, [dirHandle]);
+
+  useEffect(() => { refresh(); }, [refresh, refreshKey]);
+
+  function handleMutationDone() {
+    refresh();
+    onRefresh?.();
+    setPendingCreate(null);
+  }
+
+  if (!dirHandle) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full gap-3 p-4 text-center">
+        <FolderOpen className="size-8 text-muted-foreground" />
+        <p className="text-xs text-muted-foreground">No workspace open</p>
+        {onOpenDir && (
+          <Button size="sm" variant="outline" onClick={onOpenDir} className="text-xs">
+            Open workspace
+          </Button>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="h-full overflow-y-auto">
+      {/* Header */}
+      <div className="px-2 py-2 border-b flex items-center gap-1">
+        <FolderOpen className="size-3.5 text-amber-500 shrink-0" />
+        <span className="text-xs font-medium truncate text-foreground flex-1">{dirHandle.name}</span>
+        <button
+          type="button"
+          title="New file"
+          onClick={() => setPendingCreate({ parentPath: "", kind: "file" })}
+          className="size-5 flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-accent shrink-0"
+        >
+          <FilePlus className="size-3.5" />
+        </button>
+        <button
+          type="button"
+          title="New folder"
+          onClick={() => setPendingCreate({ parentPath: "", kind: "directory" })}
+          className="size-5 flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-accent shrink-0"
+        >
+          <FolderPlus className="size-3.5" />
+        </button>
+      </div>
+
+      {loading && <p className="text-xs text-muted-foreground p-3">Loading...</p>}
+      {error && <p className="text-xs text-destructive p-3">{error}</p>}
+
+      <div className="py-1">
+        {/* Root-level inline create */}
+        {pendingCreate?.parentPath === "" && (
+          <InlineCreateInput
+            dirHandle={dirHandle}
+            parentPath=""
+            kind={pendingCreate.kind}
+            depth={0}
+            onDone={handleMutationDone}
+          />
+        )}
+        {!loading && !error && entries.length === 0 && !pendingCreate && (
+          <p className="text-xs text-muted-foreground p-3">Empty directory</p>
+        )}
+        {entries.map((entry) => (
+          <TreeNode
+            key={entry.path}
+            entry={entry}
+            dirHandle={dirHandle}
+            onOpenFile={onOpenFile}
+            depth={0}
+            pendingCreate={pendingCreate}
+            onPendingCreate={setPendingCreate}
+            onRefresh={handleMutationDone}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}

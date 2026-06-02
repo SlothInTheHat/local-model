@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tauri + React + Typescript</title>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <div id="startup-check" style="position:fixed;top:8px;right:8px;background:#1a1a2e;color:#e0e0ff;padding:8px 12px;border-radius:6px;font:12px monospace;z-index:99999">HTML loaded ✓</div>
+    <script>
+      // Non-module inline script — runs even if module loading fails
+      setTimeout(function() {
+        var el = document.getElementById('startup-check');
+        if (el) el.remove();
+      }, 4000);
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
