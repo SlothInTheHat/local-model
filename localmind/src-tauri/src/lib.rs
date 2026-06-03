@@ -1,6 +1,64 @@
 use std::process::Command;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use serde::Serialize;
+
+// ─── PATH augmentation ────────────────────────────────────────────────────────
+
+static EFFECTIVE_PATH: OnceLock<String> = OnceLock::new();
+
+/// Build a PATH that merges system PATH with the user PATH (HKCU\Environment).
+/// On Windows, desktop apps launched outside a terminal only see system PATH,
+/// so git/node/python installed by the user are invisible. We call PowerShell
+/// once, cache the result, and inject it into every spawned command.
+fn effective_path() -> &'static str {
+    EFFECTIVE_PATH.get_or_init(|| {
+        let base = std::env::var("PATH").unwrap_or_default();
+
+        #[cfg(target_os = "windows")]
+        {
+            // 1. Try reading user PATH from the Windows environment registry via PowerShell.
+            if let Ok(out) = Command::new("powershell")
+                .args([
+                    "-NoProfile", "-NonInteractive", "-Command",
+                    "[Environment]::GetEnvironmentVariable('PATH','User')",
+                ])
+                .output()
+            {
+                if out.status.success() {
+                    let user_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !user_path.is_empty() {
+                        return format!("{};{}", user_path, base);
+                    }
+                }
+            }
+
+            // 2. Fallback: prepend well-known tool locations that exist on disk.
+            let username = std::env::var("USERNAME").unwrap_or_default();
+            let candidates = vec![
+                r"C:\Program Files\Git\cmd".to_string(),
+                r"C:\Program Files\Git\bin".to_string(),
+                r"C:\Program Files\nodejs".to_string(),
+                format!(r"C:\Users\{username}\AppData\Roaming\npm"),
+                format!(r"C:\Users\{username}\AppData\Local\Programs\Python\Python313"),
+                format!(r"C:\Users\{username}\AppData\Local\Programs\Python\Python312"),
+                format!(r"C:\Users\{username}\AppData\Local\Programs\Python\Python311"),
+            ];
+            let extra: Vec<String> = candidates
+                .into_iter()
+                .filter(|p| Path::new(p).exists())
+                .collect();
+            if !extra.is_empty() {
+                return format!("{};{}", extra.join(";"), base);
+            }
+        }
+
+        base
+    })
+}
+
+mod mcp;
+use mcp::{mcp_start_server, mcp_stop_server, mcp_send_request};
 
 #[derive(Serialize)]
 pub struct CommandResult {
@@ -17,6 +75,12 @@ pub struct SystemInfo {
     os_version: String,
     cpu_threads: usize,
     hostname: String,
+}
+
+#[derive(Serialize)]
+pub struct GpuInfo {
+    name: String,
+    vram_mb: u64,
 }
 
 /// Open a native folder-picker dialog and return the selected path.
@@ -71,6 +135,7 @@ fn run_command(
     #[cfg(target_os = "windows")]
     let output = Command::new("cmd")
         .args(["/C", &cmd])
+        .env("PATH", effective_path())
         .current_dir(work_dir_str)
         .output()
         .map_err(|e| e.to_string())?;
@@ -78,6 +143,7 @@ fn run_command(
     #[cfg(not(target_os = "windows"))]
     let output = Command::new("sh")
         .args(["-c", &cmd])
+        .env("PATH", effective_path())
         .current_dir(work_dir_str)
         .output()
         .map_err(|e| e.to_string())?;
@@ -174,6 +240,124 @@ fn os_version_string() -> String {
     }
 }
 
+/// Return GPU name and VRAM using native OS queries.
+#[tauri::command]
+fn get_gpu_info() -> Vec<GpuInfo> {
+    query_gpu_info()
+}
+
+#[cfg(target_os = "windows")]
+fn query_gpu_info() -> Vec<GpuInfo> {
+    let Ok(out) = Command::new("wmic")
+        .args(["path", "win32_VideoController", "get", "AdapterRAM,Name", "/format:csv"])
+        .output()
+    else {
+        return vec![];
+    };
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut gpus = vec![];
+    let mut name_idx: Option<usize> = None;
+    let mut ram_idx: Option<usize> = None;
+    let mut header_done = false;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+
+        let cols: Vec<&str> = line.split(',').collect();
+
+        if !header_done {
+            for (i, col) in cols.iter().enumerate() {
+                match col.trim().to_lowercase().as_str() {
+                    "name" => name_idx = Some(i),
+                    "adapterram" => ram_idx = Some(i),
+                    _ => {}
+                }
+            }
+            header_done = true;
+            continue;
+        }
+
+        let name = name_idx
+            .and_then(|i| cols.get(i))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        if name.is_empty() { continue; }
+
+        let vram_bytes: u64 = ram_idx
+            .and_then(|i| cols.get(i))
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+
+        gpus.push(GpuInfo { name, vram_mb: vram_bytes / (1024 * 1024) });
+    }
+    gpus
+}
+
+#[cfg(target_os = "macos")]
+fn query_gpu_info() -> Vec<GpuInfo> {
+    let Ok(out) = Command::new("system_profiler")
+        .args(["SPDisplaysDataType"])
+        .output()
+    else {
+        return vec![];
+    };
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut gpus: Vec<GpuInfo> = vec![];
+    let mut current_name = String::new();
+    let mut current_vram_mb: u64 = 0;
+
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(name) = t.strip_prefix("Chipset Model:") {
+            if !current_name.is_empty() {
+                gpus.push(GpuInfo { name: std::mem::take(&mut current_name), vram_mb: current_vram_mb });
+                current_vram_mb = 0;
+            }
+            current_name = name.trim().to_string();
+        } else if t.contains("VRAM") && t.contains(':') {
+            if let Some(val) = t.splitn(2, ':').nth(1).map(str::trim) {
+                if let Some(gb) = val.strip_suffix(" GB").and_then(|s| s.trim().parse::<f64>().ok()) {
+                    current_vram_mb = (gb * 1024.0) as u64;
+                } else if let Some(mb) = val.strip_suffix(" MB").and_then(|s| s.trim().parse::<u64>().ok()) {
+                    current_vram_mb = mb;
+                }
+            }
+        }
+    }
+    if !current_name.is_empty() {
+        gpus.push(GpuInfo { name: current_name, vram_mb: current_vram_mb });
+    }
+    gpus
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn query_gpu_info() -> Vec<GpuInfo> {
+    // Try nvidia-smi first
+    if let Ok(out) = Command::new("nvidia-smi")
+        .args(["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"])
+        .output()
+    {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let gpus: Vec<GpuInfo> = text.lines()
+                .filter_map(|line| {
+                    let mut parts = line.splitn(2, ',');
+                    let name = parts.next()?.trim().to_string();
+                    let vram_mb: u64 = parts.next()?.trim().parse().ok()?;
+                    if name.is_empty() { return None; }
+                    Some(GpuInfo { name, vram_mb })
+                })
+                .collect();
+            if !gpus.is_empty() { return gpus; }
+        }
+    }
+    vec![]
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -183,6 +367,10 @@ pub fn run() {
             run_command,
             get_cwd,
             get_system_info,
+            get_gpu_info,
+            mcp_start_server,
+            mcp_stop_server,
+            mcp_send_request,
         ])
         .setup(|app| {
             #[cfg(debug_assertions)]
