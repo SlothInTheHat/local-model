@@ -43,6 +43,15 @@ const DeepResearch = lazy(() =>
 const StudyMode = lazy(() =>
   import("./components/StudyMode").then((m) => ({ default: m.StudyMode }))
 );
+const ImageEditor = lazy(() =>
+  import("./components/ImageEditor").then((m) => ({ default: m.ImageEditor }))
+);
+const SkillRegistry = lazy(() =>
+  import("./components/SkillRegistry").then((m) => ({ default: m.SkillRegistry }))
+);
+const BenchmarkRunner = lazy(() =>
+  import("./components/BenchmarkRunner").then((m) => ({ default: m.BenchmarkRunner }))
+);
 const AppSettings = lazy(() =>
   import("./components/AppSettings").then((m) => ({ default: m.AppSettings }))
 );
@@ -152,7 +161,7 @@ export default function App() {
     if (!selectedModel) return;
 
     // Model recommendation — only toast if the suggestion is new
-    const rec = recommendModel(text, attachedImages.length > 0, availableModels, selectedModel);
+    const rec = recommendModel(text, attachedImages.length > 0, availableModels, selectedModel, hardware);
     if (rec) {
       const recKey = `${rec.model}:${rec.taskLabel}`;
       if (lastRecRef.current !== recKey) {
@@ -520,6 +529,18 @@ export default function App() {
         ) : view === "study" ? (
           <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
             <StudyMode selectedModel={selectedModel} />
+          </Suspense>
+        ) : view === "image" ? (
+          <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading editor…</div>}>
+            <ImageEditor selectedModel={selectedModel} />
+          </Suspense>
+        ) : view === "skills" ? (
+          <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
+            <SkillRegistry />
+          </Suspense>
+        ) : view === "benchmarks" ? (
+          <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
+            <BenchmarkRunner selectedModel={selectedModel} />
           </Suspense>
         ) : view === "settings" ? (
           <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>

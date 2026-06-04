@@ -20,6 +20,9 @@ import {
   Search,
   Plug,
   CircleUser,
+  ImageIcon,
+  BookMarked,
+  BarChart2,
 } from "lucide-react";
 import { WorkspaceSelector } from "./WorkspaceSelector";
 import { McpSettings } from "./McpSettings";
@@ -77,6 +80,9 @@ export function ChatSidebar({ view, onViewChange, selectedModel, onModelChange, 
     { id: "study", icon: <BookOpen className="size-4" />, label: "Study Mode" },
     { id: "code", icon: <Code2 className="size-4" />, label: "Code Editor" },
     { id: "docs", icon: <FileText className="size-4" />, label: "Doc Editor" },
+    { id: "image", icon: <ImageIcon className="size-4" />, label: "Image Editor" },
+    { id: "skills", icon: <BookMarked className="size-4" />, label: "Skill Registry" },
+    { id: "benchmarks", icon: <BarChart2 className="size-4" />, label: "Benchmarks" },
     { id: "models", icon: <Library className="size-4" />, label: "Model Library" },
     { id: "terminal", icon: <TerminalSquare className="size-4" />, label: "Terminal" },
     { id: "agents", icon: <Bot className="size-4" />, label: "Subagents" },

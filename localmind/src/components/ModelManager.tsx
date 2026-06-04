@@ -6,7 +6,7 @@ import { Input } from "./ui/input";
 import { ScrollArea } from "./ui/scroll-area";
 import { Separator } from "./ui/separator";
 import { pullModel, deleteModel, listModels } from "../lib/ollama";
-import { MODEL_LIBRARY, getCompatibility, type ModelSpec } from "../lib/modelLibrary";
+import { MODEL_LIBRARY, LIBRARY_UPDATED, getCompatibility, type ModelSpec } from "../lib/modelLibrary";
 import { useChatStore } from "../store/chat";
 import { useModelStore } from "../store/models";
 import { HardwareSummary } from "./HardwareSummary";
@@ -138,8 +138,12 @@ export function ModelManager({ onUseModel }: Props) {
   return (
     <div className="flex flex-col h-full overflow-hidden">
       {/* Header */}
-      <div className="h-14 border-b bg-card px-6 flex items-center">
+      <div className="h-14 border-b bg-card px-6 flex items-center justify-between">
         <h2 className="text-sm font-medium">Model Library</h2>
+        <div className="text-[10px] text-muted-foreground flex items-center gap-3">
+          <span>Installed list: <span className="text-green-600 font-medium">live from Ollama</span></span>
+          <span>Catalog: curated · updated {LIBRARY_UPDATED}</span>
+        </div>
       </div>
 
       <ScrollArea className="flex-1 min-h-0">

@@ -4,6 +4,10 @@ import { fileExists, backupFile, readFileFromHandle } from "./fileSystem";
 import { mcpCallTool } from "./mcp";
 import { useMcpStore } from "../store/mcp";
 import { injectGitCredentials, sanitizeOutput } from "../store/profile";
+import { loadSkills, saveSkill } from "./skillEngine";
+import { updateMemorySection } from "./projectMemory";
+import { saveDynamicTool } from "./dynamicTools";
+import type { DynamicToolDef } from "./dynamicTools";
 
 // ─── Tauri invoke shim ───────────────────────────────────────────────────────
 
@@ -262,6 +266,54 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
         message: { type: "string", description: "The commit message." },
       },
       required: ["message"],
+    },
+  },
+  {
+    name: "save_skill",
+    description: "Save a reusable skill (procedural knowledge) to the workspace skill registry at .localmind/skills/. Use this after completing a task to preserve the workflow for future use.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Human-readable skill name, e.g. 'Docker Debugging'." },
+        tags: { type: "string", description: "Comma-separated tags for skill discovery, e.g. 'docker,container,debug'." },
+        content: { type: "string", description: "Markdown content: step-by-step instructions, commands, and tips." },
+      },
+      required: ["name", "tags", "content"],
+    },
+  },
+  {
+    name: "update_project_memory",
+    description: "Update or append a named section in the project's persistent memory file (.localmind/memory.md). Use this to store architecture decisions, tech stack info, common commands, or user preferences that should persist across sessions.",
+    parameters: {
+      type: "object",
+      properties: {
+        section: { type: "string", description: "Section heading name, e.g. 'Tech Stack' or 'Common Commands'." },
+        content: { type: "string", description: "Markdown content for this section. Replaces existing content for the section." },
+      },
+      required: ["section", "content"],
+    },
+  },
+  {
+    name: "list_skills",
+    description: "List all skills in the workspace skill registry (.localmind/skills/). Returns skill names and tags.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "register_tool",
+    description: "Register a new dynamic tool in the workspace tool registry (.localmind/tools/). The tool will be available in future sessions. Tools use run_command under the hood with a template string.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Tool name (snake_case), e.g. 'analyze_logs'." },
+        description: { type: "string", description: "What the tool does." },
+        parameters: { type: "string", description: "JSON object mapping parameter names to {type, description} objects." },
+        template: { type: "string", description: "Shell command template using {{paramName}} placeholders, e.g. 'grep -n \"{{pattern}}\" \"{{path}}\"'." },
+      },
+      required: ["name", "description", "template"],
     },
   },
 ];
@@ -754,7 +806,82 @@ export async function executeTool(
         };
       }
 
+      case "save_skill": {
+        if (!dirHandle) return noWorkspace(call);
+        const skillName = argStr(call.args["name"]);
+        const tagsStr = argStr(call.args["tags"]);
+        const content = argStr(call.args["content"]);
+        if (!skillName || !content) throw new Error("Missing name or content");
+        const tags = tagsStr.split(",").map((t) => t.trim()).filter(Boolean);
+        const filename = await saveSkill(dirHandle, { name: skillName, tags, content });
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Skill saved: .localmind/skills/${filename}`,
+        };
+      }
+
+      case "update_project_memory": {
+        if (!dirHandle) return noWorkspace(call);
+        const section = argStr(call.args["section"]);
+        const content = argStr(call.args["content"]);
+        if (!section || !content) throw new Error("Missing section or content");
+        await updateMemorySection(dirHandle, section, content);
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Project memory updated: ## ${section}`,
+        };
+      }
+
+      case "list_skills": {
+        if (!dirHandle) return noWorkspace(call);
+        const skills = await loadSkills(dirHandle);
+        if (skills.length === 0) {
+          return { toolCallId: call.id, name: call.name, output: "No skills found in .localmind/skills/." };
+        }
+        const list = skills.map((s) => `- **${s.name}** [${s.tags.join(", ")}]`).join("\n");
+        return { toolCallId: call.id, name: call.name, output: `${skills.length} skills:\n${list}` };
+      }
+
+      case "register_tool": {
+        if (!dirHandle) return noWorkspace(call);
+        const toolName = argStr(call.args["name"]);
+        const description = argStr(call.args["description"]);
+        const template = argStr(call.args["template"]);
+        if (!toolName || !description || !template) throw new Error("Missing required fields");
+        let params: Record<string, { type: string; description: string }> = {};
+        try {
+          const rawParams = argStr(call.args["parameters"]);
+          if (rawParams) params = JSON.parse(rawParams) as typeof params;
+        } catch { /* ignore bad JSON */ }
+        const def: DynamicToolDef = { name: toolName, description, parameters: params, implementation: "run_command", template };
+        await saveDynamicTool(dirHandle, def);
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Tool registered: ${toolName} → .localmind/tools/${toolName}.json`,
+        };
+      }
+
       default: {
+        // Handle dynamic tools loaded from .localmind/tools/
+        if ((call as unknown as { _dynamicTemplate?: string })._dynamicTemplate) {
+          const tmpl = (call as unknown as { _dynamicTemplate: string })._dynamicTemplate;
+          const { renderTemplate } = await import("./dynamicTools");
+          const rendered = renderTemplate(tmpl, call.args);
+          const injected = injectGitCredentials(rendered);
+          const result = await tauriInvoke<{ stdout: string; stderr: string; exit_code: number }>(
+            "run_command", { cmd: injected }
+          );
+          const combined = sanitizeOutput([result.stdout, result.stderr].filter(Boolean).join("\n"));
+          return {
+            toolCallId: call.id,
+            name: call.name,
+            output: combined || "(no output)",
+            ...(result.exit_code !== 0 ? { error: `Exit code: ${result.exit_code}` } : {}),
+          };
+        }
         return {
           toolCallId: call.id,
           name: call.name,

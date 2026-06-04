@@ -4,13 +4,35 @@
 export function supportsNativeTools(modelName: string): boolean {
   const lower = modelName.toLowerCase();
   return (
-    lower.includes("llama3.1") ||
-    lower.includes("llama3.2") ||
-    lower.includes("llama 3.1") ||
-    lower.includes("llama 3.2") ||
+    // Meta Llama 3.1+
+    lower.includes("llama3.1") || lower.includes("llama 3.1") ||
+    lower.includes("llama3.2") || lower.includes("llama 3.2") ||
+    lower.includes("llama3.3") || lower.includes("llama 3.3") ||
+    lower.includes("llama3.4") || lower.includes("llama 3.4") ||
+    // Mistral family
     lower.includes("mistral-nemo") ||
+    lower.includes("mistral-large") ||
+    lower.includes("devstral") ||
+    lower.includes("mixtral") ||
+    // Alibaba Qwen
     lower.includes("qwen2.5") ||
-    lower.includes("command-r")
+    lower.includes("qwen2") ||
+    lower.includes("qwen3") ||
+    // Cohere
+    lower.includes("command-r") ||
+    // Nous Research (tool-finetuned)
+    lower.includes("hermes3") || lower.includes("hermes-3") ||
+    lower.includes("hermes2") || lower.includes("hermes-2") ||
+    // IBM Granite 3+
+    lower.includes("granite3") || lower.includes("granite-3") ||
+    // NVIDIA Nemotron
+    lower.includes("nemotron") ||
+    // Fireworks FireFunction
+    lower.includes("firefunction") ||
+    // Google Gemma 2+ via Ollama
+    lower.includes("gemma2") || lower.includes("gemma-2") ||
+    // xAI Grok
+    lower.includes("grok")
   );
 }
 
@@ -24,7 +46,13 @@ export function isVisionModel(modelName: string): boolean {
     lower.includes("bakllava") ||
     lower.includes("moondream") ||
     lower.includes("minicpm") ||
-    lower.includes("llama3.2") ||
-    lower.includes("llama 3.2")
+    lower.includes("llama3.2") || lower.includes("llama 3.2") ||
+    lower.includes("llama3.2-vision") ||
+    lower.includes("llava-llama3") ||
+    lower.includes("qwen2-vl") || lower.includes("qwen2.5-vl") ||
+    lower.includes("internvl") ||
+    lower.includes("phi-3-vision") || lower.includes("phi3-vision") ||
+    lower.includes("cogvlm") ||
+    lower.includes("pixtral")
   );
 }

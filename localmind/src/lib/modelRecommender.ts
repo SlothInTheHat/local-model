@@ -1,3 +1,6 @@
+import { MODEL_LIBRARY, getCompatibility } from "./modelLibrary";
+import type { HardwareInfo } from "./hardware";
+
 export type TaskType = "coding" | "math" | "vision" | "research" | "writing" | "general";
 
 interface TaskSignal {
@@ -112,13 +115,28 @@ export function recommendModel(
   hasImages: boolean,
   availableModels: string[],
   currentModel: string,
+  hardware?: HardwareInfo | null,
 ): { model: string; taskLabel: string; reason: string } | null {
   if (availableModels.length <= 1) return null;
 
   const task = detectTask(text, hasImages);
   if (task.type === "general") return null;
 
-  const ranked = [...availableModels].sort(
+  // Filter to models that actually fit in the user's hardware.
+  // Models not in the library (custom pulls) are kept — we can't check their size.
+  const candidates = hardware
+    ? availableModels.filter((name) => {
+        const spec = MODEL_LIBRARY.find(
+          (s) => s.id === name || s.id === `${name}:latest`,
+        );
+        if (!spec) return true; // unknown — don't exclude
+        return getCompatibility(spec, hardware) !== "too-large";
+      })
+    : availableModels;
+
+  if (candidates.length === 0) return null;
+
+  const ranked = [...candidates].sort(
     (a, b) => scoreModel(b, task.type) - scoreModel(a, task.type),
   );
 
@@ -129,7 +147,6 @@ export function recommendModel(
   const currentScore = scoreModel(currentModel, task.type);
   if (bestScore - currentScore < 15) return null;
 
-  // Don't recommend a non-vision model for vision tasks
   if (task.type === "vision" && bestScore === 0) return null;
 
   return { model: best, taskLabel: task.label, reason: task.reason };

@@ -18,6 +18,8 @@ interface Props {
   onOpenDir?: () => void;
   refreshKey?: number;
   onRefresh?: () => void;
+  /** Paths the agent has written to — their parent directories auto-expand */
+  autoExpandPaths?: ReadonlySet<string>;
 }
 
 interface PendingCreate {
@@ -100,11 +102,12 @@ interface TreeNodeProps {
   pendingCreate: PendingCreate | null;
   onPendingCreate: (p: PendingCreate | null) => void;
   onRefresh: () => void;
+  autoExpandPaths?: ReadonlySet<string>;
 }
 
 function TreeNode({
   entry, dirHandle, onOpenFile, depth,
-  pendingCreate, onPendingCreate, onRefresh,
+  pendingCreate, onPendingCreate, onRefresh, autoExpandPaths,
 }: TreeNodeProps) {
   const [expanded, setExpanded] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -117,6 +120,13 @@ function TreeNode({
   useEffect(() => {
     if (pendingCreate?.parentPath === entry.path) setExpanded(true);
   }, [pendingCreate, entry.path]);
+
+  // Auto-expand when the agent has written a file inside this directory
+  useEffect(() => {
+    if (entry.kind === "directory" && autoExpandPaths?.has(entry.path)) {
+      setExpanded(true);
+    }
+  }, [autoExpandPaths, entry.path, entry.kind]);
 
   async function handleClick() {
     if (renaming) return;
@@ -298,6 +308,7 @@ function TreeNode({
               pendingCreate={pendingCreate}
               onPendingCreate={onPendingCreate}
               onRefresh={onRefresh}
+              autoExpandPaths={autoExpandPaths}
             />
           ))}
         </div>
@@ -308,7 +319,7 @@ function TreeNode({
 
 // ─── FileTree root ────────────────────────────────────────────────────────────
 
-export function FileTree({ dirHandle, onOpenFile, onOpenDir, refreshKey, onRefresh }: Props) {
+export function FileTree({ dirHandle, onOpenFile, onOpenDir, refreshKey, onRefresh, autoExpandPaths }: Props) {
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -318,7 +329,8 @@ export function FileTree({ dirHandle, onOpenFile, onOpenDir, refreshKey, onRefre
     if (!dirHandle) { setEntries([]); return; }
     setLoading(true);
     setError(null);
-    listDirectory(dirHandle, 3)
+    // Depth 5 so nested project structures (src/components/ui/…) are fully visible
+    listDirectory(dirHandle, 5)
       .then(setEntries)
       .catch((err: Error) => setError(err.message))
       .finally(() => setLoading(false));
@@ -397,6 +409,7 @@ export function FileTree({ dirHandle, onOpenFile, onOpenDir, refreshKey, onRefre
             pendingCreate={pendingCreate}
             onPendingCreate={setPendingCreate}
             onRefresh={handleMutationDone}
+            autoExpandPaths={autoExpandPaths}
           />
         ))}
       </div>

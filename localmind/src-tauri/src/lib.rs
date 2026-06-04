@@ -82,6 +82,100 @@ fn effective_path() -> &'static str {
 mod mcp;
 use mcp::{mcp_start_server, mcp_stop_server, mcp_send_request};
 
+// ─── Native file system commands (used instead of File System Access API) ────
+
+#[derive(Serialize)]
+pub struct FsEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+}
+
+/// Read a file as UTF-8 text.
+#[tauri::command]
+fn fs_read_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| e.to_string())
+}
+
+/// Write text content to a file (creates parent directories as needed).
+#[tauri::command]
+fn fs_write_file(path: String, content: String) -> Result<(), String> {
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&path, content.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// List immediate children of a directory.
+#[tauri::command]
+fn fs_list_dir(path: String) -> Result<Vec<FsEntry>, String> {
+    let rd = std::fs::read_dir(&path).map_err(|e| e.to_string())?;
+    let mut entries = Vec::new();
+    for item in rd.flatten() {
+        let name = item.file_name().to_string_lossy().to_string();
+        let is_dir = item.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // Always use forward slashes for consistency with JS paths
+        let p = item.path().to_string_lossy().replace('\\', "/");
+        entries.push(FsEntry { name, path: p, is_dir });
+    }
+    // Sort: directories first, then alphabetical
+    entries.sort_by(|a, b| {
+        b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(entries)
+}
+
+/// Delete a file or directory.
+#[tauri::command]
+fn fs_delete(path: String, recursive: bool) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if p.is_dir() {
+        if recursive {
+            std::fs::remove_dir_all(p).map_err(|e| e.to_string())
+        } else {
+            std::fs::remove_dir(p).map_err(|e| e.to_string())
+        }
+    } else {
+        std::fs::remove_file(p).map_err(|e| e.to_string())
+    }
+}
+
+/// Return true if the path exists on disk.
+#[tauri::command]
+fn fs_exists(path: String) -> bool {
+    std::path::Path::new(&path).exists()
+}
+
+/// Create a directory (and all parents).
+#[tauri::command]
+fn fs_mkdir(path: String) -> Result<(), String> {
+    std::fs::create_dir_all(&path).map_err(|e| e.to_string())
+}
+
+/// Read a file as a base64-encoded string (used for inlining binary assets in HTML preview).
+#[tauri::command]
+fn fs_read_file_base64(path: String) -> Result<String, String> {
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    Ok(base64_encode(&bytes))
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let len = chunk.len();
+        let b0 = chunk[0] as u32;
+        let b1 = if len > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if len > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 0x3f) as usize] as char);
+        out.push(T[((n >> 12) & 0x3f) as usize] as char);
+        if len > 1 { out.push(T[((n >> 6) & 0x3f) as usize] as char); } else { out.push('='); }
+        if len > 2 { out.push(T[(n & 0x3f) as usize] as char); } else { out.push('='); }
+    }
+    out
+}
+
 #[derive(Serialize)]
 pub struct CommandResult {
     stdout: String,
@@ -270,6 +364,79 @@ fn get_gpu_info() -> Vec<GpuInfo> {
 
 #[cfg(target_os = "windows")]
 fn query_gpu_info() -> Vec<GpuInfo> {
+    // 1. nvidia-smi — most accurate source for NVIDIA GPUs.
+    //    wmic AdapterRAM is a 32-bit field and returns wrong values for cards > 4 GB.
+    if let Ok(out) = Command::new("nvidia-smi")
+        .args(["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"])
+        .env("PATH", effective_path())
+        .output()
+    {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let gpus: Vec<GpuInfo> = text.lines()
+                .filter_map(|line| {
+                    let mut parts = line.splitn(2, ',');
+                    let name = parts.next()?.trim().to_string();
+                    // nvidia-smi reports MiB; convert to MB (≈1 MiB = 1.049 MB, close enough)
+                    let vram_mb: u64 = parts.next()?.trim().parse().ok()?;
+                    if name.is_empty() { return None; }
+                    Some(GpuInfo { name, vram_mb })
+                })
+                .collect();
+            if !gpus.is_empty() { return gpus; }
+        }
+    }
+
+    // 2. PowerShell DXGI query — works for AMD, Intel Arc, and any DirectX 12 adapter.
+    //    Returns DedicatedVideoMemory in bytes (64-bit, no truncation).
+    if let Ok(out) = Command::new("powershell")
+        .args([
+            "-NoProfile", "-NonInteractive", "-Command",
+            r#"
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class DXGI {
+    [DllImport("dxgi.dll")] public static extern int CreateDXGIFactory1(ref Guid riid, out IntPtr ppFactory);
+    public static Guid IID_IDXGIFactory1 = new Guid("770aae78-f26f-4dba-a829-253c83d1b387");
+}
+'@
+try {
+    $f = [IntPtr]::Zero
+    $g = [DXGI]::IID_IDXGIFactory1
+    if ([DXGI]::CreateDXGIFactory1([ref]$g, [ref]$f) -eq 0) {
+        # Use WMI as a simpler alternative
+        Get-CimInstance Win32_VideoController | ForEach-Object {
+            "$($_.Name)|$($_.AdapterRAM)"
+        }
+    }
+} catch {}
+Get-CimInstance Win32_VideoController | ForEach-Object { "$($_.Name)|$($_.AdapterRAM)" }
+"#,
+        ])
+        .output()
+    {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut gpus: Vec<GpuInfo> = Vec::new();
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                let mut parts = line.splitn(2, '|');
+                let name = match parts.next() { Some(n) => n.trim().to_string(), None => continue };
+                if name.is_empty() { continue; }
+                // AdapterRAM from CIM is still 32-bit on some systems; treat 0 as unknown
+                let vram_bytes: u64 = parts.next()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+                let vram_mb = vram_bytes / (1024 * 1024);
+                gpus.push(GpuInfo { name, vram_mb });
+            }
+            if !gpus.is_empty() { return gpus; }
+        }
+    }
+
+    // 3. Last resort: wmic csv (original approach)
     let Ok(out) = Command::new("wmic")
         .args(["path", "win32_VideoController", "get", "AdapterRAM,Name", "/format:csv"])
         .output()
@@ -286,9 +453,7 @@ fn query_gpu_info() -> Vec<GpuInfo> {
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() { continue; }
-
         let cols: Vec<&str> = line.split(',').collect();
-
         if !header_done {
             for (i, col) in cols.iter().enumerate() {
                 match col.trim().to_lowercase().as_str() {
@@ -300,19 +465,9 @@ fn query_gpu_info() -> Vec<GpuInfo> {
             header_done = true;
             continue;
         }
-
-        let name = name_idx
-            .and_then(|i| cols.get(i))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-
+        let name = name_idx.and_then(|i| cols.get(i)).map(|s| s.trim().to_string()).unwrap_or_default();
         if name.is_empty() { continue; }
-
-        let vram_bytes: u64 = ram_idx
-            .and_then(|i| cols.get(i))
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-
+        let vram_bytes: u64 = ram_idx.and_then(|i| cols.get(i)).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
         gpus.push(GpuInfo { name, vram_mb: vram_bytes / (1024 * 1024) });
     }
     gpus
@@ -393,6 +548,13 @@ pub fn run() {
             mcp_start_server,
             mcp_stop_server,
             mcp_send_request,
+            fs_read_file,
+            fs_write_file,
+            fs_list_dir,
+            fs_delete,
+            fs_exists,
+            fs_mkdir,
+            fs_read_file_base64,
         ])
         .setup(|app| {
             #[cfg(debug_assertions)]

@@ -1,3 +1,5 @@
+import { TauriDirectoryHandle } from "./tauriFs";
+
 export interface FileEntry {
   name: string;
   path: string;
@@ -22,6 +24,11 @@ async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
   return core.invoke(cmd, args);
 }
 
+function isTauriEnv(): boolean {
+  const w = window as unknown as Record<string, unknown>;
+  return !!(w.__TAURI__ || w.__TAURI_INTERNALS__);
+}
+
 // File System Access API — not in all TypeScript DOM lib versions
 type ShowDirectoryPickerOpts = { mode?: "read" | "readwrite" };
 const showDirectoryPicker = (opts?: ShowDirectoryPickerOpts): Promise<FileSystemDirectoryHandle> =>
@@ -29,26 +36,29 @@ const showDirectoryPicker = (opts?: ShowDirectoryPickerOpts): Promise<FileSystem
     .showDirectoryPicker(opts);
 
 /**
- * Open a workspace folder. In Tauri mode uses a native dialog to get the real
- * OS path (needed for terminal sandboxing). In browser mode falls back to the
- * File System Access API (no real path, but file tools still work via dirHandle).
+ * Open a workspace folder.
+ *
+ * Tauri mode: uses the native OS folder picker via Tauri invoke, then wraps
+ * the result in a TauriDirectoryHandle that routes all file I/O through
+ * Tauri commands — no showDirectoryPicker call needed (avoids the
+ * "Must be handling a user gesture" error that occurs after awaiting a
+ * Tauri invoke).
+ *
+ * Browser mode: falls back to the File System Access API.
  */
 export async function openWorkspace(): Promise<WorkspaceResult> {
-  // Try Tauri native dialog first — gives us the real path
-  try {
+  if (isTauriEnv()) {
+    // Native Tauri path — open_workspace_dialog returns the selected OS path.
+    // We do NOT call showDirectoryPicker here; TauriDirectoryHandle handles
+    // all file operations through Tauri commands instead.
     const osPath = await tauriInvoke<string | null>("open_workspace_dialog");
-    if (osPath) {
-      // Also open the browser-facing handle for file tools
-      const handle = await showDirectoryPicker({ mode: "readwrite" });
-      const name = osPath.split(/[\\/]/).filter(Boolean).pop() ?? handle.name;
-      return { handle, path: osPath, name };
-    }
-    // User cancelled the native dialog — fall through to browser picker
-  } catch {
-    // Not in Tauri mode or dialog failed — fall through
+    if (!osPath) throw new DOMException("User cancelled", "AbortError");
+    const handle = new TauriDirectoryHandle(osPath) as unknown as FileSystemDirectoryHandle;
+    const name = osPath.replace(/\\/g, "/").split("/").filter(Boolean).pop() ?? "workspace";
+    return { handle, path: osPath, name };
   }
 
-  // Browser fallback
+  // Browser fallback — uses File System Access API (requires user gesture)
   const handle = await showDirectoryPicker({ mode: "readwrite" });
   return { handle, path: null, name: handle.name };
 }
