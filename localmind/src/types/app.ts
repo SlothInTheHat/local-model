@@ -1,1 +1,1 @@
-export type AppView = "chat" | "code" | "docs" | "models" | "terminal" | "agents";
+export type AppView = "chat" | "code" | "docs" | "models" | "terminal" | "agents" | "research" | "study" | "settings";

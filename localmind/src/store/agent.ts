@@ -25,6 +25,11 @@ const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   web_search: true,
   run_command: false,
   get_system_info: true,
+  git_status: false,
+  git_diff: false,
+  git_log: false,
+  git_add: false,
+  git_commit: false,
 };
 
 export const useAgentStore = create<AgentState>()((set) => ({

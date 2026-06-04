@@ -117,6 +117,11 @@ export async function writeFileToHandle(
   await writable.close();
 }
 
+const HIDDEN_ENTRIES = new Set([
+  ".localmind-backups",
+  "node_modules", ".git", "dist", ".next", "__pycache__", ".venv", "build", "coverage",
+]);
+
 async function buildEntries(
   handle: FileSystemDirectoryHandle,
   basePath: string,
@@ -125,6 +130,7 @@ async function buildEntries(
 ): Promise<FileEntry[]> {
   const entries: FileEntry[] = [];
   for await (const [name, entry] of handle.entries()) {
+    if (HIDDEN_ENTRIES.has(name)) continue;
     const entryPath = basePath ? `${basePath}/${name}` : name;
     if (entry.kind === "directory" && depth < maxDepth) {
       const children = await buildEntries(

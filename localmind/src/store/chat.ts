@@ -1,6 +1,54 @@
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
+import { persist, createJSONStorage } from "zustand/middleware";
 import type { ChatMessage } from "../lib/ollama";
+
+// ─── Inline IndexedDB storage adapter ────────────────────────────────────────
+// Replaces localStorage (5 MB cap) with IndexedDB (hundreds of MB).
+function makeIdbStorage(dbName: string, storeName: string) {
+  let db: IDBDatabase | null = null;
+
+  function open(): Promise<IDBDatabase> {
+    if (db) return Promise.resolve(db);
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(dbName, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore(storeName);
+      req.onsuccess = () => { db = req.result; resolve(db!); };
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  return {
+    getItem: async (key: string): Promise<string | null> => {
+      const store = await open();
+      return new Promise((resolve, reject) => {
+        const tx = store.transaction(storeName, "readonly");
+        const req = tx.objectStore(storeName).get(key);
+        req.onsuccess = () => resolve((req.result as string | undefined) ?? null);
+        req.onerror = () => reject(req.error);
+      });
+    },
+    setItem: async (key: string, value: string): Promise<void> => {
+      const store = await open();
+      return new Promise((resolve, reject) => {
+        const tx = store.transaction(storeName, "readwrite");
+        tx.objectStore(storeName).put(value, key);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    },
+    removeItem: async (key: string): Promise<void> => {
+      const store = await open();
+      return new Promise((resolve, reject) => {
+        const tx = store.transaction(storeName, "readwrite");
+        tx.objectStore(storeName).delete(key);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    },
+  };
+}
+
+const chatIdbStorage = makeIdbStorage("localmind-db", "chat-store");
 
 export interface Conversation {
   id: string;
@@ -106,6 +154,7 @@ export const useChatStore = create<ChatState>()(
     }),
     {
       name: "localmind-chat",
+      storage: createJSONStorage(() => chatIdbStorage),
       partialize: (state) => ({
         conversations: state.conversations.map((c) => ({
           ...c,

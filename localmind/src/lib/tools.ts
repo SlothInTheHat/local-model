@@ -1,6 +1,9 @@
 import { evaluate } from "mathjs";
 import { searchWeb } from "./search";
 import { fileExists, backupFile, readFileFromHandle } from "./fileSystem";
+import { mcpCallTool } from "./mcp";
+import { useMcpStore } from "../store/mcp";
+import { injectGitCredentials, sanitizeOutput } from "../store/profile";
 
 // ─── Tauri invoke shim ───────────────────────────────────────────────────────
 
@@ -37,12 +40,18 @@ export type ToolName =
   | "calculator"
   | "web_search"
   | "run_command"
-  | "get_system_info";
+  | "get_system_info"
+  | "git_status"
+  | "git_diff"
+  | "git_log"
+  | "git_add"
+  | "git_commit";
 
 export interface ToolDef {
-  name: ToolName;
+  // string allows MCP tools with dynamic "serverId__toolName" names
+  name: string;
   description: string;
-  parameters: Record<string, unknown>; // JSON Schema object
+  parameters: Record<string, unknown>;
 }
 
 export const TOOL_DEFINITIONS: ToolDef[] = [
@@ -211,17 +220,69 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       required: [],
     },
   },
+  {
+    name: "git_status",
+    description: "Show the working tree status (changed, staged, and untracked files). Use this to understand what has changed in the repo.",
+    parameters: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "git_diff",
+    description: "Show the diff of unstaged or staged changes. Optionally limit to a specific file.",
+    parameters: {
+      type: "object",
+      properties: {
+        staged: { type: "boolean", description: "If true, show staged (--cached) diff." },
+        path: { type: "string", description: "Optional file path to limit the diff to." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "git_log",
+    description: "Show the last 20 commits in one-line format.",
+    parameters: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "git_add",
+    description: "Stage file(s) for commit.",
+    parameters: {
+      type: "object",
+      properties: {
+        paths: { type: "string", description: "Space-separated list of files/patterns to stage, e.g. 'src/main.ts' or '.' for all." },
+      },
+      required: ["paths"],
+    },
+  },
+  {
+    name: "git_commit",
+    description: "Create a git commit with the given message. Only stage changes you intend to commit first.",
+    parameters: {
+      type: "object",
+      properties: {
+        message: { type: "string", description: "The commit message." },
+      },
+      required: ["message"],
+    },
+  },
 ];
+
+/**
+ * Returns the combined tool list: built-in tools (filtered by enabled state) + MCP tools.
+ * Import and call this instead of TOOL_DEFINITIONS directly.
+ */
+export function getToolDefinitions(mcpTools: ToolDef[] = []): ToolDef[] {
+  return [...TOOL_DEFINITIONS, ...mcpTools];
+}
 
 export interface ToolCall {
   id: string;
-  name: ToolName;
+  name: string; // string allows MCP tool names ("serverId__toolName")
   args: Record<string, unknown>;
 }
 
 export interface ToolResult {
   toolCallId: string;
-  name: ToolName;
+  name: string;
   output: string;
   error?: string;
 }
@@ -240,7 +301,7 @@ function matchesFileGlob(name: string, pattern: string): boolean {
 }
 
 // Skip noisy directories that are rarely useful
-const SKIP_DIRS = new Set(["node_modules", ".git", "dist", ".next", "__pycache__", ".venv", "build", "coverage"]);
+const SKIP_DIRS = new Set(["node_modules", ".git", "dist", ".next", "__pycache__", ".venv", "build", "coverage", ".localmind-backups"]);
 
 async function grepInHandle(
   handle: FileSystemDirectoryHandle,
@@ -322,24 +383,36 @@ function noWorkspace(call: ToolCall): ToolResult {
   };
 }
 
-function normalizeSubPath(p: string): string {
-  const trimmed = p.trim().replace(/^\.?\/?$/, "");
-  return trimmed;
-}
-
-/** Throw if any segment of a path could escape the workspace. */
-function assertNoTraversal(path: string): void {
-  // Split on both slash styles, filter blanks
-  const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
-  for (const part of parts) {
-    if (part === ".." || part === ".") {
-      throw new Error(`Path traversal not allowed: "${path}"`);
-    }
-  }
-  // Catch encoded variants like %2e%2e
-  if (/%2e/i.test(path) || /\.\./i.test(path)) {
+/**
+ * Resolve a path relative to the workspace root.
+ * Collapses "." segments and resolves ".." against the accumulated stack.
+ * Throws only if ".." would escape the root (stack underflows) or if
+ * percent-encoded dot sequences are present.
+ * Returns the canonical path segments ready for the File System Access API.
+ */
+function resolvePathParts(path: string): string[] {
+  if (/%2e/i.test(path)) {
     throw new Error(`Path traversal not allowed: "${path}"`);
   }
+  const raw = path.replace(/\\/g, "/").split("/").filter((s) => s !== "" && s !== ".");
+  const stack: string[] = [];
+  for (const part of raw) {
+    if (part === "..") {
+      if (stack.length === 0) {
+        throw new Error(`Path traversal not allowed: "${path}"`);
+      }
+      stack.pop();
+    } else {
+      stack.push(part);
+    }
+  }
+  return stack;
+}
+
+function normalizeSubPath(p: string): string {
+  const trimmed = p.trim();
+  if (!trimmed) return "";
+  return resolvePathParts(trimmed).join("/");
 }
 
 async function resolveDirHandle(
@@ -408,6 +481,17 @@ export async function executeTool(
   dirHandle: FileSystemDirectoryHandle | null
 ): Promise<ToolResult> {
   try {
+    // ── MCP dispatch: names are prefixed "serverId__toolName" ────────────────
+    if (call.name.includes("__")) {
+      const [serverId] = call.name.split("__");
+      const server = useMcpStore.getState().servers.find((s) => s.id === serverId);
+      if (!server) {
+        return { toolCallId: call.id, name: call.name, output: "", error: `MCP server '${serverId}' not found` };
+      }
+      const output = await mcpCallTool(server, call.name, call.args);
+      return { toolCallId: call.id, name: call.name, output };
+    }
+
     switch (call.name) {
       case "calculator": {
         const expr = argStr(call.args["expression"]);
@@ -453,8 +537,7 @@ export async function executeTool(
         if (!dirHandle) return noWorkspace(call);
         const path = argStr(call.args["path"]);
         if (!path) throw new Error("Missing path argument");
-        assertNoTraversal(path);
-        const parts = path.split("/").filter(Boolean);
+        const parts = resolvePathParts(path);
         const fileName = parts.pop()!;
         let parentHandle = dirHandle;
         if (parts.length > 0) {
@@ -477,17 +560,16 @@ export async function executeTool(
         const path = argStr(call.args["path"]);
         const content = argStr(call.args["content"]);
         if (!path) throw new Error("Missing path argument");
-        assertNoTraversal(path);
+        const parts = resolvePathParts(path);
+        const normalizedPath = parts.join("/");
 
-        const isBackupPath = path.startsWith(".localmind-backups/");
+        const isBackupPath = normalizedPath.startsWith(".localmind-backups/");
         let backupPath: string | null = null;
 
-        if (!isBackupPath && await fileExists(dirHandle, path)) {
-          const existing = await readFileFromHandle(dirHandle, path);
-          backupPath = await backupFile(dirHandle, path, existing);
+        if (!isBackupPath && await fileExists(dirHandle, normalizedPath)) {
+          const existing = await readFileFromHandle(dirHandle, normalizedPath);
+          backupPath = await backupFile(dirHandle, normalizedPath, existing);
         }
-
-        const parts = path.split("/").filter(Boolean);
         const fileName = parts.pop()!;
         let parentHandle = dirHandle;
         if (parts.length > 0) {
@@ -579,8 +661,7 @@ export async function executeTool(
         if (!dirHandle) return noWorkspace(call);
         const path = argStr(call.args["path"]);
         if (!path) throw new Error("Missing path argument");
-        assertNoTraversal(path);
-        const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
+        const parts = resolvePathParts(path);
         const fileName = parts.pop()!;
         let parentHandle = dirHandle;
         if (parts.length > 0) {
@@ -600,11 +681,16 @@ export async function executeTool(
         const cmd = argStr(call.args["cmd"]);
         if (!cmd) throw new Error("Missing cmd argument");
         const cwd = argStr(call.args["cwd"]) || undefined;
+        // Inject stored git credentials into HTTPS URLs before execution.
+        // Token is never shown in the approval dialog (call.args keeps the original).
+        const injectedCmd = injectGitCredentials(cmd);
         const result = await tauriInvoke<{ stdout: string; stderr: string; exit_code: number; cwd: string }>(
           "run_command",
-          { cmd, cwd }
+          { cmd: injectedCmd, cwd }
         );
-        const combined = [result.stdout, result.stderr].filter(Boolean).join("\n");
+        const combined = sanitizeOutput(
+          [result.stdout, result.stderr].filter(Boolean).join("\n")
+        );
         return {
           toolCallId: call.id,
           name: call.name,
@@ -632,13 +718,48 @@ export async function executeTool(
         };
       }
 
+      case "git_status":
+      case "git_diff":
+      case "git_log":
+      case "git_add":
+      case "git_commit": {
+        let gitCmd: string;
+        if (call.name === "git_status") {
+          gitCmd = "git status --porcelain";
+        } else if (call.name === "git_diff") {
+          const staged = call.args["staged"] ? "--cached " : "";
+          const path = argStr(call.args["path"]);
+          gitCmd = `git diff ${staged}${path ? `-- ${path}` : ""}`.trim();
+        } else if (call.name === "git_log") {
+          gitCmd = "git log --oneline -20";
+        } else if (call.name === "git_add") {
+          const paths = argStr(call.args["paths"]);
+          if (!paths) throw new Error("Missing paths argument");
+          gitCmd = `git add ${paths}`;
+        } else {
+          const message = argStr(call.args["message"]);
+          if (!message) throw new Error("Missing message argument");
+          gitCmd = `git commit -m "${message.replace(/"/g, '\\"')}"`;
+        }
+        const gitResult = await tauriInvoke<{ stdout: string; stderr: string; exit_code: number }>(
+          "run_command",
+          { cmd: gitCmd }
+        );
+        const combined = [gitResult.stdout, gitResult.stderr].filter(Boolean).join("\n");
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: combined || "(no output)",
+          ...(gitResult.exit_code !== 0 ? { error: `Exit code: ${gitResult.exit_code}` } : {}),
+        };
+      }
+
       default: {
-        const exhaustive: never = call.name;
         return {
           toolCallId: call.id,
           name: call.name,
           output: "",
-          error: `Unknown tool: ${exhaustive}`,
+          error: `Unknown tool: ${call.name}`,
         };
       }
     }

@@ -1,17 +1,21 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertCircle, SlidersHorizontal } from "lucide-react";
 import { toast, Toaster } from "sonner";
+import { recommendModel } from "./lib/modelRecommender";
 import { listModels, streamChat } from "./lib/ollama";
 import type { ChatMessage } from "./lib/ollama";
 import { searchWeb } from "./lib/search";
 import { runAgentTurn } from "./lib/agentLoop";
-import { executeTool, TOOL_DEFINITIONS, setSystemInfoContext } from "./lib/tools";
+import { executeTool, getToolDefinitions, setSystemInfoContext } from "./lib/tools";
 import type { ToolResult } from "./lib/tools";
 import { useModelStore } from "./store/models";
+import { useMcpStore } from "./store/mcp";
+import { useProfileStore } from "./store/profile";
 import { openWorkspace } from "./lib/fileSystem";
 import { useChatStore } from "./store/chat";
 import { useAgentStore } from "./store/agent";
 import { ChatSidebar } from "./components/ChatSidebar";
+import { ConversationSearch } from "./components/ConversationSearch";
 import { ChatMessages } from "./components/ChatMessages";
 import { ChatInput } from "./components/ChatInput";
 import { ModelManager } from "./components/ModelManager";
@@ -33,6 +37,15 @@ const Terminal = lazy(() =>
 const SubagentManager = lazy(() =>
   import("./components/SubagentManager").then((m) => ({ default: m.SubagentManager }))
 );
+const DeepResearch = lazy(() =>
+  import("./components/DeepResearch").then((m) => ({ default: m.DeepResearch }))
+);
+const StudyMode = lazy(() =>
+  import("./components/StudyMode").then((m) => ({ default: m.StudyMode }))
+);
+const AppSettings = lazy(() =>
+  import("./components/AppSettings").then((m) => ({ default: m.AppSettings }))
+);
 
 export default function App() {
   const {
@@ -42,6 +55,7 @@ export default function App() {
     availableModels,
     setModels,
     newConversation,
+    selectConversation,
     addMessage,
     appendToLastMessage,
     setStreaming,
@@ -65,6 +79,7 @@ export default function App() {
   const [ollamaError, setOllamaError] = useState<string | null>(null);
   const [webSearchEnabled, setWebSearchEnabled] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
   const [agentMode, setAgentMode] = useState(false);
   const [attachedImages, setAttachedImages] = useState<string[]>([]);
   const [systemPromptOpen, setSystemPromptOpen] = useState(false);
@@ -72,6 +87,8 @@ export default function App() {
   // Ref to track current convId across async agent continuations
   const activeConvIdRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  // Track last recommendation shown to avoid repeating the same toast
+  const lastRecRef = useRef<string>("");
 
   const activeConv = conversations.find((c) => c.id === activeId) ?? null;
 
@@ -133,6 +150,23 @@ export default function App() {
 
   async function handleSend(text: string) {
     if (!selectedModel) return;
+
+    // Model recommendation — only toast if the suggestion is new
+    const rec = recommendModel(text, attachedImages.length > 0, availableModels, selectedModel);
+    if (rec) {
+      const recKey = `${rec.model}:${rec.taskLabel}`;
+      if (lastRecRef.current !== recKey) {
+        lastRecRef.current = recKey;
+        toast(`Switch to ${rec.model}?`, {
+          description: `Better suited for ${rec.reason}`,
+          duration: 10000,
+          action: {
+            label: "Switch",
+            onClick: () => setSelectedModel(rec.model),
+          },
+        });
+      }
+    }
 
     let convId = activeId;
     if (!convId) convId = newConversation(selectedModel);
@@ -218,9 +252,14 @@ export default function App() {
   // ─── Agent loop ───────────────────────────────────────────────────────────
 
   async function runAgentLoop(convId: string, history: ChatMessage[]) {
-    const enabledTools = TOOL_DEFINITIONS.filter((t) => toolsEnabled[t.name]);
+    const mcpTools = useMcpStore.getState().getEnabledTools();
+    const allTools = getToolDefinitions(mcpTools);
+    const enabledTools = allTools.filter(
+      (t) => t.name.includes("__") || toolsEnabled[t.name as import("./lib/tools").ToolName]
+    );
 
     // Inject a system-level context block so the agent knows its environment
+    const profile = useProfileStore.getState();
     const contextLines = [
       `## Runtime context`,
       `- Model: ${selectedModel || "unknown"}`,
@@ -230,6 +269,20 @@ export default function App() {
       ].join("\n") : "- Hardware: not yet scanned",
       `- Platform: ${navigator.platform}`,
       `- Desktop mode: ${!!(window as unknown as Record<string, unknown>).__TAURI__}`,
+      dirHandle ? `- Workspace: ${dirHandle.name}` : "- Workspace: none",
+      profile.githubUsername ? `- GitHub: @${profile.githubUsername} (token configured — HTTPS auth is automatic)` : "",
+      profile.gitName ? `- Git identity: ${profile.gitName} <${profile.gitEmail}>` : "",
+      ``,
+      `## Agent behavior`,
+      `When the user asks you to explore, understand, or summarize a project or workspace:`,
+      `1. Use list_directory to get the file tree.`,
+      `2. Then read the actual content of key files — prioritize README.md, CLAUDE.md, package.json,`,
+      `   Cargo.toml, pyproject.toml, or any obvious entry-point / config file. Read at least 3-5`,
+      `   files before answering so your summary reflects what the code actually does, not just`,
+      `   what the filenames suggest.`,
+      `3. For deeper questions ("how does X work", "find the bug in Y") use grep_files or read_file`,
+      `   to read the relevant source files before answering.`,
+      `Never answer a workspace question based solely on a directory listing.`,
     ].join("\n");
 
     // Prepend context to the first system message, or add one if absent
@@ -358,6 +411,12 @@ export default function App() {
         onViewChange={setView}
         selectedModel={selectedModel}
         onModelChange={(m) => { setSelectedModel(m); toast.info(`Model: ${m}`, { duration: 2000 }); }}
+        onOpenSearch={() => setSearchOpen(true)}
+      />
+      <ConversationSearch
+        open={searchOpen}
+        onClose={() => setSearchOpen(false)}
+        onSelect={(id) => { selectConversation(id); setView("chat"); setSearchOpen(false); }}
       />
 
       <div className="flex flex-col flex-1 min-w-0">
@@ -453,6 +512,18 @@ export default function App() {
         ) : view === "agents" ? (
           <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading agents…</div>}>
             <SubagentManager />
+          </Suspense>
+        ) : view === "research" ? (
+          <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
+            <DeepResearch selectedModel={selectedModel} />
+          </Suspense>
+        ) : view === "study" ? (
+          <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
+            <StudyMode selectedModel={selectedModel} />
+          </Suspense>
+        ) : view === "settings" ? (
+          <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
+            <AppSettings />
           </Suspense>
         ) : (
           <ModelManager onUseModel={handleUseModel} />

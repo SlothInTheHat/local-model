@@ -40,9 +40,31 @@ fn effective_path() -> &'static str {
                 r"C:\Program Files\Git\bin".to_string(),
                 r"C:\Program Files\nodejs".to_string(),
                 format!(r"C:\Users\{username}\AppData\Roaming\npm"),
+                // Python (standard installer) — all common versions
                 format!(r"C:\Users\{username}\AppData\Local\Programs\Python\Python313"),
                 format!(r"C:\Users\{username}\AppData\Local\Programs\Python\Python312"),
                 format!(r"C:\Users\{username}\AppData\Local\Programs\Python\Python311"),
+                format!(r"C:\Users\{username}\AppData\Local\Programs\Python\Python310"),
+                format!(r"C:\Users\{username}\AppData\Local\Programs\Python\Python39"),
+                format!(r"C:\Users\{username}\AppData\Local\Programs\Python\Python38"),
+                r"C:\Python313".to_string(),
+                r"C:\Python312".to_string(),
+                r"C:\Python311".to_string(),
+                r"C:\Python310".to_string(),
+                r"C:\Python39".to_string(),
+                r"C:\Python38".to_string(),
+                r"C:\Program Files\Python313".to_string(),
+                r"C:\Program Files\Python312".to_string(),
+                r"C:\Program Files\Python311".to_string(),
+                // Conda / Miniconda / Anaconda
+                format!(r"C:\Users\{username}\miniconda3"),
+                format!(r"C:\Users\{username}\miniconda3\Scripts"),
+                format!(r"C:\Users\{username}\anaconda3"),
+                format!(r"C:\Users\{username}\anaconda3\Scripts"),
+                format!(r"C:\ProgramData\miniconda3"),
+                format!(r"C:\ProgramData\miniconda3\Scripts"),
+                format!(r"C:\ProgramData\anaconda3"),
+                format!(r"C:\ProgramData\anaconda3\Scripts"),
             ];
             let extra: Vec<String> = candidates
                 .into_iter()

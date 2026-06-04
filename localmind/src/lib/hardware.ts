@@ -5,7 +5,21 @@ export interface HardwareInfo {
   vramGb: number; // 0 = unknown / integrated
 }
 
-// Best-effort VRAM lookup from GPU renderer string
+interface TauriGpuInfo {
+  name: string;
+  vram_mb: number;
+}
+
+// Tauri invoke shim — works in desktop mode, no-ops in browser
+async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const tauri = (window as unknown as Record<string, unknown>).__TAURI__;
+  if (!tauri) throw new Error("Not in Tauri desktop mode");
+  const core = (tauri as Record<string, unknown>).core as { invoke?: (cmd: string, args?: unknown) => Promise<T> };
+  if (typeof core?.invoke !== "function") throw new Error("Tauri core.invoke unavailable");
+  return core.invoke(cmd, args);
+}
+
+// Best-effort VRAM lookup from GPU renderer string (fallback for browser/dev mode)
 function estimateVram(renderer: string): number {
   const s = renderer.toLowerCase();
 
@@ -55,13 +69,7 @@ function estimateVram(renderer: string): number {
   return 0; // unknown / integrated
 }
 
-export async function detectHardware(): Promise<HardwareInfo> {
-  const cpuThreads = navigator.hardwareConcurrency ?? 4;
-  const ramGb = Math.round((navigator as unknown as Record<string, number>).deviceMemory ?? 4);
-
-  let gpuName = "Unknown GPU";
-  let vramGb = 0;
-
+function webglGpuInfo(): { gpuName: string; vramGb: number } {
   try {
     const canvas = document.createElement("canvas");
     const gl =
@@ -71,13 +79,41 @@ export async function detectHardware(): Promise<HardwareInfo> {
     if (gl) {
       const ext = gl.getExtension("WEBGL_debug_renderer_info");
       if (ext) {
-        gpuName = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) as string;
-        vramGb = estimateVram(gpuName);
+        const gpuName = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) as string;
+        return { gpuName, vramGb: estimateVram(gpuName) };
       }
     }
   } catch {
-    // WebGL not available; proceed with unknowns
+    // WebGL not available
+  }
+  return { gpuName: "Unknown GPU", vramGb: 0 };
+}
+
+export async function detectHardware(): Promise<HardwareInfo> {
+  const cpuThreads = navigator.hardwareConcurrency ?? 4;
+  const ramGb = Math.round((navigator as unknown as Record<string, number>).deviceMemory ?? 4);
+
+  // Try native GPU query via Tauri first (accurate VRAM from OS)
+  try {
+    const gpus = await tauriInvoke<TauriGpuInfo[]>("get_gpu_info");
+    // Pick the GPU with the most VRAM (skip pure integrated adapters with 0 MB)
+    const best = gpus
+      .filter((g) => g.name.trim().length > 0)
+      .sort((a, b) => b.vram_mb - a.vram_mb)[0];
+
+    if (best) {
+      return {
+        cpuThreads,
+        ramGb,
+        gpuName: best.name,
+        vramGb: Math.round(best.vram_mb / 1024),
+      };
+    }
+  } catch {
+    // Not in Tauri or command failed — fall through to WebGL
   }
 
+  // Fallback: derive GPU name + VRAM estimate from WebGL renderer string
+  const { gpuName, vramGb } = webglGpuInfo();
   return { cpuThreads, ramGb, gpuName, vramGb };
 }

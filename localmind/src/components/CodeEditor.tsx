@@ -1,5 +1,5 @@
 import React, { Suspense, useRef, useState, useEffect } from "react";
-import { Save, ChevronRight, Send, Play, Square, ChevronDown, ChevronUp } from "lucide-react";
+import { Save, ChevronRight, Send, Play, Square, ChevronDown, ChevronUp, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
@@ -7,7 +7,8 @@ import { FileTree } from "./FileTree";
 import { openWorkspace, readFileFromHandle, writeFileToHandle, listDirectory } from "../lib/fileSystem";
 import type { FileEntry } from "../lib/fileSystem";
 import { runAgentTurn } from "../lib/agentLoop";
-import { executeTool, TOOL_DEFINITIONS } from "../lib/tools";
+import { executeTool, getToolDefinitions } from "../lib/tools";
+import { injectGitCredentials, sanitizeOutput } from "../store/profile";
 import { streamChat } from "../lib/ollama";
 import { supportsNativeTools } from "../lib/modelCapabilities";
 import { useAgentStore } from "../store/agent";
@@ -84,11 +85,80 @@ function runJavaScript(code: string): { output: string; error: boolean } {
   }
 }
 
-const CODE_TOOLS = TOOL_DEFINITIONS.filter((t) =>
-  (["read_file", "list_directory", "grep_files", "find_files", "write_file"] as string[]).includes(t.name)
-);
+// All tools are available to the code agent.
+const CODE_TOOLS = getToolDefinitions();
 
-const WRITE_TOOLS = new Set(["write_file"]);
+function buildApprovalPrompt(name: string, args: Record<string, unknown>): string {
+  const a = (key: string) => (typeof args[key] === "string" ? args[key] as string : JSON.stringify(args[key] ?? ""));
+  switch (name) {
+    case "write_file":  return `AI wants to write file:\n  ${a("path")}\n\nAllow?`;
+    case "delete_file": return `AI wants to DELETE file:\n  ${a("path")}\n\nThis cannot be undone. Allow?`;
+    case "run_command": return `AI wants to run:\n\n  ${a("cmd")}\n\nAllow?`;
+    case "git_add":     return `AI wants to stage:\n\n  git add ${a("paths")}\n\nAllow?`;
+    case "git_commit":  return `AI wants to commit:\n\n  ${a("message")}\n\nAllow?`;
+    default:            return `AI wants to run "${name}" — allow?`;
+  }
+}
+
+const isTauri = () => {
+  const w = window as unknown as Record<string, unknown>;
+  // __TAURI__ is set when withGlobalTauri: true (our config).
+  // __TAURI_INTERNALS__ is the low-level shim always present in Tauri v2 webviews.
+  return !!(w.__TAURI__ || w.__TAURI_INTERNALS__);
+};
+
+async function tauriRun(cmd: string, cwd?: string): Promise<{ stdout: string; stderr: string; exit_code: number }> {
+  const tauri = (window as unknown as Record<string, unknown>).__TAURI__;
+  const core = (tauri as Record<string, unknown>).core as { invoke: (c: string, a: unknown) => Promise<unknown> };
+  return core.invoke("run_command", { cmd, cwd }) as Promise<{ stdout: string; stderr: string; exit_code: number }>;
+}
+
+type RunMode = "browser-js" | "html-preview" | "shell" | "none";
+
+function getRunMode(lang: string): RunMode {
+  if (lang === "javascript" || lang === "javascriptreact") return "browser-js";
+  if (lang === "html") return "html-preview";
+  const shellLangs = new Set([
+    "python", "typescript", "typescriptreact", "ruby", "go", "rust",
+    "shell", "powershell", "php", "perl", "lua", "r", "java", "swift", "dart", "kotlin",
+  ]);
+  if (shellLangs.has(lang)) return "shell";
+  return "none";
+}
+
+function shellRunCmd(lang: string, filePath: string): string {
+  const p = filePath.replace(/\\/g, "/");
+  const name = p.split("/").pop() ?? p;
+  const dir = p.includes("/") ? `"${p.slice(0, p.lastIndexOf("/"))}"` : ".";
+  switch (lang) {
+    case "python": return `python "${p}"`;
+    case "typescript":
+    case "typescriptreact": return `npx ts-node "${p}"`;
+    case "javascript":
+    case "javascriptreact": return `node "${p}"`;
+    case "ruby": return `ruby "${p}"`;
+    case "go": return `go run "${p}"`;
+    case "rust": return `rustc "${p}" -o _lm_run && ./_lm_run && rm -f _lm_run`;
+    case "shell": return `bash "${p}"`;
+    case "powershell": return `powershell -ExecutionPolicy Bypass -File "${p}"`;
+    case "php": return `php "${p}"`;
+    case "perl": return `perl "${p}"`;
+    case "lua": return `lua "${p}"`;
+    case "r": return `Rscript "${p}"`;
+    case "java": return `javac "${p}" && java -cp ${dir} "${name.replace(/\.java$/, "")}"`;
+    case "swift": return `swift "${p}"`;
+    case "dart": return `dart run "${p}"`;
+    case "kotlin": return `kotlinc "${p}" -include-runtime -d _lm.jar 2>&1 && java -jar _lm.jar; rm -f _lm.jar`;
+    default: return `echo "No run command for ${lang}"`;
+  }
+}
+
+// Tools that require explicit user approval before executing.
+const APPROVAL_REQUIRED = new Set([
+  "write_file", "delete_file",
+  "run_command",
+  "git_add", "git_commit",
+]);
 
 interface AiMessage {
   role: "user" | "assistant" | "tool";
@@ -102,7 +172,12 @@ interface CodeEditorProps {
 }
 
 export function CodeEditor({ selectedModel }: CodeEditorProps) {
-  const { dirHandle, setWorkspace } = useAgentStore();
+  const { dirHandle, workspacePath, setWorkspace } = useAgentStore();
+
+  // Multi-file tabs
+  interface OpenTab { path: string; content: string; isDirty: boolean; }
+  const [openTabs, setOpenTabs] = useState<OpenTab[]>([]);
+  const [activeTabPath, setActiveTabPath] = useState<string>("");
 
   const [fileContent, setFileContent] = useState<string>("");
   const [currentPath, setCurrentPath] = useState<string>("");
@@ -124,6 +199,10 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
   // Run output panel
   const [runOutput, setRunOutput] = useState<{ output: string; error: boolean } | null>(null);
   const [isOutputOpen, setIsOutputOpen] = useState(false);
+  // HTML preview — stores a blob URL so navigation stays sandboxed
+  const [htmlPreviewUrl, setHtmlPreviewUrl] = useState<string | null>(null);
+  const [htmlPreviewPath, setHtmlPreviewPath] = useState<string>("");
+  const prevPreviewUrlRef = useRef<string | null>(null);
 
   const editorRef = useRef<MonacoEditorNS.IStandaloneCodeEditor | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -178,8 +257,21 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
 
   async function handleOpenFile(_handle: FileSystemFileHandle, path: string) {
     if (!dirHandle) return;
+
+    // Switch to already-open tab if exists
+    const existing = openTabs.find((t) => t.path === path);
+    if (existing) {
+      setActiveTabPath(path);
+      setFileContent(existing.content);
+      setCurrentPath(path);
+      setLanguage(detectLanguage(path));
+      return;
+    }
+
     try {
       const text = await readFileFromHandle(dirHandle, path);
+      setOpenTabs((prev) => [...prev, { path, content: text, isDirty: false }]);
+      setActiveTabPath(path);
       setFileContent(text);
       setCurrentPath(path);
       setLanguage(detectLanguage(path));
@@ -190,12 +282,110 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
     }
   }
 
+  function handleSwitchTab(path: string) {
+    const tab = openTabs.find((t) => t.path === path);
+    if (!tab) return;
+    // Persist current content back into tabs before switching
+    setOpenTabs((prev) => prev.map((t) => t.path === activeTabPath ? { ...t, content: fileContent } : t));
+    setActiveTabPath(path);
+    setFileContent(tab.content);
+    setCurrentPath(path);
+    setLanguage(detectLanguage(path));
+    setRunOutput(null);
+  }
+
+  function handleCloseTab(path: string, e: React.MouseEvent) {
+    e.stopPropagation();
+    const tab = openTabs.find((t) => t.path === path);
+    if (tab?.isDirty && !window.confirm(`${path.split("/").pop()} has unsaved changes. Close anyway?`)) return;
+    const newTabs = openTabs.filter((t) => t.path !== path);
+    setOpenTabs(newTabs);
+    if (activeTabPath === path) {
+      const last = newTabs[newTabs.length - 1];
+      if (last) {
+        setActiveTabPath(last.path);
+        setFileContent(last.content);
+        setCurrentPath(last.path);
+        setLanguage(detectLanguage(last.path));
+      } else {
+        setActiveTabPath("");
+        setFileContent("");
+        setCurrentPath("");
+        setLanguage("plaintext");
+      }
+    }
+  }
+
+  // Inject a script into HTML that turns local navigation into postMessage events,
+  // then create a blob URL so the iframe origin is null (can't bleed into the app).
+  function buildPreviewBlobUrl(html: string): string {
+    const interceptor = `<script>
+(function(){
+  function nav(url){
+    if(!url||url.startsWith('http')||url.startsWith('//')||url.startsWith('data:')||url.startsWith('javascript:')) return;
+    window.parent.postMessage({type:'lm-nav',to:url},'*');
+  }
+  document.addEventListener('click',function(e){
+    var a=e.target.closest('a[href]');
+    if(a){var h=a.getAttribute('href');if(h&&!h.startsWith('http')&&!h.startsWith('#')){e.preventDefault();nav(h);}}
+  },true);
+  // Rewrite inline onclick that would have called location.href
+})();
+<\/script>`;
+
+    // Rewrite: window.location.href = 'url' → postMessage (covers inline onclick attrs)
+    const patched = html
+      .replace(/window\.location\.href\s*=\s*['"]([^'"]+)['"]/g,
+        "window.parent.postMessage({type:'lm-nav',to:'$1'},'*')")
+      .replace(/location\.href\s*=\s*['"]([^'"]+)['"]/g,
+        "window.parent.postMessage({type:'lm-nav',to:'$1'},'*')");
+
+    const injected = patched.includes("<head")
+      ? patched.replace(/(<head[^>]*>)/i, `$1${interceptor}`)
+      : interceptor + patched;
+
+    // Revoke previous URL to avoid memory leaks
+    if (prevPreviewUrlRef.current) {
+      URL.revokeObjectURL(prevPreviewUrlRef.current);
+    }
+    const url = URL.createObjectURL(new Blob([injected], { type: "text/html" }));
+    prevPreviewUrlRef.current = url;
+    return url;
+  }
+
+  // Listen for in-preview navigation requests
+  useEffect(() => {
+    async function onMessage(e: MessageEvent) {
+      if (!e.data || e.data.type !== "lm-nav") return;
+      const target: string = e.data.to as string;
+      if (!dirHandle || !htmlPreviewPath) return;
+
+      // Resolve path relative to the file currently being previewed
+      const base = htmlPreviewPath.includes("/")
+        ? htmlPreviewPath.slice(0, htmlPreviewPath.lastIndexOf("/"))
+        : "";
+      const resolved = base ? `${base}/${target}` : target;
+
+      try {
+        const content = await readFileFromHandle(dirHandle, resolved);
+        const url = buildPreviewBlobUrl(content);
+        setHtmlPreviewUrl(url);
+        setHtmlPreviewPath(resolved);
+      } catch {
+        toast.error(`Preview: file not found — ${resolved}`);
+      }
+    }
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [dirHandle, htmlPreviewPath]); // eslint-disable-line react-hooks/exhaustive-deps
+
   async function handleSave() {
     if (!dirHandle || !currentPath) return;
     setSaveStatus("saving");
     try {
       await writeFileToHandle(dirHandle, currentPath, fileContent);
       setSaveStatus("saved");
+      setOpenTabs((prev) => prev.map((t) => t.path === currentPath ? { ...t, isDirty: false, content: fileContent } : t));
       toast.success(`Saved ${currentPath.split("/").pop()}`);
       setTimeout(() => setSaveStatus("idle"), 2000);
     } catch (err) {
@@ -204,21 +394,82 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
     }
   }
 
-  function handleRun() {
+  async function handleRun() {
     if (!fileContent.trim()) return;
-    if (language === "javascript" || language === "javascriptreact") {
+    const mode = getRunMode(language);
+
+    if (mode === "browser-js") {
+      setHtmlPreviewUrl(null);
+      setHtmlPreviewPath("");
       const result = runJavaScript(fileContent);
       setRunOutput(result);
       setIsOutputOpen(true);
       if (result.error) toast.error("Runtime error");
       else toast.success("Ran successfully");
-    } else if (language === "typescript" || language === "typescriptreact") {
-      setRunOutput({ output: "TypeScript must be compiled first.\nTip: ask the AI assistant to convert it to JavaScript, then run.", error: true });
-      setIsOutputOpen(true);
-    } else {
-      setRunOutput({ output: `Cannot run ${language} in the browser.\nFor Python, Rust, etc. — use your terminal: run the file directly.`, error: true });
-      setIsOutputOpen(true);
+      return;
     }
+
+    if (mode === "html-preview") {
+      setRunOutput(null);
+      const url = buildPreviewBlobUrl(fileContent);
+      setHtmlPreviewUrl(url);
+      setHtmlPreviewPath(currentPath);
+      setIsOutputOpen(true);
+      return;
+    }
+
+    if (mode === "shell") {
+      setHtmlPreviewUrl(null);
+      setHtmlPreviewPath("");
+      if (!isTauri()) {
+        const cmd = shellRunCmd(language, currentPath || "file");
+        setRunOutput({ output: `Not running in desktop mode.\n\nTo run this file, use your terminal:\n\n  ${cmd}`, error: true });
+        setIsOutputOpen(true);
+        return;
+      }
+      if (!currentPath) {
+        setRunOutput({ output: "No file is open. Open a file from the file tree first.", error: true });
+        setIsOutputOpen(true);
+        return;
+      }
+      if (!workspacePath) {
+        setRunOutput({ output: "No workspace folder is open.\n\nClick the folder icon in the file tree to open your project, then run again.", error: true });
+        setIsOutputOpen(true);
+        return;
+      }
+
+      // Auto-save if the file has unsaved changes before running
+      const activeTab = openTabs.find((t) => t.path === currentPath);
+      if (activeTab?.isDirty && dirHandle) {
+        try {
+          await writeFileToHandle(dirHandle, currentPath, fileContent);
+          setOpenTabs((prev) => prev.map((t) => t.path === currentPath ? { ...t, isDirty: false, content: fileContent } : t));
+        } catch (e) {
+          setRunOutput({ output: `Could not save file before running: ${(e as Error).message}`, error: true });
+          setIsOutputOpen(true);
+          return;
+        }
+      }
+
+      const cmd = shellRunCmd(language, currentPath);
+      setRunOutput({ output: `$ ${cmd}\n\nRunning…`, error: false });
+      setIsOutputOpen(true);
+      try {
+        const result = await tauriRun(injectGitCredentials(cmd), workspacePath);
+        const combined = sanitizeOutput([result.stdout, result.stderr].filter(Boolean).join("\n"));
+        setRunOutput({ output: `$ ${cmd}\n\n${combined || "(no output)"}`, error: result.exit_code !== 0 });
+        if (result.exit_code !== 0) toast.error(`Exited ${result.exit_code}`);
+        else toast.success("Ran successfully");
+      } catch (e) {
+        setRunOutput({ output: `Failed to run: ${(e as Error).message}`, error: true });
+        toast.error("Run failed");
+      }
+      return;
+    }
+
+    // mode === "none"
+    setRunOutput({ output: `No runner available for "${language}" files.`, error: true });
+    setIsOutputOpen(true);
   }
 
   async function handleChatSend() {
@@ -238,22 +489,29 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
 
     // Build system context
     const parts: string[] = [
-      "You are a code assistant with full read access to the user's workspace.",
+      "You are a code assistant with full access to the user's workspace and shell.",
     ];
 
     if (toolsSupported) {
       parts.push(
-        "IMPORTANT RULES:",
-        "- Before answering any question about the codebase, use your tools to find relevant files.",
-        "- Use grep_files to locate functions, variables, imports, or patterns.",
-        "- Use find_files to locate files by name.",
-        "- Use read_file to read any file you need — especially markdown docs first.",
-        "- Never guess file contents. If unsure, read the file.",
+        "CAPABILITIES:",
+        "- run_command: run any shell command (git, npm, pip, cargo, make, etc.). Always pass the workspace path as cwd.",
+        "- git_status / git_diff / git_log / git_add / git_commit: git operations.",
+        "- read_file / write_file / delete_file / list_directory / grep_files / find_files: file system.",
+        "- web_search: look up docs, examples, or package information.",
+        "",
+        "RULES:",
+        "- Before answering about the codebase, read relevant files first.",
+        "- For tasks like cloning a repo, installing packages, or running tests — use run_command.",
+        "- For git tasks — prefer the specific git_* tools; fall back to run_command for anything else.",
+        "- Never guess file contents or command output. Use your tools.",
+        "- IMPORTANT: When making code changes, use write_file to apply them directly to the file. NEVER output the full file contents or large code blocks in your chat response — only describe what you changed in 1-2 sentences.",
       );
     }
 
     if (dirHandle) {
-      parts.push(`\nWorkspace: ${dirHandle.name}`);
+      const cwdNote = workspacePath ? ` (OS path: ${workspacePath} — use this as cwd for run_command)` : "";
+      parts.push(`\nWorkspace: ${dirHandle.name}${cwdNote}`);
 
       if (workspaceDocs) {
         parts.push(`\n## Workspace documentation (auto-read on open)\n${workspaceDocs}`);
@@ -341,12 +599,9 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
                 });
                 setTimeout(() => aiBottomRef.current?.scrollIntoView({ behavior: "smooth" }), 0);
 
-                // Write tools require explicit user approval
-                if (WRITE_TOOLS.has(call.name)) {
-                  const path = typeof call.args["path"] === "string" ? call.args["path"] : String(call.args["path"] ?? "");
-                  const approved = window.confirm(
-                    `AI wants to write: ${path || "unknown path"}\n\nAllow this file write?`
-                  );
+                // Destructive / side-effect tools require explicit user approval
+                if (APPROVAL_REQUIRED.has(call.name)) {
+                  const approved = window.confirm(buildApprovalPrompt(call.name, call.args));
                   if (!approved) {
                     const deniedSummary = `${label} → denied`;
                     setAiMessages((prev) => {
@@ -480,7 +735,9 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
   }
 
   const pathParts = currentPath ? currentPath.split("/") : [];
-  const canRun = language === "javascript" || language === "javascriptreact";
+  const runMode = getRunMode(language);
+  const canRun = runMode !== "none";
+  const runLabel = runMode === "html-preview" ? "Preview" : "Run";
 
   return (
     <div className="flex flex-col h-full w-full overflow-hidden">
@@ -498,6 +755,36 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
 
         {/* Center: Editor + output */}
         <div className="flex flex-col flex-1 min-w-0">
+          {/* Tab bar */}
+          {openTabs.length > 0 && (
+            <div className="flex items-end gap-0 border-b bg-muted/30 shrink-0 overflow-x-auto">
+              {openTabs.map((tab) => {
+                const name = tab.path.split("/").pop() ?? tab.path;
+                const isActive = tab.path === activeTabPath;
+                return (
+                  <div
+                    key={tab.path}
+                    onClick={() => handleSwitchTab(tab.path)}
+                    className={`flex items-center gap-1.5 px-3 h-8 text-xs cursor-pointer border-r whitespace-nowrap shrink-0 transition-colors ${
+                      isActive
+                        ? "bg-background text-foreground border-b-2 border-b-primary"
+                        : "text-muted-foreground hover:text-foreground hover:bg-background/60"
+                    }`}
+                  >
+                    <span className={tab.isDirty ? "italic" : ""}>{name}</span>
+                    {tab.isDirty && <span className="size-1.5 rounded-full bg-amber-500 shrink-0" />}
+                    <button
+                      onClick={(e) => handleCloseTab(tab.path, e)}
+                      className="ml-0.5 opacity-50 hover:opacity-100 transition-opacity"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
           {/* Top bar */}
           <div className="h-10 border-b bg-card px-3 flex items-center gap-2 shrink-0">
             <div className="flex items-center gap-1 text-xs text-muted-foreground flex-1 min-w-0 overflow-hidden">
@@ -529,12 +816,17 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
             <Button
               size="sm" variant={canRun ? "default" : "outline"}
               className="text-xs h-7 px-2 shrink-0 gap-1"
-              onClick={handleRun}
+              onClick={() => void handleRun()}
               disabled={!fileContent.trim()}
-              title={canRun ? "Run JavaScript (Ctrl+Enter)" : "Run (JS only in browser)"}
+              title={
+                runMode === "browser-js" ? "Run in browser sandbox (Ctrl+Enter)" :
+                runMode === "html-preview" ? "Preview HTML (Ctrl+Enter)" :
+                runMode === "shell" ? `Run via shell${isTauri() ? "" : " (desktop mode required)"}` :
+                "No runner for this language"
+              }
             >
               <Play className="size-3" />
-              Run
+              {runLabel}
             </Button>
 
             <Button
@@ -564,11 +856,19 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
                 language={language}
                 value={fileContent}
                 theme="vs-dark"
-                onChange={(v) => setFileContent(v ?? "")}
+                onChange={(v) => {
+                  const content = v ?? "";
+                  setFileContent(content);
+                  if (currentPath) {
+                    setOpenTabs((prev) =>
+                      prev.map((t) => t.path === currentPath ? { ...t, content, isDirty: true } : t)
+                    );
+                  }
+                }}
                 onMount={(ed) => {
                   editorRef.current = ed;
                   // Ctrl+Enter to run
-                  ed.addCommand(2048 /* Ctrl */ | 3 /* Enter */, () => handleRun());
+                  ed.addCommand(2048 /* Ctrl */ | 3 /* Enter */, () => void handleRun());
                   // Ctrl+S to save
                   ed.addCommand(2048 | 49 /* S */, () => void handleSave());
                 }}
@@ -577,8 +877,40 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
             </Suspense>
           </div>
 
-          {/* Output panel */}
-          {runOutput && (
+          {/* HTML Preview panel */}
+          {htmlPreviewUrl !== null && (
+            <div className="border-t shrink-0" style={{ height: isOutputOpen ? 320 : 32 }}>
+              <div className="flex items-center gap-2 px-3 h-8 bg-zinc-900 text-xs text-zinc-300 border-b border-zinc-700">
+                <button type="button" onClick={() => setIsOutputOpen((v) => !v)} className="flex items-center gap-1.5 hover:text-white transition-colors">
+                  {isOutputOpen ? <ChevronDown className="size-3" /> : <ChevronUp className="size-3" />}
+                  <span className="text-blue-400">HTML Preview</span>
+                  {htmlPreviewPath && (
+                    <span className="text-zinc-500 ml-1">{htmlPreviewPath.split("/").pop()}</span>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setHtmlPreviewUrl(null); setHtmlPreviewPath(""); }}
+                  className="ml-auto text-zinc-500 hover:text-zinc-200 transition-colors"
+                >
+                  <X className="size-3" />
+                </button>
+              </div>
+              {isOutputOpen && (
+                <iframe
+                  key={htmlPreviewUrl}
+                  src={htmlPreviewUrl}
+                  sandbox="allow-scripts"
+                  className="w-full bg-white"
+                  style={{ height: 288, border: "none" }}
+                  title="HTML Preview"
+                />
+              )}
+            </div>
+          )}
+
+          {/* Text output panel */}
+          {runOutput && !htmlPreviewUrl && (
             <div className="border-t bg-zinc-950 shrink-0" style={{ maxHeight: isOutputOpen ? 200 : 32 }}>
               <button
                 type="button"
@@ -662,8 +994,8 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
               <div ref={aiBottomRef} />
             </div>
 
-            {/* Apply button */}
-            {aiMessages.some((m) => m.role === "assistant" && m.content) && (
+            {/* Apply button — only shown when model can't use tools (fallback for plain text responses) */}
+            {!supportsNativeTools(selectedModel) && aiMessages.some((m) => m.role === "assistant" && m.content) && (
               <div className="px-3 py-1.5 border-t">
                 <Button size="sm" variant="outline" className="w-full text-xs h-7" onClick={handleApplyLastResponse}>
                   Apply to {editorRef.current?.getSelection()?.isEmpty() === false ? "selection" : "file"}
