@@ -1,7 +1,51 @@
 use std::process::Command;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use serde::Serialize;
+
+// ─── Ollama lifecycle ─────────────────────────────────────────────────────────
+
+/// Holds the Child handle if *we* spawned Ollama. None means it was already running.
+static OLLAMA_CHILD: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new();
+
+fn is_ollama_running() -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    TcpStream::connect_timeout(
+        &"127.0.0.1:11434".parse().unwrap(),
+        Duration::from_millis(300),
+    ).is_ok()
+}
+
+fn ensure_ollama_running() {
+    // Always init the lock so the exit handler can safely call .get()
+    let lock = OLLAMA_CHILD.get_or_init(|| Mutex::new(None));
+
+    if is_ollama_running() {
+        return; // already up — user-managed instance, leave it alone
+    }
+
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("ollama")
+        .arg("serve")
+        .env("PATH", effective_path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    #[cfg(not(target_os = "windows"))]
+    let result = std::process::Command::new("ollama")
+        .arg("serve")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    if let Ok(child) = result {
+        if let Ok(mut guard) = lock.lock() {
+            *guard = Some(child);
+        }
+    }
+}
 
 // ─── PATH augmentation ────────────────────────────────────────────────────────
 
@@ -557,6 +601,10 @@ pub fn run() {
             fs_read_file_base64,
         ])
         .setup(|app| {
+            // Start Ollama in a background thread so the UI loads immediately.
+            // If Ollama is already running (user-managed), this is a no-op.
+            std::thread::spawn(ensure_ollama_running);
+
             #[cfg(debug_assertions)]
             {
                 use tauri::Manager;
@@ -566,6 +614,19 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Only kill Ollama if we were the ones who started it.
+                if let Some(lock) = OLLAMA_CHILD.get() {
+                    if let Ok(mut guard) = lock.lock() {
+                        if let Some(mut child) = guard.take() {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                    }
+                }
+            }
+        });
 }
