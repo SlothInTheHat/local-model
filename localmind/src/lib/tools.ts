@@ -8,6 +8,11 @@ import { loadSkills, saveSkill } from "./skillEngine";
 import { updateMemorySection, readProjectMemory } from "./projectMemory";
 import { saveDynamicTool } from "./dynamicTools";
 import type { DynamicToolDef } from "./dynamicTools";
+import type { AppView } from "../types/app";
+import { useChatStore } from "../store/chat";
+import { useModelSelectionStore } from "../store/modelSelection";
+import { useAppViewStore } from "../store/appView";
+import { useTaskQueueStore } from "../store/taskQueue";
 
 // ─── Tauri invoke shim ───────────────────────────────────────────────────────
 
@@ -55,7 +60,16 @@ export type ToolName =
   | "todo_write"
   | "apply_patch"
   | "web_fetch"
-  | "create_folder";
+  | "create_folder"
+  | "switch_model"
+  | "switch_view"
+  | "send_task_to_tab";
+
+/** All top-level UI tabs/views, used for switch_view / send_task_to_tab validation. */
+export const APP_VIEWS: AppView[] = [
+  "chat", "code", "docs", "models", "terminal", "agents", "research",
+  "study", "settings", "image", "skills", "benchmarks", "compare", "memory", "logs",
+];
 
 export interface ToolDef {
   // string allows MCP tools with dynamic "serverId__toolName" names
@@ -431,6 +445,40 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
         template: { type: "string", description: "Shell command template using {{paramName}} placeholders, e.g. 'grep -n \"{{pattern}}\" \"{{path}}\"'." },
       },
       required: ["name", "description", "template"],
+    },
+  },
+  {
+    name: "switch_model",
+    description: "Switch the app's active Ollama model. Use when the user asks to change models, or when a different model would suit the current task better.",
+    parameters: {
+      type: "object",
+      properties: {
+        model: { type: "string", description: "Name of an already-pulled Ollama model to switch to (must match an available model exactly)." },
+      },
+      required: ["model"],
+    },
+  },
+  {
+    name: "switch_view",
+    description: "Navigate the user's UI to a different tab/view of the app.",
+    parameters: {
+      type: "object",
+      properties: {
+        view: { type: "string", enum: APP_VIEWS, description: "The tab to switch to." },
+      },
+      required: ["view"],
+    },
+  },
+  {
+    name: "send_task_to_tab",
+    description: "Queue a task description for the agent in another tab to pick up later. Does not switch the user's view or run anything immediately — the user (or that tab's agent) starts it from a banner.",
+    parameters: {
+      type: "object",
+      properties: {
+        target_view: { type: "string", enum: APP_VIEWS, description: "The tab the task is intended for." },
+        task: { type: "string", description: "Description of the task for that tab's agent to perform." },
+      },
+      required: ["target_view", "task"],
     },
   },
 ];
@@ -1067,6 +1115,65 @@ export async function executeTool(
           toolCallId: call.id,
           name: call.name,
           output: JSON.stringify(info, null, 2),
+        };
+      }
+
+      case "switch_model": {
+        const model = argStr(call.args["model"]);
+        if (!model) throw new Error("Missing model argument");
+        const available = useChatStore.getState().availableModels;
+        if (!available.includes(model)) {
+          return {
+            toolCallId: call.id,
+            name: call.name,
+            output: `"${model}" is not in the available models list.`,
+            error: `Model not found. Available models: ${available.join(", ") || "(none)"}`,
+          };
+        }
+        useModelSelectionStore.getState().setSelectedModel(model);
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Switched active model to "${model}".`,
+        };
+      }
+
+      case "switch_view": {
+        const view = argStr(call.args["view"]) as AppView;
+        if (!APP_VIEWS.includes(view)) {
+          return {
+            toolCallId: call.id,
+            name: call.name,
+            output: `"${view}" is not a valid view.`,
+            error: `Invalid view. Valid views: ${APP_VIEWS.join(", ")}`,
+          };
+        }
+        useAppViewStore.getState().setView(view);
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Switched view to "${view}".`,
+        };
+      }
+
+      case "send_task_to_tab": {
+        const targetView = argStr(call.args["target_view"]) as AppView;
+        const task = argStr(call.args["task"]);
+        if (!APP_VIEWS.includes(targetView)) {
+          return {
+            toolCallId: call.id,
+            name: call.name,
+            output: `"${targetView}" is not a valid view.`,
+            error: `Invalid target_view. Valid views: ${APP_VIEWS.join(", ")}`,
+          };
+        }
+        if (!task) throw new Error("Missing task argument");
+        const sourceView = useAppViewStore.getState().view;
+        const id = useTaskQueueStore.getState().enqueue(targetView, task, sourceView);
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Queued task ${id} for the "${targetView}" tab: "${task}"`,
         };
       }
 

@@ -1,4 +1,4 @@
-import { FolderOpen, Calculator, Globe, Pencil, List, Search, FileSearch, TerminalSquare, Info, Trash2, GitBranch, Plug, BookMarked } from "lucide-react";
+import { FolderOpen, Calculator, Globe, Pencil, List, Search, FileSearch, TerminalSquare, Info, Trash2, GitBranch, Plug, BookMarked, Sparkles, LayoutGrid, Send } from "lucide-react";
 import { Button } from "./ui/button";
 import { Card, CardContent } from "./ui/card";
 import { cn } from "./ui/utils";
@@ -32,6 +32,9 @@ function ToolIcon({ name, className }: { name: string; className?: string }) {
     case "save_skill":
     case "list_skills": return <BookMarked className={cls} />;
     case "web_fetch": return <Globe className={cls} />;
+    case "switch_model": return <Sparkles className={cls} />;
+    case "switch_view": return <LayoutGrid className={cls} />;
+    case "send_task_to_tab": return <Send className={cls} />;
     default: return <Plug className={cls} />;
   }
 }
@@ -55,6 +58,9 @@ const TOOL_LABELS: Record<string, string> = {
   save_skill: "Save Skill",
   list_skills: "List Skills",
   web_fetch: "Web Fetch",
+  switch_model: "Switch Model",
+  switch_view: "Switch View",
+  send_task_to_tab: "Send Task to Tab",
 };
 
 export function ToolCallCard({ call, onApprove, onDeny }: Props) {

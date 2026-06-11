@@ -11,8 +11,35 @@ import { loadSkills, matchSkills, formatSkillsForContext } from "./skillEngine";
 import type { Skill } from "./skillEngine";
 import { formatToolLabel, summariseToolResult } from "./toolFormatting";
 import { StuckDetector, errorRecoveryHint, toolResultFailed } from "./stuckDetector";
+import type { AppView } from "../types/app";
+import { useTaskQueueStore } from "../store/taskQueue";
 
 export const DEFAULT_MAX_ROUNDS = 50;
+
+/** Concise, always-on description of LocalMind's own views and the 3 app-control tools, injected into every system prompt. */
+const APP_CAPABILITIES_BLOCK = `## About LocalMind
+LocalMind is a desktop app (Tauri + React) wrapping local Ollama models in a
+coding-agent UI with multiple tabs:
+- chat: conversational chat, optional agent tools
+- code: Monaco editor + file tree + this agent loop
+- docs: Tiptap document editor with AI slash commands
+- models: browse/download Ollama models
+- terminal: shell terminal
+- agents: subagent manager (parallel one-off agent tasks)
+- research: deep research mode (multi-step web research)
+- study: study mode (topic Q&A)
+- settings: app settings (incl. feature-idea steering)
+- image: image editor with AI chat panel
+- skills: skill registry browser
+- benchmarks: model benchmark runner
+- compare: side-by-side model comparison
+- memory: persistent memory browser
+- logs: agent session logs
+
+Tools: switch_model (change the active Ollama model app-wide), switch_view
+(navigate the user's UI to another tab), send_task_to_tab (queue a task for
+the agent in another tab to pick up later — does not interrupt or switch the
+user's current view).`;
 
 export interface TodoItem {
   id: string;
@@ -46,6 +73,8 @@ export interface AgentRuntimeConfig {
   dirHandle: FileSystemDirectoryHandle | null;
   workspacePath: string | null;
   workspaceName: string | null;
+  /** The tab this agent session is running in — used to surface tasks queued for this tab via send_task_to_tab. */
+  currentView: AppView;
 
   tools: ToolDef[];
   agentBuildMode: boolean;
@@ -82,6 +111,7 @@ const TOOL_GROUPS: Array<[string, string[]]> = [
   ["git", ["git_status", "git_diff", "git_log", "git_add", "git_commit"]],
   ["web", ["web_search", "web_fetch"]],
   ["state", ["todo_write", "update_project_memory", "list_skills", "save_skill", "get_system_info"]],
+  ["app", ["switch_model", "switch_view", "send_task_to_tab"]],
 ];
 
 function buildSystemPrompt(config: AgentRuntimeConfig): string {
@@ -122,6 +152,8 @@ function buildSystemPrompt(config: AgentRuntimeConfig): string {
     "- 'up to date' / 'already satisfied' / 'already installed' in install output means the dependency is present — do not re-run the install, move on.",
     "- web_search is capped at 4 calls this session — after 1-2 searches, commit to an approach.",
     "- Never simulate actions in text (writing out 'Todos: ... (completed)', pasting code instead of writing it, describing a command instead of running it). Every action is a real tool call. A response with no tool call ends the task.",
+    "",
+    APP_CAPABILITIES_BLOCK,
   );
 
   if (config.toolsSupported) {
@@ -291,6 +323,17 @@ async function buildCurrentStateBlock(
       "```" + openFile.language,
       snippet + (fileLines.length > 80 ? "\n…(truncated)" : ""),
       "```",
+    );
+  }
+
+  const pendingTasks = useTaskQueueStore.getState().tasks.filter(
+    (t) => t.targetView === config.currentView && t.status === "pending"
+  );
+  if (pendingTasks.length > 0) {
+    lines.push(
+      "",
+      "Pending tasks queued for this tab (from another tab's agent — the user can start these via the banner, or you may begin one now if it fits the current task):",
+      ...pendingTasks.map((t) => `- (from ${t.sourceView}) ${t.task}`),
     );
   }
 

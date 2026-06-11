@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { AlertCircle, SlidersHorizontal, Volume2, VolumeX } from "lucide-react";
+import { AlertCircle, SlidersHorizontal, Volume2, VolumeX, Lightbulb } from "lucide-react";
 import { toast, Toaster } from "sonner";
 import { recommendModel } from "./lib/modelRecommender";
 import { listModels, pullModel } from "./lib/ollama";
@@ -16,6 +16,9 @@ import { useProvidersStore } from "./store/providers";
 import { openWorkspace } from "./lib/fileSystem";
 import { useChatStore } from "./store/chat";
 import { useAgentStore } from "./store/agent";
+import { useAppViewStore } from "./store/appView";
+import { useModelSelectionStore } from "./store/modelSelection";
+import { QueuedTaskBanner } from "./components/QueuedTaskBanner";
 import { ChatSidebar } from "./components/ChatSidebar";
 import { ConversationSearch } from "./components/ConversationSearch";
 import { ChatMessages } from "./components/ChatMessages";
@@ -24,7 +27,6 @@ import { ModelManager } from "./components/ModelManager";
 import { AgentToolbar } from "./components/AgentToolbar";
 import { ToolCallCard } from "./components/ToolCallCard";
 import { SystemPromptDialog } from "./components/SystemPromptDialog";
-import type { AppView } from "./types/app";
 import { lazy, Suspense } from "react";
 
 const CodeEditor = lazy(() =>
@@ -95,17 +97,10 @@ export default function App() {
   } = useAgentStore();
 
   const { hardware, vramOverride } = useModelStore();
-  const { numCtxOverride } = useSettingsStore();
+  const { numCtxOverride, featureIdeasSteering } = useSettingsStore();
 
-  const [view, setView] = useState<AppView>("chat");
-  // Track which heavy views have been visited so we can keep them mounted (hidden)
-  // instead of unmounting them — preserves any running agent loops.
-  const [mountedViews, setMountedViews] = useState<Set<AppView>>(new Set<AppView>());
-  function handleViewChange(v: AppView) {
-    setMountedViews((prev) => { const next = new Set(prev); next.add(v); return next; });
-    setView(v);
-  }
-  const [selectedModel, setSelectedModel] = useState("");
+  const { view, mountedViews, setView } = useAppViewStore();
+  const { selectedModel, setSelectedModel } = useModelSelectionStore();
   const [ollamaError, setOllamaError] = useState<string | null>(null);
   const [webSearchEnabled, setWebSearchEnabled] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
@@ -272,7 +267,7 @@ export default function App() {
 
   // ─── Normal send (non-agent) ──────────────────────────────────────────────
 
-  async function handleSend(text: string) {
+  async function handleSend(text: string, forceAgentMode = false) {
     if (!selectedModel) return;
 
     // Model recommendation — only toast if the suggestion is new
@@ -333,7 +328,7 @@ export default function App() {
       }
     }
 
-    if (agentMode) {
+    if (agentMode || forceAgentMode) {
       // Fresh agent task — require approval again from scratch.
       autoApproveRemainingRef.current = false;
       await runAgentLoop(convId, history);
@@ -399,6 +394,7 @@ export default function App() {
         dirHandle,
         workspacePath,
         workspaceName: dirHandle?.name ?? null,
+        currentView: "chat",
         tools: enabledTools,
         agentBuildMode: true,
         autoApproveAll: false,
@@ -493,7 +489,7 @@ export default function App() {
       <Toaster position="bottom-right" richColors closeButton />
       <ChatSidebar
         view={view}
-        onViewChange={handleViewChange}
+        onViewChange={setView}
         selectedModel={selectedModel}
         onModelChange={(m) => { setSelectedModel(m); toast.info(`Model: ${m}`, { duration: 2000 }); }}
         onOpenSearch={() => setSearchOpen(true)}
@@ -513,6 +509,31 @@ export default function App() {
                 {activeConv?.title ?? "AI Chat"}
               </h2>
               <div className="flex items-center gap-0.5">
+                {/* Research feature ideas */}
+                {dirHandle && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAgentMode(true);
+                      const steering = featureIdeasSteering.trim();
+                      void handleSend(
+                        `Research new feature ideas for LocalMind. Use web_search/web_fetch to see ` +
+                        `what similar tools (Claude Code, Cursor, other local-LLM agent apps) are ` +
+                        `doing well. Re-read the "About LocalMind" section of your system prompt ` +
+                        `so you don't suggest things that already exist.\n` +
+                        (steering ? `Steering from the user: ${steering}\n` : "") +
+                        `Write a prioritized list of 5-10 concrete next features to ` +
+                        `FEATURE_IDEAS.md in the workspace root. For each: a short title, a 1-2 ` +
+                        `sentence description, and why it's useful.`,
+                        true
+                      );
+                    }}
+                    title="Research new feature ideas and write FEATURE_IDEAS.md to the workspace"
+                    className="size-8 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+                  >
+                    <Lightbulb className="size-4" />
+                  </button>
+                )}
                 {/* TTS toggle */}
                 <button
                   type="button"
@@ -579,6 +600,14 @@ export default function App() {
                 ))}
               </div>
             )}
+
+            <QueuedTaskBanner
+              view="chat"
+              onStart={(task) => {
+                setAgentMode(true);
+                void handleSend(task, true);
+              }}
+            />
 
             <ChatInput
               onSend={(text) => void handleSend(text)}

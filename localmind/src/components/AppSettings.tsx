@@ -302,8 +302,8 @@ function ProvidersSection() {
 export function AppSettings() {
   const { gitName, gitEmail, setGitIdentity } = useProfileStore();
   const {
-    defaultSystemPrompt, agentAutoApproveReads, theme, numCtxOverride,
-    setDefaultSystemPrompt, setAgentAutoApproveReads, setTheme, setNumCtxOverride,
+    defaultSystemPrompt, agentAutoApproveReads, theme, numCtxOverride, featureIdeasSteering,
+    setDefaultSystemPrompt, setAgentAutoApproveReads, setTheme, setNumCtxOverride, setFeatureIdeasSteering,
   } = useSettingsStore();
   const { hardware, vramOverride } = useModelStore();
 
@@ -496,6 +496,20 @@ export function AppSettings() {
                       Reset to auto
                     </Button>
                   </div>
+                </Field>
+
+                {/* Feature idea steering */}
+                <Field
+                  label="Feature idea steering (optional)"
+                  hint='Guides the "Research feature ideas" action (Chat, with a workspace open) toward the kind of features you want.'
+                >
+                  <textarea
+                    value={featureIdeasSteering}
+                    onChange={(e) => setFeatureIdeasSteering(e.target.value)}
+                    rows={3}
+                    placeholder="e.g. Lean towards a JARVIS-style assistant: voice control, proactive automation, deeper OS integration."
+                    className="w-full text-sm px-3 py-2 rounded-md border border-border bg-background text-foreground outline-none focus:ring-2 focus:ring-ring resize-none"
+                  />
                 </Field>
               </CardContent>
             </Card>

@@ -28,6 +28,9 @@ export function formatToolLabel(name: string, args: Record<string, unknown>): st
     case "list_skills":     return `📚 Listing skills`;
     case "update_project_memory": return `🧠 Updating memory: ${args["section"]}`;
     case "register_tool":   return `🔧 Registering tool: ${args["name"]}`;
+    case "switch_model":    return `🔀 Switching model to ${args["model"]}`;
+    case "switch_view":     return `🧭 Switching view to ${args["view"]}`;
+    case "send_task_to_tab": return `📨 Sending task to ${args["target_view"]}`;
     default:                return `⚙ ${name}`;
   }
 }
@@ -67,6 +70,9 @@ export function summariseToolResult(name: string, args: Record<string, unknown>,
     case "list_skills":     return `📚 ${lines} skill${lines !== 1 ? "s" : ""} found`;
     case "update_project_memory": return `🧠 Memory updated: ${args["section"]}`;
     case "register_tool":   return `🔧 Tool registered: ${args["name"]}`;
+    case "switch_model":    return `🔀 Switched model to ${args["model"]}`;
+    case "switch_view":     return `🧭 Switched view to ${args["view"]}`;
+    case "send_task_to_tab": return `📨 Task queued for ${args["target_view"]}`;
     default:                return `⚙ ${name} — done`;
   }
 }

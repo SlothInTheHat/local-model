@@ -36,6 +36,9 @@ const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   apply_patch: true,
   web_fetch: true,
   create_folder: true,
+  switch_model: true,
+  switch_view: true,
+  send_task_to_tab: true,
 };
 
 export const useAgentStore = create<AgentState>()((set) => ({

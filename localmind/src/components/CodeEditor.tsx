@@ -661,6 +661,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
       "git_status", "git_commit",
       "update_project_memory",
       "create_folder",
+      "switch_model", "switch_view", "send_task_to_tab",
     ]);
     const dynamicOllamaTools = dynamicToolDefs.map(toOllamaTool);
     const CODE_TOOLS = [
@@ -729,6 +730,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
         dirHandle,
         workspacePath,
         workspaceName: dirHandle?.name ?? null,
+        currentView: "code",
         tools: CODE_TOOLS,
         agentBuildMode,
         autoApproveAll,
