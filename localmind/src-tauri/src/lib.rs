@@ -296,6 +296,8 @@ fn run_command(
     // Uses std::process::Child so cwd is always respected (tokio jobs ignore cwd).
     const TIMEOUT_SECS: u64 = 30;
 
+    const TIMEOUT_MSG: &str = "(timed out after 30s and the process was terminated - dev servers and other long-running commands (npm start, npm run dev, flask run, etc.) must be run manually in your own terminal, not via the agent. Use a build/typecheck/test command to verify instead.)";
+
     #[cfg(target_os = "windows")]
     let output = {
         use std::process::Stdio;
@@ -309,6 +311,7 @@ fn run_command(
             .spawn()
             .map_err(|e| e.to_string())?;
 
+        let pid = child.id();
         let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<std::process::Output>>();
         std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
 
@@ -316,8 +319,13 @@ fn run_command(
             Ok(Ok(out)) => out,
             Ok(Err(e)) => return Err(e.to_string()),
             Err(_) => {
+                // Kill the whole process tree (e.g. powershell -> npm -> node) so
+                // dev servers don't keep running in the background after we time out.
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .output();
                 return Ok(CommandResult {
-                    stdout: "(timed out after 30s - GUI apps like OpenCV must be run in your terminal, not via the agent)".to_string(),
+                    stdout: TIMEOUT_MSG.to_string(),
                     stderr: String::new(),
                     exit_code: 1,
                     cwd: work_dir_str.to_string(),
@@ -329,6 +337,7 @@ fn run_command(
 
     #[cfg(not(target_os = "windows"))]
     let output = {
+        use std::os::unix::process::CommandExt;
         use std::process::Stdio;
         let child = Command::new("sh")
             .args(["-c", &cmd])
@@ -336,9 +345,13 @@ fn run_command(
             .current_dir(work_dir_str)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // New process group so we can kill the whole tree (sh + any children
+            // it spawns, e.g. npm -> node) on timeout, not just the shell.
+            .process_group(0)
             .spawn()
             .map_err(|e| e.to_string())?;
 
+        let pid = child.id();
         let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<std::process::Output>>();
         std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
 
@@ -346,8 +359,9 @@ fn run_command(
             Ok(Ok(out)) => out,
             Ok(Err(e)) => return Err(e.to_string()),
             Err(_) => {
+                let _ = Command::new("kill").args(["-9", &format!("-{pid}")]).output();
                 return Ok(CommandResult {
-                    stdout: "(timed out after 30s - GUI apps must be run manually in a terminal)".to_string(),
+                    stdout: TIMEOUT_MSG.to_string(),
                     stderr: String::new(),
                     exit_code: 1,
                     cwd: work_dir_str.to_string(),

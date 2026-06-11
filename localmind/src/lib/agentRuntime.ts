@@ -7,6 +7,8 @@ import { fileExists, listDirectory } from "./fileSystem";
 import type { FileEntry } from "./fileSystem";
 import type { HardwareInfo } from "./hardware";
 import { formatMemoryForContext, readProjectMemory } from "./projectMemory";
+import { loadSkills, matchSkills, formatSkillsForContext } from "./skillEngine";
+import type { Skill } from "./skillEngine";
 import { formatToolLabel, summariseToolResult } from "./toolFormatting";
 import { StuckDetector, errorRecoveryHint, toolResultFailed } from "./stuckDetector";
 
@@ -27,7 +29,7 @@ export const PLAN_MODE_DENIED = new Set([
 /** Tools that mutate the workspace or run commands — require approval unless auto-approve is on. */
 export const APPROVAL_REQUIRED = new Set([
   "write_file", "patch_file", "apply_patch", "delete_file",
-  "run_command", "git_add", "git_commit",
+  "run_command", "git_add", "git_commit", "save_skill",
 ]);
 
 export interface OpenFileInfo {
@@ -86,7 +88,7 @@ function buildSystemPrompt(config: AgentRuntimeConfig): string {
   const modeTag = config.agentBuildMode ? "BUILD" : "PLAN";
   const lines: string[] = [];
 
-  let runtimeLine = `Runtime: model=${config.modelRef}`;
+  let runtimeLine = `Runtime: model=${config.modelRef}, OS=${navigator.platform}`;
   if (config.hardware) {
     runtimeLine += `, GPU=${config.hardware.gpuName} (${config.hardware.vramGb}GB VRAM), RAM=${config.hardware.ramGb}GB`;
   }
@@ -103,18 +105,20 @@ function buildSystemPrompt(config: AgentRuntimeConfig): string {
     runtimeLine,
     "",
     "## Core loop — every round",
-    "1. ORIENT: read the 'Current state' block below (todos, file tree, last action, open file). Don't re-list a directory you've already seen — read the files inside it instead.",
-    "2. PLAN: if you don't have a todo list yet, call todo_write ONCE with the full plan. Never call todo_write twice in a row.",
-    "3. ACT: make exactly ONE tool call that advances the in_progress (or first pending) todo — a real action (read/write/patch/run/search), not another planning call.",
-    "4. VERIFY: read the FULL result of that call before deciding what to do next. Exit code 0 and no errors means success.",
-    "5. UPDATE: when a todo is finished, call todo_write to mark it complete, then immediately continue with the next todo — don't stop to announce it.",
-    "6. ON ERROR: read the [RECOVERY HINT] attached to the failed result and follow it. Never repeat the exact same failing call — it will be blocked.",
+    "1. ORIENT: read the 'Current state' block below (todos, file tree, last action, open file, relevant skills). Don't re-list a directory you've already seen — read the files inside it instead.",
+    "2. SKILL CHECK (Round 1 of a real multi-step build/coding task only — skip for quick questions or small one-off edits): if 'Relevant skills' are listed below, those are skills you already have for this — use them and do NOT search for replacements. If none are listed, you may run ONE web_search for an existing published skill/guide for this kind of task (e.g. \"claude code skill <topic>\", \"agent skill <topic>\"). If a result looks clearly useful, web_fetch it and call save_skill to install it (the user will be asked to approve) before continuing. If nothing relevant turns up, just proceed — never search or install a skill 'just because it's a step'.",
+    "3. PLAN: if you don't have a todo list yet, call todo_write ONCE with the full plan. Never call todo_write twice in a row.",
+    "4. ACT: make exactly ONE tool call that advances the in_progress (or first pending) todo — a real action (read/write/patch/run/search), not another planning call.",
+    "5. VERIFY: read the FULL result of that call before deciding what to do next. Exit code 0 and no errors means success.",
+    "6. UPDATE: when a todo is finished, call todo_write to mark it complete, then immediately continue with the next todo — don't stop to announce it.",
+    "7. ON ERROR: read the [RECOVERY HINT] attached to the failed result and follow it. Never repeat the exact same failing call — it will be blocked.",
     "",
     "## Core rules",
     "- Before touching a project, read its key files (package.json/README/entry point) to understand what already exists.",
     "- The system blocks write_file/patch_file/apply_patch on existing files you haven't read yet — call read_file first.",
     "- patch_file (or apply_patch) for edits to existing files. write_file is for brand-new files only.",
-    "- run_command: pass cwd= for subdirectories, never 'cd dir && cmd'. Never start dev servers or other long-running/blocking processes (npm start, npm run dev, flask run, etc.) — use build/typecheck/test commands to verify instead.",
+    "- run_command: pass cwd= for subdirectories, never 'cd dir && cmd'. Never start dev servers or other long-running/blocking processes (npm start, npm run dev, flask run, etc.) — they will be killed after 30s; use build/typecheck/test commands to verify instead.",
+    "- run_command executes via PowerShell on Windows and sh on Mac/Linux (see OS= above) — use that shell's syntax. On Windows: 'Remove-Item -Recurse -Force' not 'rm -rf', 'New-Item -ItemType Directory' not 'mkdir -p', '$env:VAR' not '$VAR'.",
     "- 'up to date' / 'already satisfied' / 'already installed' in install output means the dependency is present — do not re-run the install, move on.",
     "- web_search is capped at 4 calls this session — after 1-2 searches, commit to an approach.",
     "- Never simulate actions in text (writing out 'Todos: ... (completed)', pasting code instead of writing it, describing a command instead of running it). Every action is a real tool call. A response with no tool call ends the task.",
@@ -171,6 +175,42 @@ interface RuntimeState {
   treeDirty: boolean;
   cachedMemory: string;
   memoryDirty: boolean;
+  cachedSkills: Skill[] | null;
+  skillsDirty: boolean;
+  taskQuery: string;
+  changedFiles: Set<string>;
+}
+
+/** Pulls the most recent user message to use as the query for skill matching. */
+function deriveTaskQuery(history: ChatMessage[]): string {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (m.role === "user" && m.content.trim()) return m.content.slice(0, 500);
+  }
+  return "";
+}
+
+/** One-time nudge injected when the agent stops without a tool call, to catch premature "done" and do a final code review of changed files. */
+function buildCompletionReviewPrompt(taskQuery: string, changedFiles: Set<string>): string {
+  const lines = ["You stopped without making a tool call. Before ending, do a final review of this session's work."];
+  if (taskQuery) lines.push(`Original request: "${taskQuery}"`);
+  lines.push("");
+
+  if (changedFiles.size > 0) {
+    lines.push(
+      "Files you created or edited this session:",
+      ...[...changedFiles].map((f) => `- ${f}`),
+      "",
+      "Read through each of these files (read_file) and check: does the code make sense, is it complete, and does it actually achieve the original request? If you find bugs, missing pieces, leftover placeholders, or anything inconsistent, fix it now with the next tool call.",
+    );
+  } else {
+    lines.push(
+      "Check the Current state above (file tree, todos, open file) against the original request. If anything is missing, broken, or left unfinished, make the next tool call now to fix it.",
+    );
+  }
+
+  lines.push("", "If everything is correct and complete, or you need specific information from the user to continue, give a brief plain-language summary or question instead — no tool call needed.");
+  return lines.join("\n");
 }
 
 async function buildCurrentStateBlock(
@@ -225,6 +265,19 @@ async function buildCurrentStateBlock(
         ? state.cachedMemory.slice(0, 400) + "\n…"
         : state.cachedMemory;
       lines.push("", formatMemoryForContext(truncated));
+    }
+
+    if (state.skillsDirty || state.cachedSkills === null) {
+      try {
+        state.cachedSkills = await loadSkills(config.dirHandle);
+      } catch {
+        state.cachedSkills = [];
+      }
+      state.skillsDirty = false;
+    }
+    if (state.cachedSkills.length > 0 && state.taskQuery) {
+      const matched = matchSkills(state.cachedSkills, state.taskQuery, 3, 1);
+      if (matched.length > 0) lines.push("", formatSkillsForContext(matched));
     }
   }
 
@@ -384,6 +437,10 @@ export async function runAgentSession(
     treeDirty: true,
     cachedMemory: "",
     memoryDirty: true,
+    cachedSkills: null,
+    skillsDirty: true,
+    taskQuery: deriveTaskQuery(priorHistory),
+    changedFiles: new Set<string>(),
   };
 
   let history: ChatMessage[] = [...priorHistory];
@@ -392,6 +449,7 @@ export async function runAgentSession(
   let wasAborted = false;
   let round = 0;
   let lastRoundHadToolCalls = false;
+  let completionCheckDone = false;
 
   const toolsForModel = config.toolsSupported ? config.tools : [];
 
@@ -420,16 +478,22 @@ export async function runAgentSession(
       ];
 
       lastRoundHadToolCalls = false;
+      let roundText = "";
 
       for await (const event of runAgentTurnForModel(config.modelRef, messagesForRound, toolsForModel, config.signal, { numCtx })) {
         if (config.signal.aborted) throw new DOMException("Aborted", "AbortError");
 
         if (event.type === "text_delta" && event.content) {
           if (event.content.startsWith("\x00CLEAN:")) {
-            config.onTextReplace(event.content.slice("\x00CLEAN:".length));
+            const clean = event.content.slice("\x00CLEAN:".length);
+            config.onTextReplace(clean);
+            roundText = clean;
           } else {
             const cleaned = event.content.replace(/<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>/g, "");
-            if (cleaned) config.onTextDelta(cleaned);
+            if (cleaned) {
+              config.onTextDelta(cleaned);
+              roundText += cleaned;
+            }
           }
         } else if (event.type === "tool_calls" && event.toolCalls) {
           lastRoundHadToolCalls = true;
@@ -449,9 +513,13 @@ export async function runAgentSession(
               hadSideEffects = true;
               state.treeDirty = true;
               if (call.name === "install_deps") state.memoryDirty = true;
+              for (const p of pathsFromCall(call)) state.changedFiles.add(p);
             }
             if (!blocked && call.name === "update_project_memory" && !result.error) {
               state.memoryDirty = true;
+            }
+            if (!blocked && call.name === "save_skill" && !result.error) {
+              state.skillsDirty = true;
             }
 
             const summary = blocked
@@ -473,7 +541,18 @@ export async function runAgentSession(
         }
       }
 
-      if (!lastRoundHadToolCalls) break;
+      if (!lastRoundHadToolCalls) {
+        const trimmed = roundText.trim();
+        const looksLikeQuestion = /\?\s*$/.test(trimmed);
+        const canRecheck = config.agentBuildMode && hadSideEffects && !completionCheckDone
+          && trimmed.length > 0 && !looksLikeQuestion && round < config.maxRounds;
+        if (canRecheck) {
+          completionCheckDone = true;
+          history = [...history, { role: "user", content: buildCompletionReviewPrompt(state.taskQuery, state.changedFiles) }];
+          continue;
+        }
+        break;
+      }
     }
 
     if (round >= config.maxRounds && lastRoundHadToolCalls) {

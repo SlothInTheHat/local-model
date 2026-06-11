@@ -1,4 +1,4 @@
-import { FolderOpen, Calculator, Globe, Pencil, List, Search, FileSearch, TerminalSquare, Info, Trash2, GitBranch, Plug } from "lucide-react";
+import { FolderOpen, Calculator, Globe, Pencil, List, Search, FileSearch, TerminalSquare, Info, Trash2, GitBranch, Plug, BookMarked } from "lucide-react";
 import { Button } from "./ui/button";
 import { Card, CardContent } from "./ui/card";
 import { cn } from "./ui/utils";
@@ -29,6 +29,9 @@ function ToolIcon({ name, className }: { name: string; className?: string }) {
     case "git_log":
     case "git_add":
     case "git_commit": return <GitBranch className={cls} />;
+    case "save_skill":
+    case "list_skills": return <BookMarked className={cls} />;
+    case "web_fetch": return <Globe className={cls} />;
     default: return <Plug className={cls} />;
   }
 }
@@ -49,6 +52,9 @@ const TOOL_LABELS: Record<string, string> = {
   git_log: "Git Log",
   git_add: "Git Add",
   git_commit: "Git Commit",
+  save_skill: "Save Skill",
+  list_skills: "List Skills",
+  web_fetch: "Web Fetch",
 };
 
 export function ToolCallCard({ call, onApprove, onDeny }: Props) {
