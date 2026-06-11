@@ -1,7 +1,10 @@
 /**
- * Returns true if the model supports native tool/function calling via Ollama.
+ * Returns true if the model supports native tool/function calling.
+ * Non-Ollama models (containing "::") use OpenAI-compat format and always support tools.
  */
 export function supportsNativeTools(modelName: string): boolean {
+  // OpenAI-compatible provider models always support tool use
+  if (modelName.includes("::")) return true;
   const lower = modelName.toLowerCase();
   return (
     // Meta Llama 3.1+

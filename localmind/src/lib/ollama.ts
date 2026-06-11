@@ -25,6 +25,7 @@ export async function listModels(): Promise<OllamaModel[]> {
 export interface PullUpdate {
   status: string;
   percent: number; // 0-100; 0 when status has no progress info
+  done?: boolean;  // true only on the final "success" message
 }
 
 export async function* pullModel(
@@ -50,15 +51,17 @@ export async function* pullModel(
 
     const lines = decoder.decode(value, { stream: true }).split("\n").filter(Boolean);
     for (const line of lines) {
-      try {
-        const json = JSON.parse(line);
-        const percent =
-          json.total > 0 ? Math.round((json.completed / json.total) * 100) : 0;
-        yield { status: json.status ?? "", percent };
-        if (json.status === "success") return;
-      } catch {
-        // skip malformed lines
-      }
+      let json: Record<string, unknown>;
+      try { json = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+      if (json["error"]) throw new Error(String(json["error"]));
+      const percent =
+        (json["total"] as number) > 0
+          ? Math.round(((json["completed"] as number) / (json["total"] as number)) * 100)
+          : 0;
+      const status = (json["status"] as string) ?? "";
+      const isDone = status === "success";
+      yield { status, percent, done: isDone };
+      if (isDone) return;
     }
   }
 }
@@ -84,7 +87,10 @@ export async function* streamChat(
     signal,
   });
 
-  if (!res.ok) throw new Error(`Ollama returned ${res.status}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(body ? `Ollama ${res.status}: ${body.slice(0, 300)}` : `Ollama returned ${res.status}`);
+  }
   if (!res.body) throw new Error("No response body from Ollama");
 
   const reader = res.body.getReader();

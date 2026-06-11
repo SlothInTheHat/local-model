@@ -1,9 +1,44 @@
 import { useState } from "react";
-import { Plus, Trash2, RefreshCw, CheckCircle2, XCircle, Circle, ChevronDown, ChevronRight } from "lucide-react";
+import { Plus, Trash2, RefreshCw, CheckCircle2, XCircle, Circle, ChevronDown, ChevronRight, Mail, HardDrive, Calendar, Globe, Check } from "lucide-react";
 import { Button } from "./ui/button";
 import { Card, CardContent } from "./ui/card";
 import { useMcpStore, type McpServer } from "../store/mcp";
 import { mcpInitialize, mcpListTools, mcpStopServer } from "../lib/mcp";
+
+const QUICK_TEMPLATES = [
+  {
+    id: "gmail",
+    label: "Gmail",
+    Icon: Mail,
+    command: "npx",
+    args: "-y mcp-gmail",
+    description: "Read, search & send email (needs OAuth setup)",
+  },
+  {
+    id: "gdrive",
+    label: "Google Drive",
+    Icon: HardDrive,
+    command: "npx",
+    args: "-y @modelcontextprotocol/server-gdrive",
+    description: "Browse, read & create Drive files (needs OAuth setup)",
+  },
+  {
+    id: "gcal",
+    label: "Google Calendar",
+    Icon: Calendar,
+    command: "npx",
+    args: "-y google-calendar-mcp",
+    description: "View & create calendar events (needs OAuth setup)",
+  },
+  {
+    id: "browser",
+    label: "Browser",
+    Icon: Globe,
+    command: "npx",
+    args: "-y @playwright/mcp@latest",
+    description: "Automate browser navigation & forms",
+  },
+] as const;
 
 const STATUS_ICON: Record<McpServer["status"], React.ReactNode> = {
   disconnected: <Circle className="size-3 text-muted-foreground" />,
@@ -69,6 +104,48 @@ export function McpSettings() {
 
   return (
     <div className="space-y-3">
+      {/* Quick Setup cards */}
+      <div>
+        <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">Quick Setup</span>
+        <div className="grid grid-cols-2 gap-1.5 mt-1.5">
+          {QUICK_TEMPLATES.map((t) => {
+            const alreadyAdded = servers.some((s) => s.id === t.id);
+            return (
+              <button
+                key={t.id}
+                disabled={alreadyAdded}
+                onClick={() => {
+                  if (alreadyAdded) return;
+                  addServer({
+                    id: t.id,
+                    label: t.label,
+                    transport: "stdio",
+                    command: t.command,
+                    args: t.args.split(" ").filter(Boolean),
+                    env: {},
+                    url: undefined,
+                    enabled: true,
+                  });
+                }}
+                className={`flex flex-col items-start p-2 rounded-md border text-left transition-colors ${
+                  alreadyAdded
+                    ? "border-green-200 bg-green-50 text-green-700 cursor-default"
+                    : "border-border bg-background hover:bg-accent hover:border-primary/30 cursor-pointer"
+                }`}
+              >
+                <div className="flex items-center gap-1.5 mb-0.5">
+                  {alreadyAdded
+                    ? <Check className="size-3 text-green-600 shrink-0" />
+                    : <t.Icon className="size-3 text-muted-foreground shrink-0" />}
+                  <span className="text-[11px] font-medium leading-none">{t.label}</span>
+                </div>
+                <span className="text-[9px] text-muted-foreground leading-tight">{t.description}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       <div className="flex items-center justify-between">
         <span className="text-xs font-medium text-foreground">MCP Servers</span>
         <Button size="sm" variant="ghost" className="h-6 text-xs gap-1" onClick={() => setAdding((v) => !v)}>
@@ -169,7 +246,7 @@ export function McpSettings() {
             </div>
 
             {server.errorMessage && server.status === "error" && (
-              <p className="text-[10px] text-destructive truncate">{server.errorMessage}</p>
+              <p className="text-[10px] text-destructive break-all whitespace-pre-wrap leading-tight">{server.errorMessage}</p>
             )}
 
             {expanded === server.id && (

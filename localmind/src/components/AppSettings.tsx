@@ -1,11 +1,14 @@
 import { useState } from "react";
-import { Eye, EyeOff, CheckCircle2, XCircle, RefreshCw, Settings, User, GitBranch, Globe } from "lucide-react";
+import { Eye, EyeOff, CheckCircle2, XCircle, RefreshCw, Settings, User, GitBranch, Globe, Plug } from "lucide-react";
 import { Button } from "./ui/button";
 import { Card, CardContent } from "./ui/card";
 import { Separator } from "./ui/separator";
 import { ScrollArea } from "./ui/scroll-area";
 import { useProfileStore } from "../store/profile";
 import { useSettingsStore } from "../store/settings";
+import { useProvidersStore } from "../store/providers";
+import { useModelStore } from "../store/models";
+import { recommendedNumCtx } from "../lib/contextSize";
 import { McpSettings } from "./McpSettings";
 
 // ─── Section wrapper ──────────────────────────────────────────────────────────
@@ -204,20 +207,117 @@ function GitLabSection() {
   );
 }
 
+// ─── Providers section ────────────────────────────────────────────────────────
+
+function ProvidersSection() {
+  const { providers, setProvider } = useProvidersStore();
+  const [showKeys, setShowKeys] = useState<Record<string, boolean>>({});
+  const [modelEdits, setModelEdits] = useState<Record<string, string>>({});
+
+  function toggleKey(id: string) {
+    setShowKeys((s) => ({ ...s, [id]: !s[id] }));
+  }
+
+  function getModelDraft(id: string, current: string[]) {
+    return modelEdits[id] ?? current.join("\n");
+  }
+
+  function saveModels(id: string, current: string[]) {
+    const draft = modelEdits[id] ?? current.join("\n");
+    const models = draft.split("\n").map((m) => m.trim()).filter(Boolean);
+    setProvider(id, { models });
+  }
+
+  return (
+    <div className="space-y-3">
+      {providers.map((p) => (
+        <Card key={p.id}>
+          <CardContent className="p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <span className="text-sm font-medium text-foreground">{p.name}</span>
+                <span className="ml-2 text-[10px] text-muted-foreground font-mono">{p.baseUrl}</span>
+              </div>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <span className="text-xs text-muted-foreground">{p.enabled ? "Enabled" : "Disabled"}</span>
+                <input
+                  type="checkbox"
+                  checked={p.enabled}
+                  onChange={(e) => setProvider(p.id, { enabled: e.target.checked })}
+                  className="size-4 rounded"
+                />
+              </label>
+            </div>
+
+            {p.enabled && (
+              <>
+                {/* API key */}
+                <Field label="API Key" hint={p.id === "llamacpp" ? "Leave empty for local llama.cpp server (no auth needed)." : undefined}>
+                  <div className="relative">
+                    <input
+                      type={showKeys[p.id] ? "text" : "password"}
+                      value={p.apiKey}
+                      onChange={(e) => setProvider(p.id, { apiKey: e.target.value })}
+                      placeholder={p.id === "openrouter" ? "sk-or-…" : p.id === "openai" ? "sk-…" : "optional"}
+                      className="w-full text-sm px-3 py-1.5 pr-8 rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground outline-none focus:ring-2 focus:ring-ring font-mono"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => toggleKey(p.id)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                    >
+                      {showKeys[p.id] ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+                    </button>
+                  </div>
+                </Field>
+
+                {/* Model list */}
+                <Field label="Models (one per line)" hint="These models will appear in the model selector, prefixed with the provider name.">
+                  <textarea
+                    value={getModelDraft(p.id, p.models)}
+                    onChange={(e) => setModelEdits((s) => ({ ...s, [p.id]: e.target.value }))}
+                    rows={4}
+                    className="w-full text-xs px-3 py-2 rounded-md border border-border bg-background text-foreground outline-none focus:ring-2 focus:ring-ring resize-none font-mono"
+                    placeholder="gpt-4o&#10;gpt-4o-mini"
+                  />
+                  <Button
+                    size="sm"
+                    className="h-7 text-xs mt-1"
+                    onClick={() => saveModels(p.id, p.models)}
+                  >
+                    Save models
+                  </Button>
+                </Field>
+              </>
+            )}
+          </CardContent>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
 // ─── Main component ───────────────────────────────────────────────────────────
 
 export function AppSettings() {
   const { gitName, gitEmail, setGitIdentity } = useProfileStore();
-  const { defaultSystemPrompt, agentAutoApproveReads, theme, setDefaultSystemPrompt, setAgentAutoApproveReads, setTheme } =
-    useSettingsStore();
+  const {
+    defaultSystemPrompt, agentAutoApproveReads, theme, numCtxOverride,
+    setDefaultSystemPrompt, setAgentAutoApproveReads, setTheme, setNumCtxOverride,
+  } = useSettingsStore();
+  const { hardware, vramOverride } = useModelStore();
 
   const [localName, setLocalName] = useState(gitName);
   const [localEmail, setLocalEmail] = useState(gitEmail);
   const [localPrompt, setLocalPrompt] = useState(defaultSystemPrompt);
+  const [localNumCtx, setLocalNumCtx] = useState(numCtxOverride != null ? String(numCtxOverride) : "");
   const [showMcp, setShowMcp] = useState(false);
 
   const identityDirty = localName !== gitName || localEmail !== gitEmail;
   const promptDirty = localPrompt !== defaultSystemPrompt;
+  const effectiveHardware = vramOverride != null && hardware ? { ...hardware, vramGb: vramOverride } : hardware;
+  const autoNumCtx = recommendedNumCtx(effectiveHardware);
+  const numCtxDirty = localNumCtx !== (numCtxOverride != null ? String(numCtxOverride) : "");
 
   return (
     <div className="flex flex-col h-full">
@@ -289,6 +389,15 @@ export function AppSettings() {
             </Card>
           </Section>
 
+          {/* ── AI Providers ── */}
+          <Section icon={<Plug className="size-4 text-muted-foreground" />} title="AI Providers">
+            <p className="text-xs text-muted-foreground">
+              Connect cloud providers alongside Ollama. Enabled providers appear in the model selector.
+              API keys are stored locally and never sent anywhere except the provider's own API.
+            </p>
+            <ProvidersSection />
+          </Section>
+
           <Separator />
 
           {/* ── App settings ── */}
@@ -346,6 +455,47 @@ export function AppSettings() {
                   >
                     Save prompt
                   </Button>
+                </Field>
+
+                {/* Agent context window */}
+                <Field
+                  label="Agent context window (num_ctx)"
+                  hint={`Tokens of context the agent loop sends to Ollama. Too small and the agent silently loses track of its task/history. Auto = ${autoNumCtx} based on detected VRAM.`}
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      value={localNumCtx}
+                      onChange={(e) => setLocalNumCtx(e.target.value)}
+                      placeholder={`Auto (${autoNumCtx})`}
+                      min={2048}
+                      step={1024}
+                      className="w-40 text-sm px-3 py-1.5 rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground outline-none focus:ring-2 focus:ring-ring"
+                    />
+                    <Button
+                      size="sm"
+                      className="h-7 text-xs"
+                      disabled={!numCtxDirty}
+                      onClick={() => {
+                        const n = parseInt(localNumCtx, 10);
+                        setNumCtxOverride(Number.isFinite(n) && n > 0 ? n : null);
+                      }}
+                    >
+                      Save
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-xs"
+                      disabled={localNumCtx === ""}
+                      onClick={() => {
+                        setLocalNumCtx("");
+                        setNumCtxOverride(null);
+                      }}
+                    >
+                      Reset to auto
+                    </Button>
+                  </div>
                 </Field>
               </CardContent>
             </Card>

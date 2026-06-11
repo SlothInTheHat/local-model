@@ -1,16 +1,18 @@
 import { useEffect, useRef, useState } from "react";
-import { AlertCircle, SlidersHorizontal } from "lucide-react";
+import { AlertCircle, SlidersHorizontal, Volume2, VolumeX } from "lucide-react";
 import { toast, Toaster } from "sonner";
 import { recommendModel } from "./lib/modelRecommender";
-import { listModels, streamChat } from "./lib/ollama";
+import { listModels, pullModel } from "./lib/ollama";
 import type { ChatMessage } from "./lib/ollama";
 import { searchWeb } from "./lib/search";
-import { runAgentTurn } from "./lib/agentLoop";
-import { executeTool, getToolDefinitions, setSystemInfoContext } from "./lib/tools";
-import type { ToolResult } from "./lib/tools";
+import { runAgentSession, DEFAULT_MAX_ROUNDS } from "./lib/agentRuntime";
+import { streamChatForModel, formatModelRef } from "./lib/chatProvider";
+import { getToolDefinitions, setSystemInfoContext } from "./lib/tools";
+import { supportsNativeTools } from "./lib/modelCapabilities";
 import { useModelStore } from "./store/models";
+import { useSettingsStore } from "./store/settings";
 import { useMcpStore } from "./store/mcp";
-import { useProfileStore } from "./store/profile";
+import { useProvidersStore } from "./store/providers";
 import { openWorkspace } from "./lib/fileSystem";
 import { useChatStore } from "./store/chat";
 import { useAgentStore } from "./store/agent";
@@ -55,6 +57,15 @@ const BenchmarkRunner = lazy(() =>
 const AppSettings = lazy(() =>
   import("./components/AppSettings").then((m) => ({ default: m.AppSettings }))
 );
+const Compare = lazy(() =>
+  import("./components/Compare").then((m) => ({ default: m.Compare }))
+);
+const MemoryView = lazy(() =>
+  import("./components/MemoryView").then((m) => ({ default: m.MemoryView }))
+);
+const AgentLogs = lazy(() =>
+  import("./components/AgentLogs").then((m) => ({ default: m.AgentLogs }))
+);
 
 export default function App() {
   const {
@@ -67,12 +78,14 @@ export default function App() {
     selectConversation,
     addMessage,
     appendToLastMessage,
+    setLastMessageContent,
     setStreaming,
     updateTitle,
   } = useChatStore();
 
   const {
     dirHandle,
+    workspacePath,
     toolsEnabled,
     pendingToolCalls,
     setWorkspace,
@@ -81,9 +94,17 @@ export default function App() {
     clearPendingToolCalls,
   } = useAgentStore();
 
-  const { hardware } = useModelStore();
+  const { hardware, vramOverride } = useModelStore();
+  const { numCtxOverride } = useSettingsStore();
 
   const [view, setView] = useState<AppView>("chat");
+  // Track which heavy views have been visited so we can keep them mounted (hidden)
+  // instead of unmounting them — preserves any running agent loops.
+  const [mountedViews, setMountedViews] = useState<Set<AppView>>(new Set<AppView>());
+  function handleViewChange(v: AppView) {
+    setMountedViews((prev) => { const next = new Set(prev); next.add(v); return next; });
+    setView(v);
+  }
   const [selectedModel, setSelectedModel] = useState("");
   const [ollamaError, setOllamaError] = useState<string | null>(null);
   const [webSearchEnabled, setWebSearchEnabled] = useState(false);
@@ -92,12 +113,20 @@ export default function App() {
   const [agentMode, setAgentMode] = useState(false);
   const [attachedImages, setAttachedImages] = useState<string[]>([]);
   const [systemPromptOpen, setSystemPromptOpen] = useState(false);
+  const [ttsEnabled, setTtsEnabled] = useState(false);
 
   // Ref to track current convId across async agent continuations
   const activeConvIdRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   // Track last recommendation shown to avoid repeating the same toast
   const lastRecRef = useRef<string>("");
+  const prevIsStreamingRef = useRef(false);
+  // Resolves the Promise returned to agentRuntime's onApprovalNeeded —
+  // set by onApprovalNeeded itself, resolved by handleApproveAll/handleDenyCall.
+  const approvalResolverRef = useRef<((approved: boolean) => void) | null>(null);
+  // Once the user clicks "Approve All", remaining approval-required calls for
+  // the rest of this task are auto-approved without prompting again.
+  const autoApproveRemainingRef = useRef(false);
 
   const activeConv = conversations.find((c) => c.id === activeId) ?? null;
 
@@ -120,6 +149,25 @@ export default function App() {
     }
   }, [activeId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // TTS: speak the last assistant message when streaming ends (no pending tool calls)
+  useEffect(() => {
+    const wasStreaming = prevIsStreamingRef.current;
+    prevIsStreamingRef.current = isStreaming;
+    if (!isStreaming && wasStreaming && ttsEnabled && pendingToolCalls.length === 0) {
+      const conv = useChatStore.getState().conversations.find((c) => c.id === activeId);
+      const assistantMsgs = conv?.messages.filter((m) => m.role === "assistant") ?? [];
+      const lastMsg = assistantMsgs[assistantMsgs.length - 1];
+      if (lastMsg?.content && lastMsg.content.length > 20) {
+        const plain = lastMsg.content
+          .replace(/```[\s\S]*?```/g, "code block")
+          .replace(/[#*`_~[\]()>]/g, "")
+          .slice(0, 3000);
+        speechSynthesis.cancel();
+        speechSynthesis.speak(new SpeechSynthesisUtterance(plain));
+      }
+    }
+  }, [isStreaming]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // "Use in Chat" from model library: select the model and switch to chat view
   function handleUseModel(id: string) {
     setSelectedModel(id);
@@ -128,19 +176,86 @@ export default function App() {
   }
 
   useEffect(() => {
-    listModels()
-      .then((models) => {
-        const names = models.map((m) => m.name);
-        setModels(names);
-        if (names.length > 0) setSelectedModel(names[0]);
-        setOllamaError(null);
-        toast.success(`Ollama connected — ${names.length} model${names.length !== 1 ? "s" : ""} available`);
-      })
-      .catch(() => {
-        setOllamaError("Cannot reach Ollama at localhost:11434 — make sure it is running.");
-        toast.error("Cannot reach Ollama at localhost:11434");
-      });
+    void initOllama();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function initOllama() {
+    const providers = useProvidersStore.getState().providers;
+    const providerModels = providers
+      .filter((p) => p.enabled && p.models.length > 0)
+      .flatMap((p) => p.models.map((m) => formatModelRef(p.id, m)));
+
+    // Retry connecting — Ollama may still be booting after auto-start
+    const MAX_ATTEMPTS = 15;
+    const RETRY_MS = 1500;
+    let ollamaModels: import("./lib/ollama").OllamaModel[] = [];
+    let connected = false;
+
+    setOllamaError("Starting Ollama…");
+
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      try {
+        ollamaModels = await listModels();
+        connected = true;
+        break;
+      } catch {
+        if (attempt < MAX_ATTEMPTS - 1) {
+          await new Promise((r) => setTimeout(r, RETRY_MS));
+        }
+      }
+    }
+
+    if (!connected) {
+      if (providerModels.length > 0) {
+        setModels(providerModels);
+        setSelectedModel(providerModels[0]);
+        setOllamaError(null);
+        toast.info(`Ollama offline — ${providerModels.length} provider model${providerModels.length !== 1 ? "s" : ""} available`);
+      } else {
+        setOllamaError("Cannot reach Ollama at localhost:11434 — is it installed?");
+      }
+      return;
+    }
+
+    const ollamaNames = ollamaModels.map((m) => m.name);
+    const all = [...ollamaNames, ...providerModels];
+    setModels(all);
+    if (all.length > 0) setSelectedModel(all[0]);
+    setOllamaError(null);
+
+    const provCount = providerModels.length;
+    toast.success(
+      `Ollama ready — ${ollamaNames.length} local model${ollamaNames.length !== 1 ? "s" : ""}` +
+      (provCount > 0 ? ` + ${provCount} provider model${provCount !== 1 ? "s" : ""}` : "")
+    );
+
+    // Auto-pull nomic-embed-text for vector memory if not already installed
+    const EMBED_MODEL = "nomic-embed-text";
+    const hasEmbedModel = ollamaNames.some((n) => n.startsWith(EMBED_MODEL));
+    if (!hasEmbedModel) {
+      void pullEmbedModelSilently(EMBED_MODEL);
+    }
+  }
+
+  async function pullEmbedModelSilently(model: string) {
+    const toastId = toast.loading(`Pulling ${model} for vector memory…`, { duration: Infinity });
+    try {
+      for await (const update of pullModel(model)) {
+        if (update.done) break;
+      }
+      toast.dismiss(toastId);
+      toast.success(`${model} ready — vector memory enabled`);
+      // Refresh model list so it appears in ModelManager
+      const refreshed = await listModels();
+      const ollamaNames = refreshed.map((m) => m.name);
+      const currentAll = useChatStore.getState().availableModels;
+      const providers = currentAll.filter((m) => m.includes("::"));
+      setModels([...ollamaNames, ...providers]);
+    } catch {
+      toast.dismiss(toastId);
+      // Non-fatal: vector memory falls back to keyword search
+    }
+  }
 
   // ─── Agent: open directory picker ────────────────────────────────────────
 
@@ -219,6 +334,8 @@ export default function App() {
     }
 
     if (agentMode) {
+      // Fresh agent task — require approval again from scratch.
+      autoApproveRemainingRef.current = false;
       await runAgentLoop(convId, history);
     } else {
       await runNormalChat(convId, history);
@@ -233,7 +350,7 @@ export default function App() {
     abortRef.current = new AbortController();
 
     try {
-      for await (const chunk of streamChat(selectedModel, history, abortRef.current.signal)) {
+      for await (const chunk of streamChatForModel(selectedModel, history, abortRef.current.signal)) {
         appendToLastMessage(convId, chunk);
       }
       const updatedConv = useChatStore.getState().conversations.find((c) => c.id === convId)!;
@@ -267,73 +384,79 @@ export default function App() {
       (t) => t.name.includes("__") || toolsEnabled[t.name as import("./lib/tools").ToolName]
     );
 
-    // Inject a system-level context block so the agent knows its environment
-    const profile = useProfileStore.getState();
-    const contextLines = [
-      `## Runtime context`,
-      `- Model: ${selectedModel || "unknown"}`,
-      hardware ? [
-        `- GPU: ${hardware.gpuName} (${hardware.vramGb} GB VRAM)`,
-        `- RAM: ${hardware.ramGb} GB | CPU threads: ${hardware.cpuThreads}`,
-      ].join("\n") : "- Hardware: not yet scanned",
-      `- Platform: ${navigator.platform}`,
-      `- Desktop mode: ${!!(window as unknown as Record<string, unknown>).__TAURI__}`,
-      dirHandle ? `- Workspace: ${dirHandle.name}` : "- Workspace: none",
-      profile.githubUsername ? `- GitHub: @${profile.githubUsername} (token configured — HTTPS auth is automatic)` : "",
-      profile.gitName ? `- Git identity: ${profile.gitName} <${profile.gitEmail}>` : "",
-      ``,
-      `## Agent behavior`,
-      `When the user asks you to explore, understand, or summarize a project or workspace:`,
-      `1. Use list_directory to get the file tree.`,
-      `2. Then read the actual content of key files — prioritize README.md, CLAUDE.md, package.json,`,
-      `   Cargo.toml, pyproject.toml, or any obvious entry-point / config file. Read at least 3-5`,
-      `   files before answering so your summary reflects what the code actually does, not just`,
-      `   what the filenames suggest.`,
-      `3. For deeper questions ("how does X work", "find the bug in Y") use grep_files or read_file`,
-      `   to read the relevant source files before answering.`,
-      `Never answer a workspace question based solely on a directory listing.`,
-    ].join("\n");
-
-    // Prepend context to the first system message, or add one if absent
-    const historyWithCtx: ChatMessage[] = history[0]?.role === "system"
-      ? [{ role: "system", content: `${history[0].content}\n\n${contextLines}` }, ...history.slice(1)]
-      : [{ role: "system", content: contextLines }, ...history];
+    const toolsSupported = supportsNativeTools(selectedModel);
+    const effectiveHardware = vramOverride != null && hardware ? { ...hardware, vramGb: vramOverride } : hardware;
 
     addMessage(convId, { role: "assistant", content: "" });
     setStreaming(true);
     abortRef.current = new AbortController();
 
     try {
-      for await (const event of runAgentTurn(
-        selectedModel,
-        historyWithCtx,
-        enabledTools,
-        abortRef.current.signal
-      )) {
-        if (event.type === "text_delta" && event.content) {
-          appendToLastMessage(convId, event.content);
-        } else if (event.type === "tool_calls" && event.toolCalls) {
-          // Pause and surface tool calls for approval
-          setPendingToolCalls(event.toolCalls);
-          setStreaming(false);
-          return; // Will resume in handleApproveAll / handleDenyAll
-        } else if (event.type === "done") {
-          // Auto-title
-          const updatedConv = useChatStore
-            .getState()
-            .conversations.find((c) => c.id === convId);
-          if (updatedConv?.title === "New Chat") {
-            const firstUserMsg = updatedConv.messages.find((m) => m.role === "user");
-            if (firstUserMsg) {
-              const words = firstUserMsg.content.trim().split(/\s+/).slice(0, 6).join(" ");
-              updateTitle(
-                convId,
-                words + (firstUserMsg.content.trim().split(/\s+/).length > 6 ? "…" : "")
-              );
-            }
-          }
-        } else if (event.type === "error") {
-          appendToLastMessage(convId, `\n\n*[Agent error: ${event.error ?? "unknown"}]*`);
+      const sessionResult = await runAgentSession(history, {
+        modelRef: selectedModel,
+        hardware: effectiveHardware,
+        numCtxOverride,
+        dirHandle,
+        workspacePath,
+        workspaceName: dirHandle?.name ?? null,
+        tools: enabledTools,
+        agentBuildMode: true,
+        autoApproveAll: false,
+        toolsSupported,
+        maxRounds: DEFAULT_MAX_ROUNDS,
+
+        onTextDelta: (chunk) => {
+          appendToLastMessage(convId, chunk);
+        },
+
+        onTextReplace: (cleanText) => {
+          setLastMessageContent(convId, cleanText);
+        },
+
+        onToolCallStart: () => {},
+
+        onApprovalNeeded: (call) => {
+          if (autoApproveRemainingRef.current) return Promise.resolve(true);
+          setPendingToolCalls([call]);
+          return new Promise<boolean>((resolve) => {
+            approvalResolverRef.current = resolve;
+            abortRef.current?.signal.addEventListener("abort", () => resolve(false), { once: true });
+          });
+        },
+
+        onToolCallResolved: (call, _label, _result, _summary, toolContent) => {
+          addMessage(convId, {
+            role: "assistant",
+            content: "",
+            tool_calls: [{ function: { name: call.name, arguments: call.args } }],
+          });
+          addMessage(convId, { role: "tool", content: toolContent });
+        },
+
+        onRoundStart: (round) => {
+          if (round > 1) addMessage(convId, { role: "assistant", content: "" });
+        },
+
+        signal: abortRef.current.signal,
+      });
+
+      if (sessionResult.hitRoundLimit) {
+        addMessage(convId, {
+          role: "assistant",
+          content: `Reached the ${DEFAULT_MAX_ROUNDS}-round limit. Ask me to continue if needed.`,
+        });
+      }
+
+      // Auto-title
+      const updatedConv = useChatStore.getState().conversations.find((c) => c.id === convId);
+      if (updatedConv?.title === "New Chat") {
+        const firstUserMsg = updatedConv.messages.find((m) => m.role === "user");
+        if (firstUserMsg) {
+          const words = firstUserMsg.content.trim().split(/\s+/).slice(0, 6).join(" ");
+          updateTitle(
+            convId,
+            words + (firstUserMsg.content.trim().split(/\s+/).length > 6 ? "…" : "")
+          );
         }
       }
     } catch (err: unknown) {
@@ -341,73 +464,26 @@ export default function App() {
       if (e.name !== "AbortError") appendToLastMessage(convId, `\n\n*[Error: ${e.message}]*`);
     } finally {
       setStreaming(false);
+      clearPendingToolCalls();
       abortRef.current = null;
     }
   }
 
-  // ─── Approve all pending tool calls ──────────────────────────────────────
+  // ─── Approve pending tool call ───────────────────────────────────────────
 
-  async function handleApproveAll() {
-    const calls = [...pendingToolCalls];
+  function handleApproveAll() {
     clearPendingToolCalls();
-
-    const convId = activeConvIdRef.current ?? activeId;
-    if (!convId) return;
-
-    // Execute all tool calls
-    const results: ToolResult[] = [];
-    for (const call of calls) {
-      const result = await executeTool(call, dirHandle);
-      results.push(result);
-
-      // Proper Ollama tool continuation format
-      addMessage(convId, {
-        role: "assistant",
-        content: "",
-        tool_calls: [{ function: { name: call.name, arguments: call.args } }],
-      });
-      addMessage(convId, {
-        role: "tool",
-        content: result.error ? `Error: ${result.error}` : result.output,
-      });
-    }
-
-    // Build tool result messages for Ollama format and continue
-    await handleContinueAgent(convId, results);
+    autoApproveRemainingRef.current = true;
+    approvalResolverRef.current?.(true);
+    approvalResolverRef.current = null;
   }
 
-  // ─── Deny a single tool call ──────────────────────────────────────────────
+  // ─── Deny the pending tool call ──────────────────────────────────────────
 
-  function handleDenyCall(callId: string) {
-    const remaining = pendingToolCalls.filter((c) => c.id !== callId);
-    if (remaining.length === 0) {
-      clearPendingToolCalls();
-      // Add a system note
-      const convId = activeConvIdRef.current ?? activeId;
-      if (convId) {
-        addMessage(convId, {
-          role: "system",
-          content: "[Tool result: tool_call]\nTool call was denied by the user.",
-        });
-      }
-    } else {
-      setPendingToolCalls(remaining);
-    }
-  }
-
-  // ─── Continue agent after tool results ───────────────────────────────────
-
-  async function handleContinueAgent(convId: string, _results: ToolResult[]) {
-    // Rebuild history from store (includes the tool result messages we just added)
-    const latestConv = useChatStore.getState().conversations.find((c) => c.id === convId);
-    if (!latestConv) return;
-
-    let history: ChatMessage[] = latestConv.messages;
-    if (latestConv.systemPrompt) {
-      history = [{ role: "system", content: latestConv.systemPrompt }, ...history];
-    }
-
-    await runAgentLoop(convId, history);
+  function handleDenyCall() {
+    clearPendingToolCalls();
+    approvalResolverRef.current?.(false);
+    approvalResolverRef.current = null;
   }
 
   // ─── Render ───────────────────────────────────────────────────────────────
@@ -417,7 +493,7 @@ export default function App() {
       <Toaster position="bottom-right" richColors closeButton />
       <ChatSidebar
         view={view}
-        onViewChange={setView}
+        onViewChange={handleViewChange}
         selectedModel={selectedModel}
         onModelChange={(m) => { setSelectedModel(m); toast.info(`Model: ${m}`, { duration: 2000 }); }}
         onOpenSearch={() => setSearchOpen(true)}
@@ -436,16 +512,35 @@ export default function App() {
               <h2 className="text-sm font-medium truncate">
                 {activeConv?.title ?? "AI Chat"}
               </h2>
-              {activeId && (
+              <div className="flex items-center gap-0.5">
+                {/* TTS toggle */}
                 <button
                   type="button"
-                  onClick={() => setSystemPromptOpen(true)}
-                  title="Edit system prompt"
-                  className="size-8 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+                  onClick={() => {
+                    const next = !ttsEnabled;
+                    setTtsEnabled(next);
+                    if (!next) speechSynthesis.cancel();
+                  }}
+                  title={ttsEnabled ? "Text-to-speech ON — click to disable" : "Enable text-to-speech"}
+                  className={`size-8 flex items-center justify-center rounded-md transition-colors ${
+                    ttsEnabled
+                      ? "text-primary"
+                      : "text-muted-foreground hover:text-foreground hover:bg-accent"
+                  }`}
                 >
-                  <SlidersHorizontal className="size-4" />
+                  {ttsEnabled ? <Volume2 className="size-4" /> : <VolumeX className="size-4" />}
                 </button>
-              )}
+                {activeId && (
+                  <button
+                    type="button"
+                    onClick={() => setSystemPromptOpen(true)}
+                    title="Edit system prompt"
+                    className="size-8 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+                  >
+                    <SlidersHorizontal className="size-4" />
+                  </button>
+                )}
+              </div>
             </div>
 
             {/* Agent toolbar */}
@@ -472,14 +567,14 @@ export default function App() {
             {pendingToolCalls.length > 0 && (
               <div className="border-t bg-card px-4 py-3 space-y-2 shrink-0 max-h-64 overflow-y-auto">
                 <div className="text-xs font-medium text-foreground mb-1">
-                  Tool calls awaiting approval ({pendingToolCalls.length})
+                  Tool call awaiting approval
                 </div>
                 {pendingToolCalls.map((call) => (
                   <ToolCallCard
                     key={call.id}
                     call={call}
                     onApprove={() => void handleApproveAll()}
-                    onDeny={() => handleDenyCall(call.id)}
+                    onDeny={() => handleDenyCall()}
                   />
                 ))}
               </div>
@@ -506,11 +601,18 @@ export default function App() {
               }
             />
           </>
-        ) : view === "code" ? (
-          <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading editor…</div>}>
-            <CodeEditor selectedModel={selectedModel} />
-          </Suspense>
-        ) : view === "docs" ? (
+        ) : null}
+
+        {/* Code Editor — always mounted after first visit so agent loops survive tab switches */}
+        {(view === "code" || mountedViews.has("code")) && (
+          <div className={view === "code" ? "flex flex-col flex-1 min-w-0 min-h-0 overflow-hidden" : "hidden"}>
+            <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading editor…</div>}>
+              <CodeEditor selectedModel={selectedModel} isActive={view === "code"} />
+            </Suspense>
+          </div>
+        )}
+
+        {view !== "chat" && view !== "code" && (view === "docs" ? (
           <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading editor…</div>}>
             <DocEditor />
           </Suspense>
@@ -542,13 +644,25 @@ export default function App() {
           <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
             <BenchmarkRunner selectedModel={selectedModel} />
           </Suspense>
+        ) : view === "compare" ? (
+          <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
+            <Compare />
+          </Suspense>
+        ) : view === "memory" ? (
+          <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
+            <MemoryView />
+          </Suspense>
+        ) : view === "logs" ? (
+          <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
+            <AgentLogs />
+          </Suspense>
         ) : view === "settings" ? (
           <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
             <AppSettings />
           </Suspense>
         ) : (
           <ModelManager onUseModel={handleUseModel} />
-        )}
+        ))}
       </div>
 
       {/* System prompt dialog */}

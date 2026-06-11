@@ -5,7 +5,7 @@ import { mcpCallTool } from "./mcp";
 import { useMcpStore } from "../store/mcp";
 import { injectGitCredentials, sanitizeOutput } from "../store/profile";
 import { loadSkills, saveSkill } from "./skillEngine";
-import { updateMemorySection } from "./projectMemory";
+import { updateMemorySection, readProjectMemory } from "./projectMemory";
 import { saveDynamicTool } from "./dynamicTools";
 import type { DynamicToolDef } from "./dynamicTools";
 
@@ -37,6 +37,7 @@ export function setSystemInfoContext(ctx: typeof _systemInfoContext) {
 export type ToolName =
   | "read_file"
   | "write_file"
+  | "patch_file"
   | "delete_file"
   | "list_directory"
   | "grep_files"
@@ -49,7 +50,12 @@ export type ToolName =
   | "git_diff"
   | "git_log"
   | "git_add"
-  | "git_commit";
+  | "git_commit"
+  | "install_deps"
+  | "todo_write"
+  | "apply_patch"
+  | "web_fetch"
+  | "create_folder";
 
 export interface ToolDef {
   // string allows MCP tools with dynamic "serverId__toolName" names
@@ -77,7 +83,19 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
   {
     name: "write_file",
     description:
-      "Create or overwrite a file in the current workspace directory with the given text content.",
+      "Create a NEW file or completely replace an existing one. For editing existing files, prefer patch_file instead.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Relative path to the file within the workspace." },
+        content: { type: "string", description: "The full text content to write." },
+      },
+      required: ["path", "content"],
+    },
+  },
+  {
+    name: "patch_file",
+    description: "Edit an existing file by replacing old_string with new_string. Uses fuzzy matching. Re-read the file first if unsure of exact content.",
     parameters: {
       type: "object",
       properties: {
@@ -85,12 +103,20 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
           type: "string",
           description: "Relative path to the file within the workspace.",
         },
-        content: {
+        old_string: {
           type: "string",
-          description: "The full text content to write.",
+          description: "The exact string to find and replace (must match character-for-character including newlines and indentation).",
+        },
+        new_string: {
+          type: "string",
+          description: "The replacement string.",
+        },
+        replace_all: {
+          type: "boolean",
+          description: "If true, replace every occurrence instead of just the first. Defaults to false.",
         },
       },
-      required: ["path", "content"],
+      required: ["path", "old_string", "new_string"],
     },
   },
   {
@@ -303,6 +329,97 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
     },
   },
   {
+    name: "install_deps",
+    description:
+      "Install project dependencies by auto-detecting the package manager. " +
+      "Finds requirements.txt → pip, package.json → npm, Cargo.toml → cargo, pyproject.toml → pip. " +
+      "If 'Requirement already satisfied' appears for every package, installation succeeded — the tool reports OK. " +
+      "Use this instead of calling run_command with pip/npm manually. " +
+      "Also responds to: install_dependencies, install_packages.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Optional sub-directory within the workspace. Defaults to workspace root.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "todo_write",
+    description: "Manage your task list. ONE todo in_progress at a time. Use instead of PLAN.md.",
+    parameters: {
+      type: "object",
+      properties: {
+        todos: {
+          type: "array",
+          description: "Full task list — always pass the complete list, not just changed items.",
+          items: {
+            type: "object",
+            properties: {
+              id:      { type: "string", description: "Unique ID (e.g. '1', '2', '3')" },
+              content: { type: "string", description: "Task description (imperative: 'Install deps', 'Create game.py')" },
+              status:  { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"] },
+            },
+            required: ["id", "content", "status"],
+          },
+        },
+      },
+      required: ["todos"],
+    },
+  },
+  {
+    name: "apply_patch",
+    description: "Patch multiple files at once. Uses fuzzy matching (whitespace differences OK).",
+    parameters: {
+      type: "object",
+      properties: {
+        patches: {
+          type: "array",
+          description: "List of patch operations to apply sequentially.",
+          items: {
+            type: "object",
+            properties: {
+              path:       { type: "string", description: "File path to patch." },
+              old_string: { type: "string", description: "String to find (fuzzy-matched)." },
+              new_string: { type: "string", description: "Replacement string." },
+            },
+            required: ["path", "old_string", "new_string"],
+          },
+        },
+      },
+      required: ["patches"],
+    },
+  },
+  {
+    name: "web_fetch",
+    description: "Fetch a URL and return its content as plain text (HTML tags stripped).",
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "The URL to fetch (must start with https:// or http://)." },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "create_folder",
+    description:
+      "Create a directory (and all parent directories) at an absolute OS path. Use this to scaffold new project folder structures on the user's machine. Requires Tauri desktop mode.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Absolute path to create, e.g. C:/Users/user/Documents/MyProject/src",
+        },
+      },
+      required: ["path"],
+    },
+  },
+  {
     name: "register_tool",
     description: "Register a new dynamic tool in the workspace tool registry (.localmind/tools/). The tool will be available in future sessions. Tools use run_command under the hood with a template string.",
     parameters: {
@@ -353,7 +470,13 @@ function matchesFileGlob(name: string, pattern: string): boolean {
 }
 
 // Skip noisy directories that are rarely useful
-const SKIP_DIRS = new Set(["node_modules", ".git", "dist", ".next", "__pycache__", ".venv", "build", "coverage", ".localmind-backups"]);
+const SKIP_DIRS = new Set([
+  "node_modules", ".git", "dist", ".next", "__pycache__",
+  // Python virtual environments — all common names
+  ".venv", "venv", "env", ".env", "myenv", "virtualenv", ".virtualenv",
+  // Build artifacts
+  "build", "coverage", "target", ".localmind-backups",
+]);
 
 async function grepInHandle(
   handle: FileSystemDirectoryHandle,
@@ -442,7 +565,7 @@ function noWorkspace(call: ToolCall): ToolResult {
  * percent-encoded dot sequences are present.
  * Returns the canonical path segments ready for the File System Access API.
  */
-function resolvePathParts(path: string): string[] {
+export function resolvePathParts(path: string): string[] {
   if (/%2e/i.test(path)) {
     throw new Error(`Path traversal not allowed: "${path}"`);
   }
@@ -461,7 +584,7 @@ function resolvePathParts(path: string): string[] {
   return stack;
 }
 
-function normalizeSubPath(p: string): string {
+export function normalizeSubPath(p: string): string {
   const trimmed = p.trim();
   if (!trimmed) return "";
   return resolvePathParts(trimmed).join("/");
@@ -526,13 +649,119 @@ async function listEntries(
   return entries;
 }
 
+// ─── Fuzzy patch matcher (inspired by OpenCode's 9-tier Edit strategy) ───────
+
+/**
+ * Find oldString in content using progressively looser matching.
+ * Returns [matchStart, matchEnd] character positions, or null if not found.
+ *
+ * Tiers (stops at first match):
+ *   1. Exact string match
+ *   2. After CRLF → LF normalization
+ *   3. Line-trimmed match (ignore trailing whitespace per line)
+ *   4. Indentation-flexible match (ignore leading whitespace per line)
+ *   5. Whitespace-normalized match (collapse all whitespace sequences)
+ */
+function fuzzyFindMatch(content: string, oldString: string): [number, number] | null {
+  // Tier 1 — exact
+  let idx = content.indexOf(oldString);
+  if (idx !== -1) return [idx, idx + oldString.length];
+
+  // Normalize line endings for all remaining tiers
+  const nl = (s: string) => s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const nc = nl(content);
+  const no = nl(oldString);
+
+  // Tier 2 — exact after CRLF normalization
+  idx = nc.indexOf(no);
+  if (idx !== -1) return [idx, idx + no.length];
+
+  const ncLines = nc.split("\n");
+  const noLines = no.split("\n");
+  const len = noLines.length;
+
+  /** Compute [charStart, charEnd] for a matched window starting at line i. */
+  function lineRange(i: number): [number, number] {
+    let start = 0;
+    for (let k = 0; k < i; k++) start += ncLines[k].length + 1;
+    let end = start;
+    for (let k = i; k < i + len; k++) end += ncLines[k].length + 1;
+    return [start, Math.min(end, nc.length)]; // end may overshoot by 1 newline
+  }
+
+  // Tier 3 — trim trailing whitespace per line
+  const trailingTrimmed = noLines.map((l) => l.trimEnd());
+  for (let i = 0; i <= ncLines.length - len; i++) {
+    if (ncLines.slice(i, i + len).map((l) => l.trimEnd())
+        .every((l, j) => l === trailingTrimmed[j])) {
+      return lineRange(i);
+    }
+  }
+
+  // Tier 4 — strip leading whitespace per line (indentation-flexible)
+  const deindented = noLines.map((l) => l.trimStart());
+  for (let i = 0; i <= ncLines.length - len; i++) {
+    if (ncLines.slice(i, i + len).map((l) => l.trimStart())
+        .every((l, j) => l === deindented[j])) {
+      return lineRange(i);
+    }
+  }
+
+  // Tier 5 — collapse all whitespace (whitespace-normalized)
+  const wsNorm = (s: string) => s.replace(/\s+/g, " ").trim();
+  const normOld = wsNorm(no);
+  for (let i = 0; i <= ncLines.length - len; i++) {
+    const windowNorm = wsNorm(ncLines.slice(i, i + len).join("\n"));
+    if (windowNorm === normOld) return lineRange(i);
+  }
+
+  return null;
+}
+
 // ─── Executor ────────────────────────────────────────────────────────────────
 
 export async function executeTool(
   call: ToolCall,
-  dirHandle: FileSystemDirectoryHandle | null
+  dirHandle: FileSystemDirectoryHandle | null,
+  workspacePath?: string   // fallback cwd for run_command when model omits it
 ): Promise<ToolResult> {
   try {
+    // ── Normalize tool names — models often hallucinate close-but-wrong names ──
+    const TOOL_ALIASES: Record<string, string> = {
+      install_dependencies: "install_deps",
+      install_dependency: "install_deps",
+      install_packages: "install_deps",
+      write_to_file: "write_file",
+      create_file: "write_file",
+      save_file: "write_file",
+      search_web: "web_search",
+      google: "web_search",
+      search: "web_search",
+      fetch_url: "web_fetch",
+      fetch: "web_fetch",
+      search_files: "grep_files",
+      grep: "grep_files",
+      find_in_files: "grep_files",
+      find: "find_files",
+      ls: "list_directory",
+      list: "list_directory",
+      read: "read_file",
+      write: "write_file",
+      cat: "read_file",
+      run: "run_command",
+      shell: "run_command",
+      exec: "run_command",
+      execute: "run_command",
+      bash: "run_command",
+      mkdir: "create_folder",
+      make_dir: "create_folder",
+      create_directory: "create_folder",
+      create_dir: "create_folder",
+    };
+    if (TOOL_ALIASES[call.name]) {
+      call = { ...call, name: TOOL_ALIASES[call.name] };
+    }
+
     // ── MCP dispatch: names are prefixed "serverId__toolName" ────────────────
     if (call.name.includes("__")) {
       const [serverId] = call.name.split("__");
@@ -587,7 +816,7 @@ export async function executeTool(
 
       case "read_file": {
         if (!dirHandle) return noWorkspace(call);
-        const path = argStr(call.args["path"]);
+        const path = argStr(call.args["path"]) || argStr(call.args["file_path"]) || argStr(call.args["filename"]);
         if (!path) throw new Error("Missing path argument");
         const parts = resolvePathParts(path);
         const fileName = parts.pop()!;
@@ -609,9 +838,10 @@ export async function executeTool(
 
       case "write_file": {
         if (!dirHandle) return noWorkspace(call);
-        const path = argStr(call.args["path"]);
-        const content = argStr(call.args["content"]);
-        if (!path) throw new Error("Missing path argument");
+        // Accept file_path as alias for path (models sometimes use the wrong param name)
+        const path = argStr(call.args["path"]) || argStr(call.args["file_path"]) || argStr(call.args["filename"]);
+        const content = argStr(call.args["content"]) || argStr(call.args["text"]) || argStr(call.args["code"]);
+        if (!path) throw new Error("Missing path argument (expected 'path', 'file_path', or 'filename')");
         const parts = resolvePathParts(path);
         const normalizedPath = parts.join("/");
 
@@ -638,10 +868,71 @@ export async function executeTool(
 
         const verb = backupPath ? "File written" : "File created";
         const backupNote = backupPath ? `\nBackup saved to: ${backupPath}` : "";
+        // When overwriting an existing file, remind the model that patch_file is preferred for future edits.
+        const overwriteHint = backupPath
+          ? `\nNote: You overwrote an existing file. For future fixes use patch_file — it edits only the changed lines and is less likely to introduce new bugs.`
+          : "";
         return {
           toolCallId: call.id,
           name: call.name,
-          output: `${verb}: ${path}${backupNote}`,
+          output: `${verb}: ${path}${backupNote}${overwriteHint}`,
+        };
+      }
+
+      case "patch_file": {
+        if (!dirHandle) return noWorkspace(call);
+        const path = argStr(call.args["path"]);
+        const oldString = call.args["old_string"] != null ? String(call.args["old_string"]) : null;
+        const newString = call.args["new_string"] != null ? String(call.args["new_string"]) : "";
+        const replaceAll = Boolean(call.args["replace_all"]);
+
+        if (!path) throw new Error("Missing path argument");
+        if (oldString === null) throw new Error("Missing old_string argument");
+
+        const patchParts = resolvePathParts(path);
+        const patchFileName = patchParts.pop()!;
+        let patchParent = dirHandle;
+        if (patchParts.length > 0) {
+          const resolved = await resolveDirHandle(dirHandle, patchParts);
+          if (!resolved) throw new Error(`Directory not found: ${patchParts.join("/")}`);
+          patchParent = resolved;
+        }
+        const patchHandle = await patchParent.getFileHandle(patchFileName, { create: false });
+        const patchFileObj = await patchHandle.getFile();
+        const original = await patchFileObj.text();
+
+        // Use fuzzy matcher — handles trailing whitespace, CRLF, indentation differences
+        const fuzzyMatch = fuzzyFindMatch(original, oldString);
+        if (!fuzzyMatch) {
+          return {
+            toolCallId: call.id,
+            name: call.name,
+            output: "",
+            error: `patch_file: old_string not found in ${path} (tried exact, CRLF-normalized, line-trimmed, indentation-flexible, and whitespace-normalized matching). Re-read the file with read_file to get the exact current content.`,
+          };
+        }
+
+        let patched: string;
+        if (replaceAll) {
+          // For replace_all, use split/join on normalized content
+          patched = original.split(oldString).join(newString);
+          if (patched === original) {
+            // Try with normalized line endings
+            patched = original.replace(/\r\n/g, "\n").split(oldString.replace(/\r\n/g, "\n")).join(newString);
+          }
+        } else {
+          const [ms, me] = fuzzyMatch;
+          patched = original.slice(0, ms) + newString + original.slice(me);
+        }
+
+        const patchWritable = await patchHandle.createWritable();
+        await patchWritable.write(patched);
+        await patchWritable.close();
+
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Patched ${path}.`,
         };
       }
 
@@ -732,7 +1023,10 @@ export async function executeTool(
       case "run_command": {
         const cmd = argStr(call.args["cmd"]);
         if (!cmd) throw new Error("Missing cmd argument");
-        const cwd = argStr(call.args["cwd"]) || undefined;
+
+        // Fall back to workspace path so commands always run in the right directory
+        // even when the model forgets to pass cwd (a common failure mode).
+        const cwd = argStr(call.args["cwd"]) || workspacePath || undefined;
         // Inject stored git credentials into HTTPS URLs before execution.
         // Token is never shown in the approval dialog (call.args keeps the original).
         const injectedCmd = injectGitCredentials(cmd);
@@ -743,11 +1037,17 @@ export async function executeTool(
         const combined = sanitizeOutput(
           [result.stdout, result.stderr].filter(Boolean).join("\n")
         );
+        const exitNote = `[exit code: ${result.exit_code}]`;
         return {
           toolCallId: call.id,
           name: call.name,
-          output: combined || "(no output)",
-          ...(result.exit_code !== 0 ? { error: `Exit code: ${result.exit_code}` } : {}),
+          output: combined ? `${combined}\n\n${exitNote}` : exitNote,
+          // Only flag as a tool error when the command produced NO output at all —
+          // a non-zero exit WITH output (test failure, lint error) is a result the
+          // model should read, not a tool failure.
+          ...(result.exit_code !== 0 && !combined
+            ? { error: `Command failed with exit code ${result.exit_code} and produced no output` }
+            : {}),
         };
       }
 
@@ -806,6 +1106,224 @@ export async function executeTool(
         };
       }
 
+      case "install_deps": {
+        const subPath = normalizeSubPath(argStr(call.args["path"]));
+        const cwdParts = subPath ? subPath.split("/").filter(Boolean) : [];
+
+        // ── Check project memory first — skip if already installed ────────────
+        if (dirHandle) {
+          const mem = await readProjectMemory(dirHandle);
+          if (mem.includes("## Dependencies") && mem.includes("Status: installed")) {
+            return {
+              toolCallId: call.id,
+              name: call.name,
+              output: "Dependencies already installed (recorded in project memory).\nSkip this step — proceed to the next unchecked item in PLAN.md.",
+            };
+          }
+        }
+
+        // ── Detect manifest file ──────────────────────────────────────────────
+        const checkFile = async (name: string): Promise<boolean> => {
+          if (!dirHandle) return false;
+          let handle = dirHandle;
+          for (const part of cwdParts) {
+            try { handle = await handle.getDirectoryHandle(part, { create: false }); } catch { return false; }
+          }
+          try { await handle.getFileHandle(name, { create: false }); return true; } catch { return false; }
+        };
+
+        const [hasReqs, hasPkg, hasCargo, hasPyproject] = await Promise.all([
+          checkFile("requirements.txt"),
+          checkFile("package.json"),
+          checkFile("Cargo.toml"),
+          checkFile("pyproject.toml"),
+        ]);
+
+        let cmd = "";
+        let manifest = "";
+        if (hasReqs)           { cmd = "pip install -r requirements.txt"; manifest = "requirements.txt"; }
+        else if (hasPkg)       { cmd = "npm install";                     manifest = "package.json"; }
+        else if (hasCargo)     { cmd = "cargo build";                     manifest = "Cargo.toml"; }
+        else if (hasPyproject) { cmd = "pip install -e .";                manifest = "pyproject.toml"; }
+        else {
+          return {
+            toolCallId: call.id, name: call.name, output: "",
+            error: "No manifest found (requirements.txt, package.json, Cargo.toml, pyproject.toml).",
+          };
+        }
+
+        const tauri = (window as unknown as Record<string, unknown>).__TAURI__;
+        if (!tauri) {
+          return { toolCallId: call.id, name: call.name, output: `Would run: ${cmd}`, error: "Not in desktop mode." };
+        }
+
+        const cwd: string | undefined = workspacePath || undefined;
+        const result = await tauriInvoke<{ stdout: string; stderr: string; exit_code: number }>(
+          "run_command", { cmd, cwd }
+        );
+        const combined = sanitizeOutput([result.stdout, result.stderr].filter(Boolean).join("\n"));
+
+        const hasRealError = result.exit_code !== 0 &&
+          !combined.includes("Successfully installed") &&
+          combined.includes("ERROR");
+
+        // ── Write install status to project memory on success ─────────────────
+        if (!hasRealError && dirHandle) {
+          const date = new Date().toISOString().split("T")[0];
+          const memContent = `Status: installed\nManifest: ${manifest}\nDate: ${date}`;
+          await updateMemorySection(dirHandle, "Dependencies", memContent).catch(() => {});
+        }
+
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: hasRealError
+            ? combined
+            : `${combined}\n\n✓ Dependencies installed. Status written to project memory — this step will be skipped in future sessions.`,
+          ...(hasRealError ? { error: `Exit code: ${result.exit_code}` } : {}),
+        };
+      }
+
+      case "todo_write": {
+        if (!dirHandle) return noWorkspace(call);
+        const rawTodos = call.args["todos"] as Array<Record<string, string>> | undefined;
+        if (!Array.isArray(rawTodos)) throw new Error("todos must be an array");
+
+        const lmDir = await dirHandle.getDirectoryHandle(".localmind", { create: true });
+
+        // Read existing todos to protect completed items from being reset.
+        // The agent cannot un-complete a task — progress is permanent.
+        const existingCompletedIds = new Set<string>();
+        try {
+          const existingHandle = await lmDir.getFileHandle("todos.json", { create: false });
+          const existingFile = await existingHandle.getFile();
+          const existingData = JSON.parse(await existingFile.text()) as Array<Record<string, string>>;
+          for (const t of existingData) {
+            if (t["status"] === "completed") existingCompletedIds.add(t["id"]);
+          }
+        } catch { /* no existing file — first write */ }
+
+        // Apply rules: protect completed, enforce single in_progress
+        let foundInProgress = false;
+        let protectedCount = 0;
+        const todos = rawTodos.map((t) => {
+          // Lock completed items — cannot be reset to pending or in_progress
+          if (existingCompletedIds.has(t["id"]) && t["status"] !== "completed") {
+            protectedCount++;
+            return { ...t, status: "completed" };
+          }
+          if (t["status"] === "in_progress") {
+            if (foundInProgress) return { ...t, status: "pending" };
+            foundInProgress = true;
+          }
+          return t;
+        });
+
+        const todoHandle = await lmDir.getFileHandle("todos.json", { create: true });
+        const todoWritable = await todoHandle.createWritable();
+        await todoWritable.write(JSON.stringify(todos, null, 2));
+        await todoWritable.close();
+
+        const done = todos.filter((t) => t["status"] === "completed").length;
+        const active = todos.filter((t) => t["status"] === "in_progress").length;
+        const pending = todos.filter((t) => t["status"] === "pending").length;
+
+        const protectedNote = protectedCount > 0
+          ? ` (${protectedCount} completed item${protectedCount > 1 ? "s" : ""} protected from reset)`
+          : "";
+        const nextNote = active === 1
+          ? ` — now execute the in_progress task, do NOT call todo_write again until it is done`
+          : pending > 0
+          ? ` — mark one task in_progress and start executing it immediately`
+          : "";
+
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Todos updated: ${todos.length} tasks — ${done} completed, ${active} in progress, ${pending} pending${protectedNote}.${nextNote}`,
+        };
+      }
+
+      case "apply_patch": {
+        if (!dirHandle) return noWorkspace(call);
+        const patchOps = call.args["patches"] as Array<{ path: string; old_string: string; new_string: string }> | undefined;
+        if (!Array.isArray(patchOps) || patchOps.length === 0) throw new Error("patches must be a non-empty array");
+
+        const results: string[] = [];
+        for (const op of patchOps) {
+          const opParts = resolvePathParts(op.path);
+          const opFile = opParts.pop()!;
+          let opParent = dirHandle;
+          if (opParts.length > 0) {
+            const resolved = await resolveDirHandle(dirHandle, opParts);
+            if (!resolved) { results.push(`✗ ${op.path}: directory not found`); continue; }
+            opParent = resolved;
+          }
+          let opHandle: FileSystemFileHandle;
+          try { opHandle = await opParent.getFileHandle(opFile, { create: false }); }
+          catch { results.push(`✗ ${op.path}: file not found`); continue; }
+
+          const opFObj = await opHandle.getFile();
+          const opContent = await opFObj.text();
+          const opMatch = fuzzyFindMatch(opContent, op.old_string);
+          if (!opMatch) { results.push(`✗ ${op.path}: old_string not found (re-read the file)`); continue; }
+
+          const [opS, opE] = opMatch;
+          const opPatched = opContent.slice(0, opS) + op.new_string + opContent.slice(opE);
+          const opWr = await opHandle.createWritable();
+          await opWr.write(opPatched);
+          await opWr.close();
+          results.push(`✓ ${op.path}`);
+        }
+
+        const failed = results.filter((r) => r.startsWith("✗")).length;
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: results.join("\n"),
+          ...(failed > 0 ? { error: `${failed} patch${failed !== 1 ? "es" : ""} failed` } : {}),
+        };
+      }
+
+      case "web_fetch": {
+        const fetchUrl = argStr(call.args["url"]);
+        if (!fetchUrl) throw new Error("Missing url argument");
+        if (!fetchUrl.startsWith("http://") && !fetchUrl.startsWith("https://")) {
+          throw new Error("url must start with http:// or https://");
+        }
+        let fetchRes: Response;
+        try {
+          fetchRes = await fetch(fetchUrl, {
+            headers: { "User-Agent": "LocalMind-Agent/1.0" },
+            signal: AbortSignal.timeout(20000),
+          });
+        } catch (err) {
+          throw new Error(`Fetch failed: ${(err as Error).message}`);
+        }
+        if (!fetchRes.ok) throw new Error(`HTTP ${fetchRes.status}: ${fetchRes.statusText}`);
+
+        let fetchText = await fetchRes.text();
+        const ct = fetchRes.headers.get("content-type") ?? "";
+        if (ct.includes("html")) {
+          fetchText = fetchText
+            .replace(/<script[\s\S]*?<\/script>/gi, "")
+            .replace(/<style[\s\S]*?<\/style>/gi, "")
+            .replace(/<!--[\s\S]*?-->/g, "")
+            .replace(/<[^>]+>/g, " ")
+            .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")
+            .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"')
+            .replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+        }
+        const MAX_FETCH = 12000;
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: fetchText.length > MAX_FETCH
+            ? fetchText.slice(0, MAX_FETCH) + "\n\n…(truncated)"
+            : fetchText,
+        };
+      }
+
       case "save_skill": {
         if (!dirHandle) return noWorkspace(call);
         const skillName = argStr(call.args["name"]);
@@ -842,6 +1360,17 @@ export async function executeTool(
         }
         const list = skills.map((s) => `- **${s.name}** [${s.tags.join(", ")}]`).join("\n");
         return { toolCallId: call.id, name: call.name, output: `${skills.length} skills:\n${list}` };
+      }
+
+      case "create_folder": {
+        const folderPath = argStr(call.args["path"]);
+        if (!folderPath) throw new Error("Missing path argument");
+        await tauriInvoke("fs_mkdir", { path: folderPath });
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Created folder: ${folderPath}`,
+        };
       }
 
       case "register_tool": {

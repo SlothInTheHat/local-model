@@ -55,7 +55,7 @@ static EFFECTIVE_PATH: OnceLock<String> = OnceLock::new();
 /// On Windows, desktop apps launched outside a terminal only see system PATH,
 /// so git/node/python installed by the user are invisible. We call PowerShell
 /// once, cache the result, and inject it into every spawned command.
-fn effective_path() -> &'static str {
+pub(crate) fn effective_path() -> &'static str {
     EFFECTIVE_PATH.get_or_init(|| {
         let base = std::env::var("PATH").unwrap_or_default();
 
@@ -292,21 +292,70 @@ fn run_command(
         }
     }
 
+    // Run with a 30-second timeout so GUI apps (OpenCV, pygame, etc.) don't block forever.
+    // Uses std::process::Child so cwd is always respected (tokio jobs ignore cwd).
+    const TIMEOUT_SECS: u64 = 30;
+
     #[cfg(target_os = "windows")]
-    let output = Command::new("cmd")
-        .args(["/C", &cmd])
-        .env("PATH", effective_path())
-        .current_dir(work_dir_str)
-        .output()
-        .map_err(|e| e.to_string())?;
+    let output = {
+        use std::process::Stdio;
+        let ps_cmd = cmd.replace(" && ", " ; ");
+        let child = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
+            .env("PATH", effective_path())
+            .current_dir(work_dir_str)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<std::process::Output>>();
+        std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(TIMEOUT_SECS)) {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(_) => {
+                return Ok(CommandResult {
+                    stdout: "(timed out after 30s - GUI apps like OpenCV must be run in your terminal, not via the agent)".to_string(),
+                    stderr: String::new(),
+                    exit_code: 1,
+                    cwd: work_dir_str.to_string(),
+                    sandbox_blocked: false,
+                });
+            }
+        }
+    };
 
     #[cfg(not(target_os = "windows"))]
-    let output = Command::new("sh")
-        .args(["-c", &cmd])
-        .env("PATH", effective_path())
-        .current_dir(work_dir_str)
-        .output()
-        .map_err(|e| e.to_string())?;
+    let output = {
+        use std::process::Stdio;
+        let child = Command::new("sh")
+            .args(["-c", &cmd])
+            .env("PATH", effective_path())
+            .current_dir(work_dir_str)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<std::process::Output>>();
+        std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(TIMEOUT_SECS)) {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(_) => {
+                return Ok(CommandResult {
+                    stdout: "(timed out after 30s - GUI apps must be run manually in a terminal)".to_string(),
+                    stderr: String::new(),
+                    exit_code: 1,
+                    cwd: work_dir_str.to_string(),
+                    sandbox_blocked: false,
+                });
+            }
+        }
+    };
 
     // Compute new cwd from cd commands
     let new_cwd_raw: PathBuf = if cmd.trim_start().to_lowercase().starts_with("cd ") {

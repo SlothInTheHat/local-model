@@ -55,6 +55,29 @@ export default defineConfig(async () => ({
         target: "https://api.duckduckgo.com",
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/ddg-search/, ""),
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        },
+      },
+      "/ddg-lite": {
+        target: "https://lite.duckduckgo.com",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/ddg-lite/, ""),
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+      },
+      "/ddg-html": {
+        target: "https://html.duckduckgo.com",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/ddg-html/, ""),
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+        },
       },
     },
   },

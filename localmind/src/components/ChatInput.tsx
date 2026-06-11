@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Send, Square, Globe, Zap, Loader2, Bot, Paperclip } from "lucide-react";
+import { Send, Square, Globe, Zap, Loader2, Bot, Paperclip, Mic } from "lucide-react";
 import { cn } from "./ui/utils";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
@@ -38,8 +38,10 @@ export function ChatInput({
   onRemoveImage,
 }: Props) {
   const [text, setText] = useState("");
+  const [micActive, setMicActive] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const recognitionRef = useRef<{ stop: () => void } | null>(null);
 
   function submit() {
     const trimmed = text.trim();
@@ -54,6 +56,35 @@ export function ChatInput({
       e.preventDefault();
       submit();
     }
+  }
+
+  function toggleMic() {
+    if (micActive) {
+      recognitionRef.current?.stop();
+      setMicActive(false);
+      return;
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const win = window as any;
+    const SR: (new () => { continuous: boolean; interimResults: boolean; onresult: ((e: any) => void) | null; onerror: (() => void) | null; onend: (() => void) | null; start: () => void; stop: () => void }) | undefined
+      = win.SpeechRecognition ?? win.webkitSpeechRecognition;
+    if (!SR) return;
+    const rec = new SR();
+    rec.continuous = false;
+    rec.interimResults = false;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    rec.onresult = (e: any) => {
+      const transcript = String(e.results[0][0].transcript).trim();
+      setMicActive(false);
+      if (transcript && !isStreaming && !isSearching && !disabled) {
+        onSend(transcript);
+      }
+    };
+    rec.onerror = () => setMicActive(false);
+    rec.onend = () => setMicActive(false);
+    rec.start();
+    recognitionRef.current = rec;
+    setMicActive(true);
   }
 
   async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -178,6 +209,21 @@ export function ChatInput({
                 )}
               >
                 <Bot className="size-4" />
+              </button>
+
+              {/* Mic — voice input */}
+              <button
+                type="button"
+                onClick={toggleMic}
+                title={micActive ? "Listening… click to stop" : "Voice input"}
+                className={cn(
+                  "size-7 flex items-center justify-center rounded-md transition-colors",
+                  micActive
+                    ? "bg-red-500 text-white animate-pulse"
+                    : "text-muted-foreground hover:text-foreground hover:bg-accent"
+                )}
+              >
+                <Mic className="size-4" />
               </button>
             </div>
           </div>

@@ -54,26 +54,57 @@ export function ModelManager({ onUseModel }: Props) {
     (!id.includes(":") && availableModels.some((m) => m === `${id}:latest`));
 
   async function handleInstall(id: string) {
-    const abort = new AbortController();
-    aborts.current[id] = abort;
-    setPullProgress(id, { status: "Connecting…", percent: 0 });
+    const MAX_RETRIES = 8;
 
-    try {
-      for await (const update of pullModel(id, abort.signal)) {
-        setPullProgress(id, { status: update.status, percent: update.percent });
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      const abort = new AbortController();
+      aborts.current[id] = abort;
+      if (attempt === 1) {
+        setPullProgress(id, { status: "Connecting…", percent: 0 });
+      } else {
+        setPullProgress(id, { status: `Reconnecting (attempt ${attempt})…`, percent: 0 });
+        await new Promise((r) => setTimeout(r, 2000));
       }
-      const models = await listModels();
-      setModels(models.map((m) => m.name));
-    } catch (err: unknown) {
-      const e = err as Error;
-      if (e.name !== "AbortError") {
-        setPullProgress(id, { status: "", percent: 0, error: e.message });
-        setTimeout(() => clearPullProgress(id), 4000);
+
+      let succeeded = false;
+      try {
+        for await (const update of pullModel(id, abort.signal)) {
+          setPullProgress(id, { status: update.status, percent: update.percent });
+          if (update.done) { succeeded = true; break; }
+        }
+      } catch (err: unknown) {
+        const e = err as Error;
+        if (e.name === "AbortError") {
+          // User cancelled — stop immediately
+          delete aborts.current[id];
+          clearPullProgress(id);
+          return;
+        }
+        if (attempt >= MAX_RETRIES) {
+          setPullProgress(id, { status: "", percent: 0, error: e.message });
+          setTimeout(() => clearPullProgress(id), 5000);
+          delete aborts.current[id];
+          return;
+        }
+        // transient error — retry (Ollama resumes the download automatically)
+        delete aborts.current[id];
+        continue;
+      } finally {
+        delete aborts.current[id];
+      }
+
+      if (succeeded) break;
+
+      // Stream ended without "success" (connection dropped mid-pull) — retry
+      if (attempt >= MAX_RETRIES) {
+        setPullProgress(id, { status: "", percent: 0, error: "Pull did not complete after several attempts." });
+        setTimeout(() => clearPullProgress(id), 5000);
         return;
       }
-    } finally {
-      delete aborts.current[id];
     }
+
+    const models = await listModels();
+    setModels(models.map((m) => m.name));
     clearPullProgress(id);
   }
 

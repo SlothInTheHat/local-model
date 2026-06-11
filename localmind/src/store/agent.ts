@@ -17,6 +17,7 @@ interface AgentState {
 const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   read_file: true,
   write_file: true,
+  patch_file: true,
   delete_file: true,
   list_directory: true,
   grep_files: true,
@@ -30,6 +31,11 @@ const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   git_log: false,
   git_add: false,
   git_commit: false,
+  install_deps: true,
+  todo_write: true,
+  apply_patch: true,
+  web_fetch: true,
+  create_folder: true,
 };
 
 export const useAgentStore = create<AgentState>()((set) => ({

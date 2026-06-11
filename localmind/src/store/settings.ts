@@ -5,12 +5,15 @@ interface Settings {
   defaultSystemPrompt: string;
   agentAutoApproveReads: boolean;
   theme: "light" | "dark";
+  /** Manual override for the agent's Ollama num_ctx. null = auto (based on detected hardware). */
+  numCtxOverride: number | null;
 }
 
 interface SettingsState extends Settings {
   setDefaultSystemPrompt: (prompt: string) => void;
   setAgentAutoApproveReads: (val: boolean) => void;
   setTheme: (theme: "light" | "dark") => void;
+  setNumCtxOverride: (val: number | null) => void;
 }
 
 export const useSettingsStore = create<SettingsState>()(
@@ -20,10 +23,12 @@ export const useSettingsStore = create<SettingsState>()(
         "You are a helpful, precise AI assistant running locally via Ollama. Be concise and accurate.",
       agentAutoApproveReads: false,
       theme: "light",
+      numCtxOverride: null,
 
       setDefaultSystemPrompt: (prompt) => set({ defaultSystemPrompt: prompt }),
       setAgentAutoApproveReads: (val) => set({ agentAutoApproveReads: val }),
       setTheme: (theme) => set({ theme }),
+      setNumCtxOverride: (val) => set({ numCtxOverride: val }),
     }),
     { name: "localmind-settings" }
   )

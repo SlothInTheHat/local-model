@@ -26,9 +26,27 @@ pub async fn mcp_start_server(
     args: Vec<String>,
     env: HashMap<String, String>,
 ) -> Result<(), String> {
+    // On Windows, route through cmd.exe so that .cmd extensions (npx.cmd, node.cmd, etc.)
+    // are resolved correctly — Rust's Command::new() cannot directly spawn .cmd files.
+    // Also inject effective_path() so user-installed tools (node, npm) are on PATH.
+    #[cfg(target_os = "windows")]
+    let mut child: Child = Command::new("cmd")
+        .arg("/c")
+        .arg(&cmd)
+        .args(&args)
+        .envs(&env)
+        .env("PATH", crate::effective_path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn MCP server '{cmd}': {e}"))?;
+
+    #[cfg(not(target_os = "windows"))]
     let mut child: Child = Command::new(&cmd)
         .args(&args)
         .envs(&env)
+        .env("PATH", crate::effective_path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -66,6 +84,8 @@ pub async fn mcp_start_server(
     });
 
     // Reader task: parse stdout lines, match by id, dispatch to waiting senders.
+    // When stdout closes (server exited), drop all pending senders so callers
+    // fail fast instead of waiting for the full timeout.
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -81,6 +101,10 @@ pub async fn mcp_start_server(
                     }
                 }
             }
+        }
+        // Server process exited — cancel all pending requests immediately.
+        if let Ok(mut map) = pending_reader.lock() {
+            map.clear();
         }
     });
 
@@ -120,8 +144,8 @@ pub async fn mcp_send_request(id: String, request_json: String) -> Result<String
         .send((request_json, reply_tx))
         .map_err(|_| "MCP server channel closed".to_string())?;
 
-    tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx)
+    tokio::time::timeout(std::time::Duration::from_secs(120), reply_rx)
         .await
-        .map_err(|_| "MCP request timed out after 30s".to_string())?
-        .map_err(|_| "MCP reply channel dropped".to_string())
+        .map_err(|_| "MCP request timed out after 120s (server may still be downloading — try again in a moment)".to_string())?
+        .map_err(|_| "MCP server process exited unexpectedly — check that the command/package name is correct and that npx can reach npm".to_string())
 }

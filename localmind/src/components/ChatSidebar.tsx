@@ -23,6 +23,10 @@ import {
   ImageIcon,
   BookMarked,
   BarChart2,
+  Columns2,
+  ScrollText,
+  ChevronDown,
+  ChevronUp,
 } from "lucide-react";
 import { WorkspaceSelector } from "./WorkspaceSelector";
 import { McpSettings } from "./McpSettings";
@@ -74,20 +78,31 @@ export function ChatSidebar({ view, onViewChange, selectedModel, onModelChange, 
     return () => window.removeEventListener("keydown", onKey);
   }, [onOpenSearch]);
 
-  const navItems: { id: AppView; icon: React.ReactNode; label: string }[] = [
-    { id: "chat", icon: <MessageSquare className="size-4" />, label: "Chat" },
-    { id: "research", icon: <Microscope className="size-4" />, label: "Deep Research" },
-    { id: "study", icon: <BookOpen className="size-4" />, label: "Study Mode" },
-    { id: "code", icon: <Code2 className="size-4" />, label: "Code Editor" },
-    { id: "docs", icon: <FileText className="size-4" />, label: "Doc Editor" },
-    { id: "image", icon: <ImageIcon className="size-4" />, label: "Image Editor" },
-    { id: "skills", icon: <BookMarked className="size-4" />, label: "Skill Registry" },
-    { id: "benchmarks", icon: <BarChart2 className="size-4" />, label: "Benchmarks" },
-    { id: "models", icon: <Library className="size-4" />, label: "Model Library" },
-    { id: "terminal", icon: <TerminalSquare className="size-4" />, label: "Terminal" },
-    { id: "agents", icon: <Bot className="size-4" />, label: "Subagents" },
-    { id: "settings", icon: <CircleUser className="size-4" />, label: "Profile & Settings" },
+  type NavItem = { id: AppView; icon: React.ReactNode; label: string };
+
+  const primaryItems: NavItem[] = [
+    { id: "chat",     icon: <MessageSquare className="size-4" />, label: "Chat" },
+    { id: "code",     icon: <Code2 className="size-4" />,         label: "Code Editor" },
+    { id: "research", icon: <Microscope className="size-4" />,    label: "Deep Research" },
+    { id: "models",   icon: <Library className="size-4" />,       label: "Model Library" },
+    { id: "memory",   icon: <Brain className="size-4" />,         label: "Memory" },
+    { id: "settings", icon: <CircleUser className="size-4" />,    label: "Settings" },
   ];
+
+  const moreItems: NavItem[] = [
+    { id: "compare",    icon: <Columns2 className="size-4" />,       label: "Compare Models" },
+    { id: "study",      icon: <BookOpen className="size-4" />,        label: "Study Mode" },
+    { id: "docs",       icon: <FileText className="size-4" />,        label: "Doc Editor" },
+    { id: "image",      icon: <ImageIcon className="size-4" />,       label: "Image Editor" },
+    { id: "skills",     icon: <BookMarked className="size-4" />,      label: "Skill Registry" },
+    { id: "benchmarks", icon: <BarChart2 className="size-4" />,       label: "Benchmarks" },
+    { id: "terminal",   icon: <TerminalSquare className="size-4" />,  label: "Terminal" },
+    { id: "agents",     icon: <Bot className="size-4" />,             label: "Subagents" },
+  ];
+
+  // Auto-expand "More" if the current view is in the secondary list
+  const isMoreView = moreItems.some((i) => i.id === view);
+  const [showMore, setShowMore] = useState(isMoreView);
 
   return (
     <aside className="w-64 border-r bg-card flex flex-col h-full shrink-0">
@@ -114,9 +129,9 @@ export function ChatSidebar({ view, onViewChange, selectedModel, onModelChange, 
       </div>
 
       <ScrollArea className="flex-1 min-h-0">
-        {/* Navigation */}
+        {/* Primary navigation */}
         <div className="p-3 space-y-0.5">
-          {navItems.map((item) => (
+          {primaryItems.map((item) => (
             <Button
               key={item.id}
               variant={view === item.id ? "secondary" : "ghost"}
@@ -127,6 +142,36 @@ export function ChatSidebar({ view, onViewChange, selectedModel, onModelChange, 
               {item.label}
             </Button>
           ))}
+
+          {/* More / secondary nav toggle */}
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setShowMore((v) => !v)}
+            className="w-full justify-start gap-2 mt-1 text-muted-foreground hover:text-foreground"
+          >
+            {showMore ? <ChevronUp className="size-3.5" /> : <ChevronDown className="size-3.5" />}
+            <span className="text-xs">{showMore ? "Less" : "More"}</span>
+            {isMoreView && !showMore && (
+              <span className="ml-auto size-1.5 rounded-full bg-primary" />
+            )}
+          </Button>
+
+          {showMore && (
+            <div className="space-y-0.5 pt-0.5">
+              {moreItems.map((item) => (
+                <Button
+                  key={item.id}
+                  variant={view === item.id ? "secondary" : "ghost"}
+                  className="w-full justify-start gap-2 text-muted-foreground hover:text-foreground"
+                  onClick={() => onViewChange(item.id)}
+                >
+                  {item.icon}
+                  {item.label}
+                </Button>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Model selector */}
@@ -196,14 +241,18 @@ export function ChatSidebar({ view, onViewChange, selectedModel, onModelChange, 
 
         {/* MCP Integrations section */}
         <div className="p-3">
-          <button
+          <Button
+            variant="ghost"
+            size="sm"
             onClick={() => setShowMcp((v) => !v)}
-            className="w-full flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition-colors mb-2"
+            className="w-full justify-start gap-2 mb-2 text-muted-foreground hover:text-foreground"
           >
             <Plug className="size-3.5" />
-            <span className="font-medium">Integrations (MCP)</span>
-            <span className="ml-auto text-[10px]">{showMcp ? "▲" : "▼"}</span>
-          </button>
+            <span className="text-xs font-medium">Integrations (MCP)</span>
+            <span className="ml-auto">
+              {showMcp ? <ChevronUp className="size-3" /> : <ChevronDown className="size-3" />}
+            </span>
+          </Button>
           {showMcp && <McpSettings />}
         </div>
       </ScrollArea>
@@ -235,12 +284,32 @@ export function ChatSidebar({ view, onViewChange, selectedModel, onModelChange, 
           </div>
         )}
         <div className="flex gap-1.5 mt-1">
-          <Button variant="outline" size="sm" className="flex-1 text-xs" onClick={() => onViewChange("models")}>
-            <Library className="size-3 mr-1.5" />
+          <Button
+            variant={view === "models" ? "secondary" : "outline"}
+            size="sm"
+            className="flex-1 text-xs"
+            onClick={() => onViewChange("models")}
+          >
+            <Library className="size-3 mr-1" />
             Models
           </Button>
-          <Button variant="outline" size="sm" className="flex-1 text-xs" onClick={() => onViewChange("settings")}>
-            <Settings className="size-3 mr-1.5" />
+          <Button
+            variant={view === "logs" ? "secondary" : "outline"}
+            size="sm"
+            className="flex-1 text-xs"
+            onClick={() => onViewChange("logs")}
+            title="Agent Logs"
+          >
+            <ScrollText className="size-3 mr-1" />
+            Logs
+          </Button>
+          <Button
+            variant={view === "settings" ? "secondary" : "outline"}
+            size="sm"
+            className="flex-1 text-xs"
+            onClick={() => onViewChange("settings")}
+          >
+            <Settings className="size-3 mr-1" />
             Settings
           </Button>
         </div>

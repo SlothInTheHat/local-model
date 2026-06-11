@@ -4,22 +4,29 @@ import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { FileTree } from "./FileTree";
-import { openWorkspace, readFileFromHandle, writeFileToHandle, listDirectory } from "../lib/fileSystem";
-import type { FileEntry } from "../lib/fileSystem";
-import { runAgentTurn } from "../lib/agentLoop";
-import { executeTool, getToolDefinitions } from "../lib/tools";
+import { openWorkspace, readFileFromHandle, writeFileToHandle } from "../lib/fileSystem";
+import { getToolDefinitions } from "../lib/tools";
 import { injectGitCredentials, sanitizeOutput } from "../store/profile";
 import { streamChat } from "../lib/ollama";
+import type { ChatMessage } from "../lib/ollama";
 import { supportsNativeTools } from "../lib/modelCapabilities";
 import { useAgentStore } from "../store/agent";
+import { useModelStore } from "../store/models";
+import { useSettingsStore } from "../store/settings";
+import { resolveNumCtx } from "../lib/contextSize";
 import type { editor as MonacoEditorNS } from "monaco-editor";
 import { CheckpointBrowser } from "./CheckpointBrowser";
 import { inlineHtmlResources } from "../lib/htmlPreview";
-import { loadSkills, matchSkills, formatSkillsForContext, saveSkill } from "../lib/skillEngine";
+import { loadSkills, saveSkill } from "../lib/skillEngine";
 import type { Skill } from "../lib/skillEngine";
-import { readProjectMemory, writeProjectMemory, formatMemoryForContext } from "../lib/projectMemory";
+import { readProjectMemory, writeProjectMemory } from "../lib/projectMemory";
 import { loadDynamicTools, toOllamaTool } from "../lib/dynamicTools";
 import type { DynamicToolDef } from "../lib/dynamicTools";
+import {
+  startSession, endSession, logRound, logToolCall, logToolResult, logAgentText,
+} from "../lib/agentLogger";
+import { runAgentSession, DEFAULT_MAX_ROUNDS } from "../lib/agentRuntime";
+import type { TodoItem } from "../lib/agentRuntime";
 
 const MonacoEditor = React.lazy(() =>
   import("@monaco-editor/react").then((m) => ({ default: m.default }))
@@ -51,19 +58,6 @@ const ALL_LANGUAGES = [
 function detectLanguage(filePath: string): string {
   const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
   return EXTENSION_TO_LANGUAGE[ext] ?? "plaintext";
-}
-
-// Render a FileEntry tree as indented text for the system prompt
-function formatTree(entries: FileEntry[], prefix: string): string {
-  return entries
-    .map((e) => {
-      const line = prefix + (e.kind === "directory" ? "📁 " : "📄 ") + e.name;
-      if (e.kind === "directory" && e.children) {
-        return line + "\n" + formatTree(e.children, prefix + "  ");
-      }
-      return line;
-    })
-    .join("\n");
 }
 
 // Sandboxed JS runner — captures console output
@@ -149,27 +143,26 @@ function shellRunCmd(lang: string, filePath: string): string {
   }
 }
 
-// Tools that require explicit user approval before executing.
-const APPROVAL_REQUIRED = new Set([
-  "write_file", "delete_file",
-  "run_command",
-  "git_add", "git_commit",
-]);
-
 interface AiMessage {
   role: "user" | "assistant" | "tool";
   content: string;
   toolName?: string;
   toolError?: boolean;
   toolResult?: string;
+  toolArgs?: Record<string, unknown>; // original args — needed to reconstruct history
 }
 
 interface CodeEditorProps {
   selectedModel: string;
+  isActive?: boolean; // false when hidden behind another tab — used to re-layout Monaco on restore
 }
 
-export function CodeEditor({ selectedModel }: CodeEditorProps) {
+export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) {
   const { dirHandle, workspacePath, setWorkspace } = useAgentStore();
+  const { hardware, vramOverride } = useModelStore();
+  const { numCtxOverride } = useSettingsStore();
+  const effectiveHardware = vramOverride != null && hardware ? { ...hardware, vramGb: vramOverride } : hardware;
+  const numCtx = resolveNumCtx(effectiveHardware, numCtxOverride);
 
   // Multi-file tabs
   interface OpenTab { path: string; content: string; isDirty: boolean; }
@@ -189,8 +182,7 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
   const aiBottomRef = useRef<HTMLDivElement>(null);
 
   // Workspace file tree + auto-read markdown docs
-  const [workspaceTree, setWorkspaceTree] = useState<string>("");
-  const [workspaceDocs, setWorkspaceDocs] = useState<string>("");
+  const [_workspaceDocs, setWorkspaceDocs] = useState<string>("");
   const [treeVersion, setTreeVersion] = useState(0);
 
   // Run output panel
@@ -205,6 +197,26 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
   const abortRef = useRef<AbortController | null>(null);
   const previewDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const treeRefreshDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const logSessionRef = useRef<string | null>(null);
+  const terminalEndRef = useRef<HTMLDivElement>(null);
+  const autoRestartCountRef = useRef(0);
+  const MAX_AUTO_RESTARTS = 5;
+
+  // Live activity status shown above the conversation while streaming
+  const [currentActivity, setCurrentActivity] = useState<string | null>(null);
+
+  // Plan / Build agent mode (Plan = read-only like OpenCode's Plan agent)
+  const [agentBuildMode, setAgentBuildMode] = useState(true); // true = Build, false = Plan
+
+  // Todo list (mirrors .localmind/todos.json)
+  const [todos, setTodos] = useState<TodoItem[]>([]);
+
+  // Integrated terminal — shows agent + user commands; user can type their own
+  interface TerminalEntry { id: string; cmd: string; output: string; error: boolean; running: boolean; durationMs?: number; source: "agent" | "user"; }
+  const [terminalLog, setTerminalLog] = useState<TerminalEntry[]>([]);
+  const [terminalOpen, setTerminalOpen] = useState(true);
+  const [terminalInput, setTerminalInput] = useState("");
+  const [terminalRunning, setTerminalRunning] = useState(false);
 
   // Paths the agent has written to — used to auto-expand parent directories
   const [autoExpandPaths, setAutoExpandPaths] = useState<Set<string>>(new Set());
@@ -213,22 +225,15 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
   const [pendingApproval, setPendingApproval] = useState<{ name: string; args: Record<string, unknown> } | null>(null);
   const approvalResolverRef = useRef<((approved: boolean) => void) | null>(null);
   const [agentRound, setAgentRound] = useState(0);
-  const [autoApproveCommands, setAutoApproveCommands] = useState(false);
+  const [autoApproveAll, setAutoApproveAll] = useState(false);
   const [expandedToolIndices, setExpandedToolIndices] = useState<Set<number>>(new Set());
 
-  // Phase 1: Planning mode
-  const [planningEnabled, setPlanningEnabled] = useState(false);
-  const [awaitingExecution, setAwaitingExecution] = useState<{
-    prompt: string;
-    history: Array<{ role: "user" | "assistant" | "system" | "tool"; content: string; tool_calls?: unknown[] }>;
-  } | null>(null);
-
-  // Phase 2: Task queue
+  // Task queue
   const [taskQueue, setTaskQueue] = useState<string[]>([]);
   const [showQueue, setShowQueue] = useState(false);
 
   // Phase 3: Skills, memory, dynamic tools
-  const [skills, setSkills] = useState<Skill[]>([]);
+  const [_skills, setSkills] = useState<Skill[]>([]);
   const [projectMemory, setProjectMemory] = useState<string>("");
   const [dynamicToolDefs, setDynamicToolDefs] = useState<DynamicToolDef[]>([]);
   const [showMemory, setShowMemory] = useState(false);
@@ -244,7 +249,6 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
   // Refresh workspace tree + eagerly read markdown docs when workspace changes
   useEffect(() => {
     if (!dirHandle) {
-      setWorkspaceTree("");
       setWorkspaceDocs("");
       setSkills([]);
       setProjectMemory("");
@@ -252,14 +256,17 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
       return;
     }
 
-    // Load skills, project memory, and dynamic tools in parallel
+    // Load skills, project memory, dynamic tools, and todos in parallel
     loadSkills(dirHandle).then(setSkills).catch(() => {});
     readProjectMemory(dirHandle).then(setProjectMemory).catch(() => {});
     loadDynamicTools(dirHandle).then(setDynamicToolDefs).catch(() => {});
-
-    listDirectory(dirHandle, 3)
-      .then((entries) => setWorkspaceTree(formatTree(entries, "")))
-      .catch(() => setWorkspaceTree("(could not read workspace)"));
+    // Load todos from .localmind/todos.json
+    dirHandle.getDirectoryHandle(".localmind", { create: false })
+      .then((lm) => lm.getFileHandle("todos.json", { create: false }))
+      .then((fh) => fh.getFile())
+      .then((f) => f.text())
+      .then((t) => setTodos(JSON.parse(t) as TodoItem[]))
+      .catch(() => setTodos([]));;
 
     // Read well-known markdown docs in priority order
     const MD_CANDIDATES = [
@@ -286,14 +293,20 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
     })();
   }, [dirHandle, treeVersion]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Poll the file tree every 1.5 s while the agent is running so that files
-  // created by run_command (mkdir, npm init, etc.) also appear without waiting
-  // for an explicit write_file callback.
+  // Monaco doesn't know its size when hidden — force a re-layout when tab becomes active again
   useEffect(() => {
-    if (!isChatStreaming) return;
-    const id = setInterval(() => setTreeVersion((v) => v + 1), 1500);
-    return () => clearInterval(id);
-  }, [isChatStreaming]);
+    if (isActive) {
+      setTimeout(() => editorRef.current?.layout(), 50);
+    }
+  }, [isActive]);
+
+  // Refresh the file tree once when the agent finishes streaming, in case
+  // run_command created files that write_file didn't explicitly notify about.
+  useEffect(() => {
+    if (!isChatStreaming) {
+      scheduleTreeRefresh();
+    }
+  }, [isChatStreaming]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Live-update the HTML preview as the user types (400 ms debounce).
   // Reads htmlPreviewUrl and language from the closure so the effect only
@@ -333,7 +346,7 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
       }
     }
     if (treeRefreshDebounceRef.current) clearTimeout(treeRefreshDebounceRef.current);
-    treeRefreshDebounceRef.current = setTimeout(() => setTreeVersion((v) => v + 1), 250);
+    treeRefreshDebounceRef.current = setTimeout(() => setTreeVersion((v) => v + 1), 800);
   }
 
   async function handleOpenDir() {
@@ -487,6 +500,36 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
     }
   }
 
+  async function handleTerminalRun(cmd: string) {
+    const trimmed = cmd.trim();
+    if (!trimmed || terminalRunning) return;
+    if (!isTauri()) {
+      const id = crypto.randomUUID();
+      setTerminalLog((prev) => [...prev, { id, cmd: trimmed, output: "Terminal commands require the desktop app (npm run tauri dev).", error: true, running: false, source: "user" }]);
+      return;
+    }
+    const id = crypto.randomUUID();
+    setTerminalLog((prev) => [...prev, { id, cmd: trimmed, output: "", error: false, running: true, source: "user" }]);
+    setTerminalRunning(true);
+    setTimeout(() => terminalEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+    try {
+      const result = await tauriRun(trimmed, workspacePath || undefined);
+      const combined = [result.stdout, result.stderr].filter(Boolean).join("\n");
+      setTerminalLog((prev) => prev.map((e) => e.id === id
+        ? { ...e, output: combined || "(no output)", error: result.exit_code !== 0, running: false }
+        : e
+      ));
+    } catch (err) {
+      setTerminalLog((prev) => prev.map((e) => e.id === id
+        ? { ...e, output: (err as Error).message, error: true, running: false }
+        : e
+      ));
+    } finally {
+      setTerminalRunning(false);
+      setTimeout(() => terminalEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+    }
+  }
+
   async function handleRun() {
     if (!fileContent.trim()) return;
     const mode = getRunMode(language);
@@ -583,11 +626,14 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
     approvalResolverRef.current = null;
   }
 
-  async function handleChatSend(promptOverride?: string) {
+  async function handleChatSend(promptOverride?: string, _isAutoRestart?: boolean) {
     const raw = promptOverride ?? chatPrompt;
     if (!raw.trim() || !selectedModel || isChatStreaming) return;
     const prompt = raw.trim();
-    if (!promptOverride) setChatPrompt("");
+    if (!promptOverride) {
+      setChatPrompt("");
+      autoRestartCountRef.current = 0; // user sent a new message — reset restart counter
+    }
     setAgentRound(0);
     setReflectionOffer(false);
 
@@ -597,84 +643,50 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
     setTimeout(() => aiBottomRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
 
     setIsChatStreaming(true);
+    setCurrentActivity(null);
     abortRef.current = new AbortController();
+
+    // Start background logging session
+    logSessionRef.current = startSession(prompt, selectedModel, dirHandle?.name);
 
     const toolsSupported = supportsNativeTools(selectedModel);
 
-    // Build system context
-    const parts: string[] = [
-      "You are a code assistant with full access to the user's workspace and shell.",
-      "",
-      "OUTPUT RULES (non-negotiable — follow these exactly):",
-      "1. NEVER paste raw code, file contents, or code blocks into chat. This clutters the UI.",
-      "2. When writing or modifying code, write it directly to disk with write_file and then tell the user what you changed in 1–2 plain sentences. Do not show the code in chat.",
-      "3. If the user explicitly says 'show me the code' or 'paste it here', you may show a short relevant excerpt (≤ 20 lines).",
-      "4. Keep all responses short. Answer questions with prose, not code dumps.",
+    // Build dynamic tool definitions for this request.
+    // Only send the essential coding tools — sending all 24 tools exceeds Ollama's context budget.
+    const ESSENTIAL_CODING_TOOLS = new Set([
+      "read_file", "write_file", "patch_file", "apply_patch",
+      "list_directory", "grep_files", "find_files",
+      "run_command", "web_search", "web_fetch",
+      "install_deps", "todo_write",
+      "git_status", "git_commit",
+      "update_project_memory",
+      "create_folder",
+    ]);
+    const dynamicOllamaTools = dynamicToolDefs.map(toOllamaTool);
+    const CODE_TOOLS = [
+      ...BASE_TOOLS.filter((t) => ESSENTIAL_CODING_TOOLS.has(t.name)),
+      ...dynamicOllamaTools,
     ];
 
-    if (toolsSupported) {
-      parts.push(
-        "",
-        "CAPABILITIES:",
-        "- run_command: run any shell command (git, npm, pip, cargo, make, etc.). Always pass the workspace path as cwd.",
-        "- git_status / git_diff / git_log / git_add / git_commit: git operations.",
-        "- read_file / write_file / delete_file / list_directory / grep_files / find_files: file system.",
-        "- web_search: look up docs, examples, or package information.",
-        "",
-        "WORKFLOW RULES:",
-        "- Before answering about the codebase, read relevant files first.",
-        "- For tasks like cloning a repo, installing packages, or running tests — use run_command.",
-        "- For git tasks — prefer the specific git_* tools; fall back to run_command for anything else.",
-        "- Never guess file contents or command output. Use your tools.",
-      );
-    } else {
-      parts.push(
-        "",
-        "IMPORTANT: You do not have tool access in this session.",
-        "- If you need to show code, keep it short (≤ 20 lines) and only include the changed section.",
-        "- Use the 'Apply to file' button to push code into the editor instead of pasting full files.",
-      );
-    }
-
-    if (dirHandle) {
-      const cwdNote = workspacePath ? ` (OS path: ${workspacePath} — use this as cwd for run_command)` : "";
-      parts.push(`\nWorkspace: ${dirHandle.name}${cwdNote}`);
-
-      if (workspaceDocs) {
-        parts.push(`\n## Workspace documentation (auto-read on open)\n${workspaceDocs}`);
-      }
-
-      if (workspaceTree) {
-        parts.push(`\n## File tree\n${workspaceTree}`);
-      }
-    }
-
-    if (currentPath) {
-      parts.push(`\n## Currently open: ${currentPath}\n\`\`\`${language}\n${fileContent}\n\`\`\``);
-    }
-
-    // Inject project memory
-    if (projectMemory) parts.push(`\n${formatMemoryForContext(projectMemory)}`);
-
-    // Inject relevant skills
-    const matchedSkills = matchSkills(skills, prompt);
-    if (matchedSkills.length > 0) parts.push(`\n${formatSkillsForContext(matchedSkills)}`);
-
-    // Build dynamic tool definitions for this request
-    const dynamicOllamaTools = dynamicToolDefs.map(toOllamaTool);
-    const CODE_TOOLS = [...BASE_TOOLS, ...dynamicOllamaTools];
-
-    // Build Ollama message history (excluding tool chips from display)
-    type OllamaMsg = {
-      role: "user" | "assistant" | "system" | "tool";
-      content: string;
-      tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }>;
-    };
-    let history: OllamaMsg[] = [
-      { role: "system", content: parts.join("\n") },
-      ...aiMessages
-        .filter((m) => m.role === "user" || m.role === "assistant")
-        .map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
+    // Build chat history — reconstruct proper tool call/result pairs so the
+    // model knows what it did in previous rounds and doesn't re-simulate them as text.
+    // No leading system message: agentRuntime builds and prepends its own per round.
+    let history: ChatMessage[] = [
+      ...aiMessages.flatMap((m): ChatMessage[] => {
+        if (m.role === "user") return [{ role: "user", content: m.content }];
+        if (m.role === "assistant") {
+          if (!m.content) return []; // empty placeholder between rounds
+          return [{ role: "assistant", content: m.content }];
+        }
+        if (m.role === "tool" && m.toolName && m.toolArgs !== undefined) {
+          // Reconstruct assistant tool_call + tool result pair
+          return [
+            { role: "assistant", content: "", tool_calls: [{ function: { name: m.toolName, arguments: m.toolArgs } }] },
+            { role: "tool", content: m.toolResult ?? (m.toolError ? "[tool failed or was denied]" : m.content) },
+          ];
+        }
+        return [];
+      }),
       { role: "user", content: prompt },
     ];
 
@@ -704,163 +716,190 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
     };
 
     let hadSideEffects = false;
+    let hitRoundLimit = false;
+    let wasAborted = false;
+    // Tool-call durations span the async gap between onToolCallStart and onToolCallResolved
+    const toolStartTimes = new Map<string, number>();
 
     try {
-      if (!toolsSupported) {
-        // ── Plain streaming — model doesn't support Ollama tool calling ─────────
-        for await (const chunk of streamChat(selectedModel, history, abortRef.current.signal)) {
+      const sessionResult = await runAgentSession(history, {
+        modelRef: selectedModel,
+        hardware: effectiveHardware,
+        numCtxOverride,
+        dirHandle,
+        workspacePath,
+        workspaceName: dirHandle?.name ?? null,
+        tools: CODE_TOOLS,
+        agentBuildMode,
+        autoApproveAll,
+        toolsSupported,
+        maxRounds: DEFAULT_MAX_ROUNDS,
+        getCurrentOpenFile: () =>
+          currentPath && fileContent ? { path: currentPath, content: fileContent, language } : null,
+
+        onTextDelta: (chunk) => {
           appendToLastAssistant(chunk);
-        }
-      } else if (planningEnabled) {
-        // ── Planning mode: first call generates a plan, user confirms before executing ──
-        const planParts = [
-          "You are a planning assistant. The user has given you a task.",
-          "Your ONLY job is to output a numbered list of steps you will take to complete it.",
-          "Do NOT execute anything. Do NOT call tools. Do NOT write code.",
-          "Output ONLY the numbered step list, nothing else.",
-        ];
-        const planHistory = [
-          { role: "system" as const, content: planParts.join("\n") },
-          { role: "user" as const, content: prompt },
-        ];
-        let planText = "";
-        for await (const chunk of streamChat(selectedModel, planHistory, abortRef.current.signal)) {
-          planText += chunk;
-          appendToLastAssistant(chunk);
-        }
-        // Store the plan and history so the user can click Execute
-        setAwaitingExecution({ prompt, history });
-        return; // Don't proceed to execution yet
-      } else {
-        // ── Agentic loop — model supports tool calling ────────────────────────
-        const MAX_TOOL_ROUNDS = 30;
-        let round = 0;
-        let gotToolCallsLastRound = false;
+          if (logSessionRef.current) logAgentText(logSessionRef.current, chunk);
+        },
 
-        while (round < MAX_TOOL_ROUNDS) {
-          round++;
-          setAgentRound(round);
-          let gotToolCalls = false;
+        onTextReplace: (cleanText) => {
+          setAiMessages((prev) => {
+            const msgs = [...prev];
+            const last = msgs[msgs.length - 1];
+            if (last?.role === "assistant") msgs[msgs.length - 1] = { ...last, content: cleanText };
+            return msgs;
+          });
+        },
 
-          for await (const event of runAgentTurn(selectedModel, history, CODE_TOOLS, abortRef.current.signal)) {
-            if (event.type === "text_delta" && event.content) {
-              appendToLastAssistant(event.content);
+        onToolCallStart: (call, label) => {
+          // Remove any trailing empty assistant placeholder before adding the chip.
+          // Store toolArgs so history reconstruction can emit proper tool_calls pairs.
+          setAiMessages((prev) => {
+            const msgs = [...prev];
+            const last = msgs[msgs.length - 1];
+            if (last?.role === "assistant" && !last.content) msgs.pop();
+            return [...msgs, { role: "tool", content: label, toolName: call.name, toolArgs: call.args }];
+          });
+          setTimeout(() => aiBottomRef.current?.scrollIntoView({ behavior: "smooth" }), 0);
 
-            } else if (event.type === "tool_calls" && event.toolCalls) {
-              gotToolCalls = true;
+          // Attach dynamic tool template so executeTool can route it
+          const dynDef = dynamicToolDefs.find((d) => d.name === call.name);
+          if (dynDef) (call as unknown as Record<string, unknown>)._dynamicTemplate = dynDef.template;
 
-              for (const call of event.toolCalls) {
-                const label = formatToolLabel(call.name, call.args);
+          if (logSessionRef.current) logToolCall(logSessionRef.current, call.name, call.args);
+          toolStartTimes.set(call.id, Date.now());
 
-                // Remove any trailing empty assistant placeholder before adding the chip
-                setAiMessages((prev) => {
-                  const msgs = [...prev];
-                  const last = msgs[msgs.length - 1];
-                  if (last?.role === "assistant" && !last.content) msgs.pop();
-                  return [...msgs, { role: "tool", content: label, toolName: call.name }];
-                });
-                setTimeout(() => aiBottomRef.current?.scrollIntoView({ behavior: "smooth" }), 0);
+          // For run_command: add a "running" entry to the terminal log immediately
+          if (call.name === "run_command") {
+            const cmd = String(call.args["cmd"] ?? "");
+            setTerminalLog((prev) => [...prev, { id: call.id, cmd, output: "", error: false, running: true, source: "agent" as const }]);
+            setTerminalOpen(true);
+            setTimeout(() => terminalEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+          }
+        },
 
-                // Destructive / side-effect tools require approval (auto-approve run_command if toggle is on)
-                if (APPROVAL_REQUIRED.has(call.name)) {
-                  const skip = autoApproveCommands && call.name === "run_command";
-                  const approved = skip || await requestApproval(call.name, call.args);
-                  if (!approved) {
-                    const deniedSummary = `${label} → denied`;
-                    setAiMessages((prev) => {
-                      const msgs = [...prev];
-                      let idx = -1;
-                      for (let j = msgs.length - 1; j >= 0; j--) {
-                        if (msgs[j].role === "tool" && msgs[j].content === label) { idx = j; break; }
-                      }
-                      if (idx !== -1) msgs[idx] = { role: "tool", content: deniedSummary, toolName: call.name, toolError: true };
-                      return msgs;
-                    });
-                    history = [
-                      ...history,
-                      { role: "assistant", content: "", tool_calls: [{ function: { name: call.name, arguments: call.args } }] },
-                      { role: "tool", content: "Tool call denied by user." },
-                    ];
-                    continue;
-                  }
+        onApprovalNeeded: (call) => requestApproval(call.name, call.args),
+
+        onToolCallResolved: (call, label, result, summary) => {
+          const toolMs = Date.now() - (toolStartTimes.get(call.id) ?? Date.now());
+          toolStartTimes.delete(call.id);
+
+          // Update terminal entry with result
+          if (call.name === "run_command") {
+            setTerminalLog((prev) =>
+              prev.map((e) =>
+                e.id === call.id
+                  ? { ...e, output: result.output || "(no output)", error: !!result.error, running: false, durationMs: toolMs }
+                  : e
+              )
+            );
+            setTimeout(() => terminalEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+          }
+
+          // Log tool result
+          if (logSessionRef.current) {
+            logToolResult(logSessionRef.current, call.name, result.output, result.error, toolMs);
+          }
+
+          setAiMessages((prev) => {
+            const msgs = [...prev];
+            let idx = -1;
+            for (let j = msgs.length - 1; j >= 0; j--) {
+              if (msgs[j].role === "tool" && msgs[j].content === label) { idx = j; break; }
+            }
+            if (idx !== -1) {
+              msgs[idx] = {
+                role: "tool",
+                content: summary,
+                toolName: call.name,
+                toolError: !!result.error,
+                toolResult: result.error ? undefined : result.output,
+              };
+            }
+            return msgs;
+          });
+
+          if (!result.error && (call.name === "write_file" || call.name === "patch_file")) {
+            const writtenPath = String(call.args["path"] ?? call.args["file_path"] ?? "");
+            scheduleTreeRefresh(writtenPath);
+            // Sync the editor if this file is currently open
+            if (writtenPath && dirHandle) {
+              readFileFromHandle(dirHandle, writtenPath).then((newContent) => {
+                // Update the active editor view
+                if (writtenPath === currentPath) {
+                  setFileContent(newContent);
                 }
-
-                // Attach dynamic tool template so executeTool can route it
-                const dynDef = dynamicToolDefs.find((d) => d.name === call.name);
-                if (dynDef) (call as unknown as Record<string, unknown>)._dynamicTemplate = dynDef.template;
-
-                const result = await executeTool(call, dirHandle);
-                if (!result.error && (call.name === "write_file" || call.name === "run_command")) {
-                  hadSideEffects = true;
-                }
-                const summary = result.error
-                  ? `${label} → error`
-                  : summariseToolResult(call.name, result.output);
-
-                setAiMessages((prev) => {
-                  const msgs = [...prev];
-                  let idx = -1;
-                  for (let j = msgs.length - 1; j >= 0; j--) {
-                    if (msgs[j].role === "tool" && msgs[j].content === label) { idx = j; break; }
-                  }
-                  if (idx !== -1) {
-                    msgs[idx] = {
-                      role: "tool",
-                      content: summary,
-                      toolName: call.name,
-                      toolError: !!result.error,
-                      toolResult: result.error ? undefined : result.output,
-                    };
-                  }
-                  return msgs;
-                });
-
-                if (!result.error && call.name === "write_file") {
-                  scheduleTreeRefresh(String(call.args["path"] ?? ""));
-                }
-
-                history = [
-                  ...history,
-                  {
-                    role: "assistant",
-                    content: "",
-                    tool_calls: [{ function: { name: call.name, arguments: call.args } }],
-                  },
-                  {
-                    role: "tool",
-                    content: result.error ? `Error: ${result.error}` : result.output,
-                  },
-                ];
-              }
-              break;
-
-            } else if (event.type === "error") {
-              setLastAssistantError(`Error: ${event.error}`);
+                // Update the tab's cached content (keeps isDirty false)
+                setOpenTabs((prev) =>
+                  prev.map((t) => t.path === writtenPath ? { ...t, content: newContent, isDirty: false } : t)
+                );
+              }).catch(() => {});
             }
           }
 
-          gotToolCallsLastRound = gotToolCalls;
-          if (!gotToolCalls) break;
+          if (!result.error && call.name === "apply_patch") {
+            // apply_patch touches multiple files — refresh any that are open
+            const patches = call.args["patches"] as Array<{ path: string }> | undefined;
+            if (Array.isArray(patches) && dirHandle) {
+              for (const p of patches) {
+                const pp = p.path;
+                scheduleTreeRefresh(pp);
+                readFileFromHandle(dirHandle, pp).then((newContent) => {
+                  if (pp === currentPath) setFileContent(newContent);
+                  setOpenTabs((prev) =>
+                    prev.map((t) => t.path === pp ? { ...t, content: newContent, isDirty: false } : t)
+                  );
+                }).catch(() => {});
+              }
+            }
+          }
+        },
 
-          // Add a single empty assistant bubble for the next round's response
-          setAiMessages((prev) => [...prev, { role: "assistant", content: "" }]);
-        }
+        onRoundStart: (round) => {
+          setAgentRound(round);
+          if (logSessionRef.current) logRound(logSessionRef.current, round);
+          // Add a single empty assistant bubble for this round's response
+          if (round > 1) {
+            setAiMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+          }
+        },
 
-        if (round >= MAX_TOOL_ROUNDS && gotToolCallsLastRound) {
-          setAiMessages((prev) => [...prev, {
-            role: "assistant",
-            content: `Reached the ${MAX_TOOL_ROUNDS}-round limit. Ask me to continue if needed.`,
-          }]);
-        }
-      } // end agentic loop else
+        onTodosChanged: setTodos,
+        onMemoryChanged: setProjectMemory,
+        onActivity: setCurrentActivity,
+
+        signal: abortRef.current.signal,
+      });
+
+      hadSideEffects = sessionResult.hadSideEffects;
+      hitRoundLimit = sessionResult.hitRoundLimit;
+      wasAborted = sessionResult.wasAborted;
+
+      if (hitRoundLimit) {
+        setAiMessages((prev) => [...prev, {
+          role: "assistant",
+          content: autoApproveAll
+            ? "Round limit reached — auto-continuing from PLAN.md…"
+            : `Reached the ${DEFAULT_MAX_ROUNDS}-round limit. Ask me to continue if needed.`,
+        }]);
+      }
     } catch (err) {
       const e = err as Error;
-      if (e.name !== "AbortError") setLastAssistantError(`Error: ${e.message}`);
+      if (e.name === "AbortError") {
+        wasAborted = true;
+      } else {
+        setLastAssistantError(`Error: ${e.message}`);
+      }
     } finally {
       setIsChatStreaming(false);
+      setCurrentActivity(null);
       abortRef.current = null;
-      // Offer to save as a skill if the agent did real work;
-      // kick off background preview generation immediately so the name is ready when the card shows.
+      // End logging session
+      if (logSessionRef.current) {
+        endSession(logSessionRef.current, hadSideEffects);
+        logSessionRef.current = null;
+      }
+      // Offer to save as a skill if the agent did real work
       if (hadSideEffects && !reflectionOffer) {
         setReflectionOffer(true);
         void generateSkillPreview();
@@ -874,78 +913,49 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
         }
         return prev;
       });
-    }
-  }
-
-  // Execute the pending plan (planning mode step 2)
-  async function handleExecutePlan() {
-    if (!awaitingExecution) return;
-    const { history } = awaitingExecution;
-    setAwaitingExecution(null);
-    const planContent = [...aiMessages].reverse().find((m) => m.role === "assistant")?.content ?? "";
-    type H = { role: "user" | "assistant" | "system" | "tool"; content: string; tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }> };
-    const continueHistory: H[] = [
-      ...(history as H[]),
-      { role: "assistant", content: planContent },
-      { role: "user", content: "Execute this plan now using your tools." },
-    ];
-    setAiMessages((prev) => [...prev, { role: "assistant", content: "" }]);
-    setIsChatStreaming(true);
-    abortRef.current = new AbortController();
-    let hadSideEffects = false;
-    const CODE_TOOLS = [...BASE_TOOLS, ...dynamicToolDefs.map(toOllamaTool)];
-    const MAX_TOOL_ROUNDS = 30;
-    let round = 0;
-    const findLast = (msgs: AiMessage[], pred: (m: AiMessage) => boolean) => {
-      for (let j = msgs.length - 1; j >= 0; j--) { if (pred(msgs[j])) return j; }
-      return -1;
-    };
-    try {
-      while (round < MAX_TOOL_ROUNDS) {
-        round++; setAgentRound(round);
-        let gotToolCalls = false;
-        for await (const event of runAgentTurn(selectedModel, continueHistory, CODE_TOOLS, abortRef.current.signal)) {
-          if (event.type === "text_delta" && event.content) {
-            setAiMessages((prev) => { const msgs=[...prev]; const last=msgs[msgs.length-1]; if(last?.role==="assistant") msgs[msgs.length-1]={...last,content:last.content+event.content!}; return msgs; });
-          } else if (event.type === "tool_calls" && event.toolCalls) {
-            gotToolCalls = true;
-            for (const call of event.toolCalls) {
-              const label = formatToolLabel(call.name, call.args);
-              setAiMessages((prev) => { const msgs=[...prev]; const last=msgs[msgs.length-1]; if(last?.role==="assistant"&&!last.content) msgs.pop(); return [...msgs,{role:"tool" as const,content:label,toolName:call.name}]; });
-              if (APPROVAL_REQUIRED.has(call.name)) {
-                const skip = autoApproveCommands && call.name === "run_command";
-                const approved = skip || await requestApproval(call.name, call.args);
-                if (!approved) {
-                  setAiMessages((prev) => { const msgs=[...prev]; const idx=findLast(msgs,(m)=>m.role==="tool"&&m.content===label); if(idx!==-1) msgs[idx]={role:"tool",content:`${label} → denied`,toolName:call.name,toolError:true}; return msgs; });
-                  continueHistory.push({role:"assistant",content:"",tool_calls:[{function:{name:call.name,arguments:call.args}}]},{role:"tool",content:"Tool call denied by user."});
-                  continue;
-                }
-              }
-              const dynDef = dynamicToolDefs.find((d) => d.name === call.name);
-              if (dynDef) (call as unknown as Record<string,unknown>)._dynamicTemplate = dynDef.template;
-              const result = await executeTool(call, dirHandle);
-              if (!result.error && (call.name==="write_file"||call.name==="run_command")) hadSideEffects = true;
-              const summary = result.error ? `${label} → error` : summariseToolResult(call.name, result.output);
-              setAiMessages((prev) => { const msgs=[...prev]; const idx=findLast(msgs,(m)=>m.role==="tool"&&m.content===label); if(idx!==-1) msgs[idx]={role:"tool",content:summary,toolName:call.name,toolError:!!result.error,toolResult:result.error?undefined:result.output}; return msgs; });
-              if (!result.error && call.name==="write_file") scheduleTreeRefresh(String(call.args["path"] ?? ""));
-              continueHistory.push({role:"assistant",content:"",tool_calls:[{function:{name:call.name,arguments:call.args}}]},{role:"tool",content:result.error?`Error: ${result.error}`:result.output});
+      // Completion signal: in Full Auto, check todos from disk after every stop
+      // (round limit OR natural stop) and re-enter if work is unfinished.
+      // Skip when user clicked Stop, or when auto-restart cap is reached.
+      if (autoApproveAll && dirHandle && !wasAborted) {
+        if (autoRestartCountRef.current >= MAX_AUTO_RESTARTS) {
+          // Hit the cap — show a message and stop looping
+          setAiMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: `⚠️ Full Auto stopped after ${MAX_AUTO_RESTARTS} automatic restarts. The agent still has incomplete todos but hasn't made enough progress. Review the todos and send a message to continue manually.`,
+            },
+          ]);
+          autoRestartCountRef.current = 0;
+        } else {
+          const continueMsg = await (async () => {
+            if (hitRoundLimit) return "Round limit reached — resume from the next pending task.";
+            try {
+              const lm = await dirHandle.getDirectoryHandle(".localmind", { create: false });
+              const fh = await lm.getFileHandle("todos.json", { create: false });
+              const f = await fh.getFile();
+              type TodoItem = { id: string; content: string; status: string };
+              const latestTodos = JSON.parse(await f.text()) as TodoItem[];
+              const incomplete = latestTodos.filter((t) => t.status === "pending" || t.status === "in_progress");
+              if (incomplete.length === 0) return null; // all done — stop
+              const next = incomplete.find((t) => t.status === "in_progress") ?? incomplete[0];
+              return `Task incomplete — ${incomplete.length} todo(s) remaining. Resume from: "${next.content}"`;
+            } catch {
+              return null; // no todos file — nothing to resume
             }
-            break;
+          })();
+          if (continueMsg) {
+            autoRestartCountRef.current += 1;
+            setTimeout(() => void handleChatSend(continueMsg, true), 500);
+          } else {
+            autoRestartCountRef.current = 0; // completed cleanly — reset
           }
         }
-        if (!gotToolCalls) break;
-        setAiMessages((prev)=>[...prev,{role:"assistant",content:""}]);
       }
-    } catch (err) {
-      const e = err as Error;
-      if (e.name !== "AbortError") setAiMessages((prev)=>{const msgs=[...prev];const last=msgs[msgs.length-1];if(last?.role==="assistant") msgs[msgs.length-1]={...last,content:`Error: ${e.message}`};return msgs;});
-    } finally {
-      setIsChatStreaming(false); abortRef.current = null;
-      if (hadSideEffects) { setReflectionOffer(true); void generateSkillPreview(); }
     }
   }
 
-  // Phase 1 — called automatically after successful agentic run.
+  // Called automatically after successful agentic run.
   // Generates a skill preview in the background so the user can see the name before confirming.
   async function generateSkillPreview() {
     if (!selectedModel) return;
@@ -1019,35 +1029,6 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
     setProjectMemory(memoryDraft);
     setEditingMemory(false);
     toast.success("Project memory saved");
-  }
-
-  function formatToolLabel(name: string, args: Record<string, unknown>): string {
-    switch (name) {
-      case "read_file": return `📄 read_file: ${args["path"]}`;
-      case "list_directory": return `📁 list_directory: ${args["path"] || "."}`;
-      case "grep_files": return `🔍 grep_files: "${args["pattern"]}"${args["path"] ? ` in ${args["path"]}` : ""}${args["file_pattern"] ? ` (${args["file_pattern"]})` : ""}`;
-      case "find_files": return `🔎 find_files: "${args["pattern"]}"`;
-      case "write_file": return `✏️ write_file: ${args["path"]}`;
-      default: return `⚙ ${name}`;
-    }
-  }
-
-  function summariseToolResult(name: string, output: string): string {
-    const lines = output.split("\n").length;
-    switch (name) {
-      case "read_file": return `📄 read_file → ${lines} line${lines !== 1 ? "s" : ""}`;
-      case "list_directory": return `📁 list_directory → ${lines} entries`;
-      case "grep_files": {
-        const m = output.match(/^(\d+) match/);
-        return `🔍 grep_files → ${m ? m[0] : `${lines} lines`}`;
-      }
-      case "find_files": {
-        const m = output.match(/^(\d+) file/);
-        return `🔎 find_files → ${m ? m[0] : `${lines} results`}`;
-      }
-      case "write_file": return `✏️ write_file → saved`;
-      default: return `⚙ ${name} → done`;
-    }
   }
 
   function handleApplyLastResponse() {
@@ -1255,6 +1236,105 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
             )}
           </div>
 
+          {/* Integrated Terminal — VS Code style, shows agent + user commands */}
+          <div className="border-t bg-zinc-950 shrink-0 flex flex-col" style={{ height: terminalOpen ? 240 : 32 }}>
+            {/* Terminal header tab bar */}
+            <div className="flex items-center gap-0 h-8 shrink-0 border-b border-zinc-800">
+              <button
+                type="button"
+                className="flex items-center gap-1.5 px-3 h-full text-xs text-zinc-300 hover:bg-zinc-800 border-t-2 border-t-green-500 transition-colors"
+                onClick={() => setTerminalOpen((v) => !v)}
+              >
+                <span className="font-medium">Terminal</span>
+                {terminalLog.some((e) => e.running) && (
+                  <span className="size-1.5 rounded-full bg-amber-400 animate-pulse" />
+                )}
+                {!terminalLog.some((e) => e.running) && terminalLog.some((e) => e.error) && (
+                  <span className="size-1.5 rounded-full bg-red-500" />
+                )}
+              </button>
+              <div className="flex-1" />
+              {terminalLog.length > 0 && (
+                <button
+                  type="button"
+                  className="px-2 h-full text-[10px] text-zinc-600 hover:text-zinc-300 transition-colors"
+                  onClick={() => setTerminalLog([])}
+                  title="Clear terminal"
+                >
+                  ✕ clear
+                </button>
+              )}
+              <button
+                type="button"
+                className="px-2 h-full text-zinc-600 hover:text-zinc-300 transition-colors"
+                onClick={() => setTerminalOpen((v) => !v)}
+                title={terminalOpen ? "Minimize terminal" : "Expand terminal"}
+              >
+                {terminalOpen ? <ChevronDown className="size-3" /> : <ChevronUp className="size-3" />}
+              </button>
+            </div>
+
+            {terminalOpen && (
+              <>
+                {/* Output area */}
+                <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2 min-h-0 font-mono">
+                  {terminalLog.length === 0 && (
+                    <p className="text-zinc-600 text-[11px]">No commands run yet. Type a command below or let the agent run one.</p>
+                  )}
+                  {terminalLog.map((entry) => (
+                    <div key={entry.id} className="space-y-0.5">
+                      <div className="flex items-baseline gap-2">
+                        <span className={`text-[11px] shrink-0 ${entry.source === "user" ? "text-blue-400" : "text-green-400"}`}>
+                          {entry.source === "user" ? "❯" : "⚡"}
+                        </span>
+                        <span className="text-zinc-200 text-[11px] break-all">{entry.cmd}</span>
+                        {entry.running && <span className="text-amber-400 text-[10px] animate-pulse shrink-0">running…</span>}
+                        {!entry.running && entry.durationMs !== undefined && (
+                          <span className="text-zinc-600 text-[10px] shrink-0 ml-auto">{entry.durationMs}ms</span>
+                        )}
+                      </div>
+                      {entry.output && (
+                        <pre className={`text-[11px] whitespace-pre-wrap break-all pl-4 leading-relaxed ${
+                          entry.error ? "text-red-400" : "text-zinc-400"
+                        }`}>
+                          {entry.output.length > 3000 ? entry.output.slice(0, 3000) + "\n…(truncated)" : entry.output}
+                        </pre>
+                      )}
+                    </div>
+                  ))}
+                  <div ref={terminalEndRef} />
+                </div>
+
+                {/* Input row */}
+                <div className="flex items-center gap-1.5 px-3 py-1.5 border-t border-zinc-800 shrink-0">
+                  <span className="text-green-400 text-[11px] font-mono shrink-0">
+                    {workspacePath ? workspacePath.split(/[\\/]/).pop() : "~"}$
+                  </span>
+                  <input
+                    type="text"
+                    value={terminalInput}
+                    onChange={(e) => setTerminalInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        const cmd = terminalInput;
+                        setTerminalInput("");
+                        void handleTerminalRun(cmd);
+                      }
+                    }}
+                    disabled={terminalRunning}
+                    placeholder="Type a command and press Enter…"
+                    className="flex-1 bg-transparent text-zinc-200 text-[11px] font-mono outline-none placeholder:text-zinc-700"
+                    spellCheck={false}
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                  />
+                  {terminalRunning && <span className="text-amber-400 text-[10px] animate-pulse shrink-0">running</span>}
+                </div>
+              </>
+            )}
+          </div>
+
           {/* Text output panel */}
           {runOutput && !htmlPreviewUrl && (
             <div className="border-t bg-zinc-950 shrink-0" style={{ maxHeight: isOutputOpen ? 200 : 32 }}>
@@ -1308,7 +1388,7 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
                 )}
                 {isChatStreaming && agentRound > 0 && (
                   <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-600 border border-blue-200 tabular-nums">
-                    Round {agentRound}/30
+                    Round {agentRound}/50
                   </span>
                 )}
               </div>
@@ -1317,29 +1397,33 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
                   <>
                     <button
                       type="button"
-                      title={planningEnabled ? "Planning mode ON — agent creates a plan before executing" : "Enable planning mode"}
-                      onClick={() => setPlanningEnabled((v) => !v)}
+                      title={agentBuildMode
+                        ? "Build mode — can write files and run commands. Click to switch to Plan mode (read-only)."
+                        : "Plan mode — read-only. Click to switch to Build mode."}
+                      onClick={() => setAgentBuildMode((v) => !v)}
                       className={`inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded border transition-colors ${
-                        planningEnabled
-                          ? "bg-blue-100 text-blue-700 border-blue-200"
-                          : "text-muted-foreground border-border hover:text-foreground hover:border-foreground/30"
+                        agentBuildMode
+                          ? "bg-orange-100 text-orange-700 border-orange-200"
+                          : "bg-blue-100 text-blue-700 border-blue-200"
                       }`}
                     >
-                      <Brain className="size-2.5" />
-                      Plan
+                      {agentBuildMode ? <Zap className="size-2.5" /> : <Brain className="size-2.5" />}
+                      {agentBuildMode ? "Build" : "Plan"}
                     </button>
                     <button
                       type="button"
-                      title={autoApproveCommands ? "Auto-approve shell commands ON — click to disable" : "Auto-approve shell commands for this session"}
-                      onClick={() => setAutoApproveCommands((v) => !v)}
+                      title={autoApproveAll
+                        ? "Full Auto ON — all tool calls execute without approval. Click to disable."
+                        : "Enable Full Auto — skips all approval prompts (write, delete, run, git). Agent works autonomously."}
+                      onClick={() => setAutoApproveAll((v) => !v)}
                       className={`inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded border transition-colors ${
-                        autoApproveCommands
-                          ? "bg-amber-100 text-amber-700 border-amber-200"
+                        autoApproveAll
+                          ? "bg-red-100 text-red-700 border-red-300"
                           : "text-muted-foreground border-border hover:text-foreground hover:border-foreground/30"
                       }`}
                     >
                       <Zap className="size-2.5" />
-                      Auto-run
+                      {autoApproveAll ? "Full Auto" : "Auto"}
                     </button>
                     <button
                       type="button"
@@ -1356,6 +1440,30 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
                     </button>
                   </>
                 )}
+                <button
+                  type="button"
+                  title="Log request info to browser console (F12) to debug 500 errors"
+                  className="text-muted-foreground hover:text-foreground text-[10px]"
+                  onClick={() => {
+                    const ESSENTIAL = new Set(["read_file","write_file","patch_file","apply_patch","list_directory","grep_files","find_files","run_command","web_search","web_fetch","install_deps","todo_write","git_status","git_commit","update_project_memory"]);
+                    const { default: BASE } = { default: getToolDefinitions() };
+                    const tools = BASE.filter(t => ESSENTIAL.has(t.name));
+                    const toolsJson = JSON.stringify(tools);
+                    const sysPrompt = `(system prompt + workspace context — varies)`;
+                    console.group("LocalMind Agent Debug");
+                    console.log("Model:", selectedModel);
+                    console.log("Tool count:", tools.length);
+                    console.log("Tools JSON chars:", toolsJson.length, "≈", Math.round(toolsJson.length/4), "tokens");
+                    console.log("Tools:", tools.map(t => t.name));
+                    console.log("num_ctx sent to Ollama:", numCtx);
+                    console.log("Tip: if Ollama 500s, try reducing tools further or use a model with larger context");
+                    console.log(sysPrompt);
+                    console.groupEnd();
+                    toast.info("Debug info logged to browser console (F12 → Console)", { duration: 4000 });
+                  }}
+                >
+                  Debug
+                </button>
                 {aiMessages.length > 0 && (
                   <button
                     type="button"
@@ -1374,8 +1482,18 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
               </div>
             </div>
 
+            {/* Live activity status bar */}
+            {isChatStreaming && (
+              <div className="px-3 py-1.5 border-b bg-muted/30 flex items-center gap-2 shrink-0">
+                <span className="size-1.5 rounded-full bg-green-500 animate-pulse shrink-0" />
+                <span className="text-[10px] text-muted-foreground truncate">
+                  {currentActivity ?? "Thinking…"}
+                </span>
+              </div>
+            )}
+
             {/* Conversation */}
-            <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
+            <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-2">
               {aiMessages.length === 0 && (
                 <p className="text-xs text-muted-foreground italic">Ask about this file…</p>
               )}
@@ -1383,8 +1501,40 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
                 if (msg.role === "tool") {
                   const isExpanded = expandedToolIndices.has(i);
                   const hasResult = !!msg.toolResult;
+                  const isPending = !hasResult && !msg.toolError && isChatStreaming;
+                  const toolName = msg.toolName ?? "";
+
+                  // Color by tool type
+                  const chipColor = msg.toolError
+                    ? "bg-red-50 text-red-600 border-red-300"
+                    : isPending
+                    ? "bg-amber-50 text-amber-700 border-amber-300"
+                    : toolName === "read_file"
+                    ? "bg-blue-50 text-blue-700 border-blue-200"
+                    : toolName === "write_file"
+                    ? "bg-green-50 text-green-700 border-green-200"
+                    : toolName === "patch_file" || toolName === "apply_patch"
+                    ? "bg-teal-50 text-teal-700 border-teal-200"
+                    : toolName === "todo_write"
+                    ? "bg-purple-50 text-purple-700 border-purple-200"
+                    : toolName === "web_fetch"
+                    ? "bg-sky-50 text-sky-700 border-sky-200"
+                    : toolName === "delete_file"
+                    ? "bg-red-50 text-red-600 border-red-200"
+                    : toolName === "list_directory"
+                    ? "bg-slate-50 text-slate-600 border-slate-200"
+                    : toolName === "grep_files" || toolName === "find_files"
+                    ? "bg-indigo-50 text-indigo-700 border-indigo-200"
+                    : toolName === "web_search"
+                    ? "bg-violet-50 text-violet-700 border-violet-200"
+                    : toolName === "run_command"
+                    ? "bg-orange-50 text-orange-700 border-orange-200"
+                    : toolName.startsWith("git_")
+                    ? "bg-yellow-50 text-yellow-700 border-yellow-200"
+                    : "bg-muted text-muted-foreground border-border";
+
                   return (
-                    <div key={i} className="flex flex-col items-center gap-1">
+                    <div key={i} className="flex flex-col items-start gap-1 w-full">
                       <button
                         type="button"
                         onClick={() => {
@@ -1395,15 +1545,14 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
                             return next;
                           });
                         }}
-                        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono border transition-colors ${
-                          msg.toolError
-                            ? "bg-red-50 text-red-600 border-red-200"
-                            : "bg-muted text-muted-foreground border-border"
-                        } ${hasResult ? "cursor-pointer hover:bg-accent" : "cursor-default"}`}
+                        className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] font-mono border transition-colors w-full text-left ${chipColor} ${
+                          isPending ? "animate-pulse" : ""
+                        } ${hasResult ? "cursor-pointer hover:opacity-80" : "cursor-default"}`}
                       >
-                        {msg.content}
+                        <span className="flex-1 truncate">{msg.content}</span>
+                        {isPending && <span className="shrink-0 text-[9px]">…</span>}
                         {hasResult && (
-                          <ChevronDown className={`size-2.5 transition-transform ${isExpanded ? "rotate-180" : ""}`} />
+                          <ChevronDown className={`size-3 shrink-0 transition-transform ${isExpanded ? "rotate-180" : ""}`} />
                         )}
                       </button>
                       {isExpanded && msg.toolResult && (
@@ -1462,23 +1611,6 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
                     onClick={() => handleApprovalDecision(false)}
                   >
                     Deny
-                  </Button>
-                </div>
-              </div>
-            )}
-
-            {/* Execute plan button — shown after planning mode generates a plan */}
-            {awaitingExecution && (
-              <div className="mx-3 mb-1 rounded-lg border border-blue-200 bg-blue-50 p-3 space-y-2 shrink-0">
-                <p className="text-xs font-medium text-blue-900">Plan ready. Execute it now?</p>
-                <div className="flex gap-2">
-                  <Button size="sm" className="flex-1 text-xs h-6 bg-blue-600 hover:bg-blue-700 text-white border-0"
-                    onClick={() => void handleExecutePlan()}>
-                    Execute plan
-                  </Button>
-                  <Button size="sm" variant="outline" className="text-xs h-6 border-blue-200 text-blue-600 hover:bg-blue-50"
-                    onClick={() => setAwaitingExecution(null)}>
-                    Cancel
                   </Button>
                 </div>
               </div>
@@ -1594,6 +1726,38 @@ export function CodeEditor({ selectedModel }: CodeEditorProps) {
                     </button>
                   </div>
                 ))}
+              </div>
+            )}
+
+            {/* Todo panel — shows current task list from todo_write */}
+            {todos.length > 0 && (
+              <div className="border-t shrink-0 px-3 py-2 max-h-40 overflow-y-auto">
+                <div className="text-[10px] font-medium text-muted-foreground mb-1.5 flex items-center gap-1">
+                  <ListTodo className="size-3" />
+                  Tasks
+                  <span className="ml-auto text-[9px]">
+                    {todos.filter((t) => t.status === "completed").length}/{todos.length}
+                  </span>
+                </div>
+                <div className="space-y-1">
+                  {todos.map((todo) => (
+                    <div key={todo.id} className="flex items-start gap-1.5">
+                      <span className="shrink-0 text-[11px] leading-none mt-0.5">
+                        {todo.status === "completed" ? "✅" :
+                         todo.status === "in_progress" ? "🔵" :
+                         todo.status === "cancelled" ? "❌" : "⬜"}
+                      </span>
+                      <span className={`text-[10px] leading-snug ${
+                        todo.status === "completed" ? "line-through text-muted-foreground" :
+                        todo.status === "in_progress" ? "text-blue-600 font-medium" :
+                        todo.status === "cancelled" ? "line-through text-muted-foreground" :
+                        "text-foreground"
+                      }`}>
+                        {todo.content}
+                      </span>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
 
