@@ -6,6 +6,7 @@ import { useMcpStore } from "../store/mcp";
 import { injectGitCredentials, sanitizeOutput } from "../store/profile";
 import { loadSkills, saveSkill } from "./skillEngine";
 import { updateMemorySection, readProjectMemory } from "./projectMemory";
+import { addMemory } from "./vectorMemory";
 import { saveDynamicTool } from "./dynamicTools";
 import type { DynamicToolDef } from "./dynamicTools";
 import type { AppView } from "../types/app";
@@ -331,6 +332,18 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
         content: { type: "string", description: "Markdown content for this section. Replaces existing content for the section." },
       },
       required: ["section", "content"],
+    },
+  },
+  {
+    name: "save_global_memory",
+    description: "Save a durable note to your global, cross-project memory (a semantic store searched and injected automatically in every project). Use for user preferences, recurring facts, or decisions that should be remembered everywhere — not just this workspace. For project-specific notes, use update_project_memory instead.",
+    parameters: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "The memory to save — a concise, self-contained statement." },
+        tags: { type: "string", description: "Comma-separated tags to help retrieve this later, e.g. 'preferences,style'." },
+      },
+      required: ["text"],
     },
   },
   {
@@ -1456,6 +1469,19 @@ export async function executeTool(
           toolCallId: call.id,
           name: call.name,
           output: `Project memory updated: ## ${section}`,
+        };
+      }
+
+      case "save_global_memory": {
+        const text = argStr(call.args["text"]);
+        const tagsStr = argStr(call.args["tags"]);
+        if (!text) throw new Error("Missing text");
+        const tags = tagsStr.split(",").map((t) => t.trim()).filter(Boolean);
+        await addMemory(text, tags, "agent");
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Saved to global memory: "${text}"`,
         };
       }
 

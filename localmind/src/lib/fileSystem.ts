@@ -1,4 +1,4 @@
-import { TauriDirectoryHandle } from "./tauriFs";
+import { TauriDirectoryHandle, tauriPathExists } from "./tauriFs";
 
 export interface FileEntry {
   name: string;
@@ -24,7 +24,7 @@ async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
   return core.invoke(cmd, args);
 }
 
-function isTauriEnv(): boolean {
+export function isTauriEnv(): boolean {
   const w = window as unknown as Record<string, unknown>;
   return !!(w.__TAURI__ || w.__TAURI_INTERNALS__);
 }
@@ -66,6 +66,17 @@ export async function openWorkspace(): Promise<WorkspaceResult> {
 /** @deprecated use openWorkspace() */
 export async function openDirectory(): Promise<FileSystemDirectoryHandle> {
   return showDirectoryPicker({ mode: "readwrite" });
+}
+
+/**
+ * Re-open a remembered workspace by its OS path, skipping the folder picker.
+ * Tauri-only — browser mode has no stable path to reopen.
+ */
+export async function openWorkspaceByPath(path: string): Promise<WorkspaceResult> {
+  if (!(await tauriPathExists(path))) throw new Error(`Folder not found: ${path}`);
+  const handle = new TauriDirectoryHandle(path) as unknown as FileSystemDirectoryHandle;
+  const name = path.replace(/\\/g, "/").split("/").filter(Boolean).pop() ?? "workspace";
+  return { handle, path, name };
 }
 
 async function resolveDirHandle(

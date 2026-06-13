@@ -46,10 +46,11 @@ export class StuckDetector {
   static readonly WEB_SEARCH_LIMIT = 4;
   static readonly TOOL_CALL_LIMITS: Record<string, number> = {
     update_project_memory: 10,
+    save_global_memory: 10,
     save_skill: 1,
   };
   static readonly MANAGEMENT_TOOLS = new Set([
-    "todo_write", "update_project_memory", "list_skills", "get_system_info",
+    "todo_write", "update_project_memory", "save_global_memory", "list_skills", "get_system_info",
   ]);
   static readonly REAL_WORK_TOOLS = new Set([
     "read_file", "write_file", "patch_file", "apply_patch", "run_command",

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Brain, ChevronDown, ChevronRight } from "lucide-react";
@@ -130,7 +130,7 @@ function clamp(text: string): { text: string; clamped: boolean } {
   return { text: s.slice(0, MAX_DISPLAY_LEN), clamped: true };
 }
 
-function MessageRow({
+const MessageRow = memo(function MessageRow({
   msg,
   isLast,
   isStreaming,
@@ -192,8 +192,13 @@ function MessageRow({
     );
   }
 
-  const { text: displayContent, clamped } = clamp(msg.content ?? "");
-  const rendered = showFull ? sanitize(msg.content ?? "") : displayContent;
+  // Sanitizing/clamping a large tool-result message on every keystroke of a
+  // later streaming response is what causes the UI to lock up — memoize per-message.
+  const { text: displayContent, clamped } = useMemo(() => clamp(msg.content ?? ""), [msg.content]);
+  const rendered = useMemo(
+    () => (showFull ? sanitize(msg.content ?? "") : displayContent),
+    [showFull, msg.content, displayContent],
+  );
 
   return (
     <div className="flex gap-3">
@@ -222,4 +227,4 @@ function MessageRow({
       </div>
     </div>
   );
-}
+});

@@ -1,0 +1,5 @@
+.venv/
+.env
+phone_agent.db
+*.log
+__pycache__/

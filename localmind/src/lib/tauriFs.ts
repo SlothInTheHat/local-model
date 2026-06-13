@@ -15,6 +15,11 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
   return tauri.core.invoke(cmd, args);
 }
 
+/** Check whether a path exists on disk — used to validate remembered workspace paths. */
+export async function tauriPathExists(path: string): Promise<boolean> {
+  return invoke<boolean>("fs_exists", { path });
+}
+
 // Hidden entries — mirror the list in fileSystem.ts
 const HIDDEN = new Set([
   ".localmind-backups", "node_modules", ".git", "dist",

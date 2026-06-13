@@ -10,9 +10,11 @@ interface Props {
 }
 
 export function QueuedTaskBanner({ view, onStart }: Props) {
-  const tasks = useTaskQueueStore((s) => s.tasks.filter((t) => t.targetView === view && t.status === "pending"));
+  const allTasks = useTaskQueueStore((s) => s.tasks);
   const setStatus = useTaskQueueStore((s) => s.setStatus);
   const remove = useTaskQueueStore((s) => s.remove);
+
+  const tasks = allTasks.filter((t) => t.targetView === view && t.status === "pending");
 
   if (tasks.length === 0) return null;
 

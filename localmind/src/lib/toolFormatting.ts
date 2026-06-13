@@ -27,6 +27,7 @@ export function formatToolLabel(name: string, args: Record<string, unknown>): st
     case "save_skill":      return `⭐ Saving skill: "${args["name"]}"`;
     case "list_skills":     return `📚 Listing skills`;
     case "update_project_memory": return `🧠 Updating memory: ${args["section"]}`;
+    case "save_global_memory": return `🌐 Saving global memory: "${String(args["text"] ?? "").slice(0, 50)}"`;
     case "register_tool":   return `🔧 Registering tool: ${args["name"]}`;
     case "switch_model":    return `🔀 Switching model to ${args["model"]}`;
     case "switch_view":     return `🧭 Switching view to ${args["view"]}`;
@@ -69,6 +70,7 @@ export function summariseToolResult(name: string, args: Record<string, unknown>,
     case "save_skill":      return `⭐ Skill saved: "${args["name"]}"`;
     case "list_skills":     return `📚 ${lines} skill${lines !== 1 ? "s" : ""} found`;
     case "update_project_memory": return `🧠 Memory updated: ${args["section"]}`;
+    case "save_global_memory": return `🌐 Global memory saved: "${String(args["text"] ?? "").slice(0, 50)}"`;
     case "register_tool":   return `🔧 Tool registered: ${args["name"]}`;
     case "switch_model":    return `🔀 Switched model to ${args["model"]}`;
     case "switch_view":     return `🧭 Switched view to ${args["view"]}`;

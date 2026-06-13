@@ -7,6 +7,7 @@ import { fileExists, listDirectory } from "./fileSystem";
 import type { FileEntry } from "./fileSystem";
 import type { HardwareInfo } from "./hardware";
 import { formatMemoryForContext, readProjectMemory } from "./projectMemory";
+import { searchMemory, formatMemoriesForContext } from "./vectorMemory";
 import { loadSkills, matchSkills, formatSkillsForContext } from "./skillEngine";
 import type { Skill } from "./skillEngine";
 import { formatToolLabel, summariseToolResult } from "./toolFormatting";
@@ -15,6 +16,9 @@ import type { AppView } from "../types/app";
 import { useTaskQueueStore } from "../store/taskQueue";
 
 export const DEFAULT_MAX_ROUNDS = 50;
+
+/** How many times a no-tool-call round can trigger a completion review before the session ends regardless. */
+const MAX_COMPLETION_CHECKS = 2;
 
 /** Concise, always-on description of LocalMind's own views and the 3 app-control tools, injected into every system prompt. */
 const APP_CAPABILITIES_BLOCK = `## About LocalMind
@@ -33,13 +37,32 @@ coding-agent UI with multiple tabs:
 - skills: skill registry browser
 - benchmarks: model benchmark runner
 - compare: side-by-side model comparison
-- memory: persistent memory browser
+- memory: global cross-project memory browser (semantic search over notes
+  saved with save_global_memory or from this tab — shared by every project,
+  unlike per-project .localmind/memory.md)
 - logs: agent session logs
 
 Tools: switch_model (change the active Ollama model app-wide), switch_view
 (navigate the user's UI to another tab), send_task_to_tab (queue a task for
 the agent in another tab to pick up later — does not interrupt or switch the
-user's current view).`;
+user's current view), save_global_memory (save a durable note to the global
+memory above, recalled automatically in any project).
+
+The sidebar's workspace switcher remembers recently-opened project folders —
+the user can switch between projects without losing this global memory,
+which is searched and injected into context every turn regardless of which
+project is open.
+
+Skills in .localmind/skills/ may also be added by an external "phone agent"
+(a Telegram bot companion that researches topics from videos sent to it) —
+treat those the same as manually-saved skills.
+
+LocalMind is single-user and fully offline: there is no real-time
+collaboration, account sync, plugin/extension marketplace, notes app, task
+manager with calendar sync, or integrations with services like Jira/GitHub
+accounts/Google Calendar. If asked what LocalMind can do or to list its
+features, answer using ONLY the tabs and tools listed above — do not invent
+additional tabs or features.`;
 
 export interface TodoItem {
   id: string;
@@ -110,21 +133,60 @@ const TOOL_GROUPS: Array<[string, string[]]> = [
   ["shell", ["run_command", "install_deps"]],
   ["git", ["git_status", "git_diff", "git_log", "git_add", "git_commit"]],
   ["web", ["web_search", "web_fetch"]],
-  ["state", ["todo_write", "update_project_memory", "list_skills", "save_skill", "get_system_info"]],
+  ["state", ["todo_write", "update_project_memory", "save_global_memory", "list_skills", "save_skill", "get_system_info"]],
   ["app", ["switch_model", "switch_view", "send_task_to_tab"]],
 ];
+
+/** Shared "Runtime: model=..., OS=..., GPU=..., workspace=..." line used by both the agent system prompt and normal-chat identity prompt. */
+export function buildRuntimeLine(
+  modelRef: string,
+  hardware: HardwareInfo | null,
+  workspaceName: string | null,
+  workspacePath: string | null,
+): string {
+  let runtimeLine = `Runtime: model=${modelRef}, OS=${navigator.platform}`;
+  if (hardware) {
+    runtimeLine += `, GPU=${hardware.gpuName} (${hardware.vramGb}GB VRAM), RAM=${hardware.ramGb}GB`;
+  }
+  runtimeLine += workspaceName
+    ? `, workspace=${workspaceName}${workspacePath ? ` (${workspacePath})` : ""}`
+    : ", workspace=none (no folder connected)";
+  return runtimeLine;
+}
+
+/**
+ * Baseline "what am I" context for normal (non-agent) chat — without this, the model
+ * gets zero information about LocalMind, the connected workspace, or the host hardware
+ * and behaves like a generic chatbot.
+ */
+export function buildIdentitySystemPrompt(
+  modelRef: string,
+  hardware: HardwareInfo | null,
+  workspaceName: string | null,
+  workspacePath: string | null,
+  memoryBlock?: string,
+): string {
+  const lines = [
+    APP_CAPABILITIES_BLOCK,
+    "",
+    buildRuntimeLine(modelRef, hardware, workspaceName, workspacePath),
+  ];
+  lines.push(
+    workspaceName
+      ? "A workspace folder is connected. You do not have live file access in this normal chat — if the user wants you to read/edit files or explore the project, tell them to enable Agent mode."
+      : "No workspace folder is connected and you have no file access. If the user asks about their files/project, tell them to enable Agent mode and use 'Open Folder' to connect one.",
+  );
+  if (memoryBlock) {
+    lines.push("", memoryBlock);
+  }
+  return lines.join("\n");
+}
 
 function buildSystemPrompt(config: AgentRuntimeConfig): string {
   const modeTag = config.agentBuildMode ? "BUILD" : "PLAN";
   const lines: string[] = [];
 
-  let runtimeLine = `Runtime: model=${config.modelRef}, OS=${navigator.platform}`;
-  if (config.hardware) {
-    runtimeLine += `, GPU=${config.hardware.gpuName} (${config.hardware.vramGb}GB VRAM), RAM=${config.hardware.ramGb}GB`;
-  }
-  runtimeLine += config.workspaceName
-    ? `, workspace=${config.workspaceName}${config.workspacePath ? ` (${config.workspacePath})` : ""}`
-    : ", workspace=none";
+  const runtimeLine = buildRuntimeLine(config.modelRef, config.hardware, config.workspaceName, config.workspacePath);
 
   lines.push(
     `You are a coding agent operating in ${modeTag} MODE.`,
@@ -152,6 +214,7 @@ function buildSystemPrompt(config: AgentRuntimeConfig): string {
     "- 'up to date' / 'already satisfied' / 'already installed' in install output means the dependency is present — do not re-run the install, move on.",
     "- web_search is capped at 4 calls this session — after 1-2 searches, commit to an approach.",
     "- Never simulate actions in text (writing out 'Todos: ... (completed)', pasting code instead of writing it, describing a command instead of running it). Every action is a real tool call. A response with no tool call ends the task.",
+    "- If your change adds, removes, or materially changes a feature, tool, or tab, update FEATURES.md in the workspace root to match.",
     "",
     APP_CAPABILITIES_BLOCK,
   );
@@ -209,6 +272,7 @@ interface RuntimeState {
   memoryDirty: boolean;
   cachedSkills: Skill[] | null;
   skillsDirty: boolean;
+  cachedGlobalMemories: string | null;
   taskQuery: string;
   changedFiles: Set<string>;
 }
@@ -222,7 +286,7 @@ function deriveTaskQuery(history: ChatMessage[]): string {
   return "";
 }
 
-/** One-time nudge injected when the agent stops without a tool call, to catch premature "done" and do a final code review of changed files. */
+/** Nudge injected when the agent stops without a tool call, to catch premature "done" and do a final code review of changed files. */
 function buildCompletionReviewPrompt(taskQuery: string, changedFiles: Set<string>): string {
   const lines = ["You stopped without making a tool call. Before ending, do a final review of this session's work."];
   if (taskQuery) lines.push(`Original request: "${taskQuery}"`);
@@ -241,7 +305,11 @@ function buildCompletionReviewPrompt(taskQuery: string, changedFiles: Set<string
     );
   }
 
-  lines.push("", "If everything is correct and complete, or you need specific information from the user to continue, give a brief plain-language summary or question instead — no tool call needed.");
+  lines.push(
+    "",
+    "If you found something unfinished or broken, FIX IT NOW with the next tool call — do not describe the problem and ask the user whether to continue, and do not just say you'll fix it without a tool call. Asking permission to keep working wastes the user's time; they expect you to finish the task.",
+    "Only stop with plain text if either (a) everything is correct and complete (brief summary, no tool call needed), or (b) you are genuinely blocked on information only the user has (e.g. a missing credential or a choice between equally valid approaches) — in that case ask one specific question.",
+  );
   return lines.join("\n");
 }
 
@@ -311,6 +379,20 @@ async function buildCurrentStateBlock(
       const matched = matchSkills(state.cachedSkills, state.taskQuery, 3, 1);
       if (matched.length > 0) lines.push("", formatSkillsForContext(matched));
     }
+  }
+
+  // Global, cross-project memory — searched once per session against the
+  // original task and cached, independent of which (if any) workspace is open.
+  if (state.cachedGlobalMemories === null) {
+    try {
+      const results = await searchMemory(state.taskQuery, 3, 0.35);
+      state.cachedGlobalMemories = formatMemoriesForContext(results);
+    } catch {
+      state.cachedGlobalMemories = "";
+    }
+  }
+  if (state.cachedGlobalMemories) {
+    lines.push("", state.cachedGlobalMemories);
   }
 
   const openFile = config.getCurrentOpenFile?.();
@@ -482,6 +564,7 @@ export async function runAgentSession(
     memoryDirty: true,
     cachedSkills: null,
     skillsDirty: true,
+    cachedGlobalMemories: null,
     taskQuery: deriveTaskQuery(priorHistory),
     changedFiles: new Set<string>(),
   };
@@ -492,7 +575,7 @@ export async function runAgentSession(
   let wasAborted = false;
   let round = 0;
   let lastRoundHadToolCalls = false;
-  let completionCheckDone = false;
+  let completionCheckCount = 0;
 
   const toolsForModel = config.toolsSupported ? config.tools : [];
 
@@ -587,10 +670,10 @@ export async function runAgentSession(
       if (!lastRoundHadToolCalls) {
         const trimmed = roundText.trim();
         const looksLikeQuestion = /\?\s*$/.test(trimmed);
-        const canRecheck = config.agentBuildMode && hadSideEffects && !completionCheckDone
+        const canRecheck = config.agentBuildMode && hadSideEffects && completionCheckCount < MAX_COMPLETION_CHECKS
           && trimmed.length > 0 && !looksLikeQuestion && round < config.maxRounds;
         if (canRecheck) {
-          completionCheckDone = true;
+          completionCheckCount++;
           history = [...history, { role: "user", content: buildCompletionReviewPrompt(state.taskQuery, state.changedFiles) }];
           continue;
         }

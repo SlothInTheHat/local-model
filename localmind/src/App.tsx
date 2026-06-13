@@ -5,7 +5,7 @@ import { recommendModel } from "./lib/modelRecommender";
 import { listModels, pullModel } from "./lib/ollama";
 import type { ChatMessage } from "./lib/ollama";
 import { searchWeb } from "./lib/search";
-import { runAgentSession, DEFAULT_MAX_ROUNDS } from "./lib/agentRuntime";
+import { runAgentSession, DEFAULT_MAX_ROUNDS, buildIdentitySystemPrompt } from "./lib/agentRuntime";
 import { streamChatForModel, formatModelRef } from "./lib/chatProvider";
 import { getToolDefinitions, setSystemInfoContext } from "./lib/tools";
 import { supportsNativeTools } from "./lib/modelCapabilities";
@@ -13,9 +13,11 @@ import { useModelStore } from "./store/models";
 import { useSettingsStore } from "./store/settings";
 import { useMcpStore } from "./store/mcp";
 import { useProvidersStore } from "./store/providers";
-import { openWorkspace } from "./lib/fileSystem";
+import { openWorkspace, openWorkspaceByPath, isTauriEnv } from "./lib/fileSystem";
+import { searchMemory, formatMemoriesForContext } from "./lib/vectorMemory";
 import { useChatStore } from "./store/chat";
 import { useAgentStore } from "./store/agent";
+import { useWorkspacesStore } from "./store/workspaces";
 import { useAppViewStore } from "./store/appView";
 import { useModelSelectionStore } from "./store/modelSelection";
 import { QueuedTaskBanner } from "./components/QueuedTaskBanner";
@@ -172,6 +174,23 @@ export default function App() {
 
   useEffect(() => {
     void initOllama();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-restore the most recently used project on launch (Tauri desktop only —
+  // browser mode has no stable path to reopen without the picker dialog).
+  useEffect(() => {
+    if (!isTauriEnv() || dirHandle) return;
+    const last = useWorkspacesStore.getState().recent[0];
+    if (!last) return;
+    void (async () => {
+      try {
+        const ws = await openWorkspaceByPath(last.path);
+        setWorkspace(ws.handle, ws.path, ws.name);
+        toast.info(`Resumed workspace: ${ws.name}`, { duration: 2000 });
+      } catch {
+        useWorkspacesStore.getState().removeRecent(last.path);
+      }
+    })();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function initOllama() {
@@ -333,7 +352,16 @@ export default function App() {
       autoApproveRemainingRef.current = false;
       await runAgentLoop(convId, history);
     } else {
-      await runNormalChat(convId, history);
+      // Give the model baseline awareness of LocalMind/workspace/hardware —
+      // without this, normal chat has zero context and acts like a generic chatbot.
+      let memoryBlock: string | undefined;
+      try {
+        memoryBlock = formatMemoriesForContext(await searchMemory(text, 3, 0.35)) || undefined;
+      } catch {
+        memoryBlock = undefined;
+      }
+      const identity = buildIdentitySystemPrompt(selectedModel, hardware, dirHandle?.name ?? null, workspacePath, memoryBlock);
+      await runNormalChat(convId, [{ role: "system", content: identity }, ...history]);
     }
   }
 
