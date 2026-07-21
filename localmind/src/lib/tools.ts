@@ -5,15 +5,22 @@ import { mcpCallTool } from "./mcp";
 import { useMcpStore } from "../store/mcp";
 import { injectGitCredentials, sanitizeOutput } from "../store/profile";
 import { loadSkills, saveSkill } from "./skillEngine";
+import { saveImprovement } from "./improvements";
 import { updateMemorySection, readProjectMemory } from "./projectMemory";
 import { addMemory } from "./vectorMemory";
 import { saveDynamicTool } from "./dynamicTools";
 import type { DynamicToolDef } from "./dynamicTools";
+import { APP_VIEWS } from "../types/app";
 import type { AppView } from "../types/app";
 import { useChatStore } from "../store/chat";
 import { useModelSelectionStore } from "../store/modelSelection";
 import { useAppViewStore } from "../store/appView";
 import { useTaskQueueStore } from "../store/taskQueue";
+import { useAgentStore } from "../store/agent";
+import { useModelStore } from "../store/models";
+import { buildJobSpec, computeInitialNextRun, describeSchedule, normalizeSchedule, parseJobSpec } from "./scheduler";
+import { searchSessions } from "./sessionSearch";
+import { isTauriEnv } from "./fileSystem";
 
 // ─── Tauri invoke shim ───────────────────────────────────────────────────────
 
@@ -52,6 +59,7 @@ export type ToolName =
   | "web_search"
   | "run_command"
   | "get_system_info"
+  | "get_current_datetime"
   | "git_status"
   | "git_diff"
   | "git_log"
@@ -62,21 +70,35 @@ export type ToolName =
   | "apply_patch"
   | "web_fetch"
   | "create_folder"
+  | "register_tool"
   | "switch_model"
   | "switch_view"
-  | "send_task_to_tab";
-
-/** All top-level UI tabs/views, used for switch_view / send_task_to_tab validation. */
-export const APP_VIEWS: AppView[] = [
-  "chat", "code", "docs", "models", "terminal", "agents", "research",
-  "study", "settings", "image", "skills", "benchmarks", "compare", "memory", "logs",
-];
+  | "send_task_to_tab"
+  | "transcribe_video"
+  | "schedule_task"
+  | "list_scheduled"
+  | "cancel_scheduled"
+  | "spawn_subagent"
+  | "propose_feature"
+  | "search_past_sessions"
+  | "read_clipboard"
+  | "set_clipboard"
+  | "open_application"
+  | "list_windows"
+  | "focus_window"
+  | "take_screenshot";
 
 export interface ToolDef {
   // string allows MCP tools with dynamic "serverId__toolName" names
   name: string;
   description: string;
   parameters: Record<string, unknown>;
+  group?: "files" | "shell" | "git" | "web" | "media" | "state" | "app" | "external";
+  risk?: "read" | "mutate" | "execute" | "ui";
+  /** Allowed in Plan (read-only) mode. */
+  planModeAllowed?: boolean;
+  /** Needs user approval in Build mode (unless autoApproveAll). */
+  requiresApproval?: boolean;
 }
 
 export const TOOL_DEFINITIONS: ToolDef[] = [
@@ -94,6 +116,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["path"],
     },
+    group: "files",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
   },
   {
     name: "write_file",
@@ -107,6 +133,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["path", "content"],
     },
+    group: "files",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
   },
   {
     name: "patch_file",
@@ -133,6 +163,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["path", "old_string", "new_string"],
     },
+    group: "files",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
   },
   {
     name: "list_directory",
@@ -148,6 +182,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: [],
     },
+    group: "files",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
   },
   {
     name: "calculator",
@@ -163,6 +201,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["expression"],
     },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
   },
   {
     name: "web_search",
@@ -174,6 +216,27 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["query"],
     },
+    group: "web",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "search_past_sessions",
+    description:
+      "Full-text search across past agent sessions and conversations (transcripts). Use to recall earlier decisions/work.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "The search query string." },
+        limit: { type: "number", description: "Max results to return. Defaults to 8." },
+      },
+      required: ["query"],
+    },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
   },
   {
     name: "grep_files",
@@ -201,6 +264,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["pattern"],
     },
+    group: "files",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
   },
   {
     name: "delete_file",
@@ -216,6 +283,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["path"],
     },
+    group: "files",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
   },
   {
     name: "find_files",
@@ -235,6 +306,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["pattern"],
     },
+    group: "files",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
   },
   {
     name: "run_command",
@@ -254,6 +329,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["cmd"],
     },
+    group: "shell",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
   },
   {
     name: "get_system_info",
@@ -264,11 +343,117 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       properties: {},
       required: [],
     },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "get_current_datetime",
+    description:
+      "Get the actual real current date and time from the system clock (ISO 8601, plus a human-readable local string and the timezone). ALWAYS use this when a task needs today's real date/time — e.g. appending a timestamp to a file. NEVER guess a date, use a date from your training data, or web_search/web_fetch an external \"current time\" API (those don't exist / aren't reachable and will fail) — this tool is instant, always available, and always correct.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "read_clipboard",
+    description: "Read the current text contents of the system clipboard.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "set_clipboard",
+    description: "Write text to the system clipboard, replacing its current contents.",
+    parameters: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "The text to copy to the clipboard." },
+      },
+      required: ["text"],
+    },
+    group: "state",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "open_application",
+    description: "Launch an application, file, or URL by name/path using the OS shell (like typing it into Start/Spotlight). Does not resolve or validate the name — the OS handles lookup.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "The application name, file path, or URL to open, e.g. 'notepad', 'chrome', 'C:\\path\\to\\file.pdf', 'https://example.com'." },
+      },
+      required: ["name"],
+    },
+    group: "state",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "list_windows",
+    description: "List visible top-level windows on the desktop, each with a title and a stable id. Use the id with focus_window.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "focus_window",
+    description: "Bring a window to the foreground (restoring it if minimized) by the id returned from list_windows.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "The window id from list_windows." },
+      },
+      required: ["id"],
+    },
+    group: "state",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "take_screenshot",
+    description: "Capture the primary monitor, save it as a PNG, and OCR the screen text. Returns the saved file path and the recognized text (no image is sent to the model).",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+    group: "state",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
   },
   {
     name: "git_status",
     description: "Show the working tree status (changed, staged, and untracked files). Use this to understand what has changed in the repo.",
     parameters: { type: "object", properties: {}, required: [] },
+    group: "git",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
   },
   {
     name: "git_diff",
@@ -281,11 +466,19 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: [],
     },
+    group: "git",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
   },
   {
     name: "git_log",
     description: "Show the last 20 commits in one-line format.",
     parameters: { type: "object", properties: {}, required: [] },
+    group: "git",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
   },
   {
     name: "git_add",
@@ -297,6 +490,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["paths"],
     },
+    group: "git",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
   },
   {
     name: "git_commit",
@@ -308,10 +505,14 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["message"],
     },
+    group: "git",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
   },
   {
     name: "save_skill",
-    description: "Save a reusable skill (procedural knowledge) to the workspace skill registry at .localmind/skills/. Use this after completing a task to preserve the workflow for future use.",
+    description: "Create and save a reusable skill (a procedural how-to) as a markdown file in the workspace skill registry (.localmind/skills/). THIS is the tool to use whenever the user asks you to make / create / author / save a skill — including building one from a spec or instructions they paste. Also use it on your own after finishing a task to preserve a useful workflow. Provide name, tags (for later discovery), and content (the full markdown instructions). Do not invent any other tool for creating skills — this is the only one.",
     parameters: {
       type: "object",
       properties: {
@@ -321,6 +522,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["name", "tags", "content"],
     },
+    group: "state",
+    risk: "mutate",
+    planModeAllowed: true,
+    requiresApproval: true,
   },
   {
     name: "update_project_memory",
@@ -333,6 +538,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["section", "content"],
     },
+    group: "state",
+    risk: "mutate",
+    planModeAllowed: true,
+    requiresApproval: false,
   },
   {
     name: "save_global_memory",
@@ -345,6 +554,30 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["text"],
     },
+    group: "state",
+    risk: "mutate",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "propose_feature",
+    description: "Draft a structured spec for a NEW LocalMind capability you lack and cannot build yourself with register_tool (i.e. it needs app source changes). Saved to .localmind/improvements/ for the user or Claude Code to implement later. Use this instead of refusing or faking a capability. Do NOT use it for things a shell one-liner could do — use register_tool for those.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Short imperative title, e.g. 'Resize images in the image editor'." },
+        motivation: { type: "string", description: "Why this is needed / what the user was trying to do." },
+        proposed_files: { type: "string", description: "Optional: comma-separated files likely involved, if you can guess them." },
+        acceptance_criteria: { type: "string", description: "Optional: how you'd know it works." },
+        size_guess: { type: "string", description: "Optional rough effort: S, M, or L." },
+        details: { type: "string", description: "The detailed spec — approach, edge cases, anything an implementer needs." },
+      },
+      required: ["title", "motivation"],
+    },
+    group: "state",
+    risk: "mutate",
+    planModeAllowed: true,
+    requiresApproval: false,
   },
   {
     name: "list_skills",
@@ -354,6 +587,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       properties: {},
       required: [],
     },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
   },
   {
     name: "install_deps",
@@ -373,6 +610,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: [],
     },
+    group: "shell",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
   },
   {
     name: "todo_write",
@@ -387,7 +628,12 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
             type: "object",
             properties: {
               id:      { type: "string", description: "Unique ID (e.g. '1', '2', '3')" },
-              content: { type: "string", description: "Task description (imperative: 'Install deps', 'Create game.py')" },
+              // Examples deliberately generic (not a filename/project-specific example): a live
+              // trace showed a weak model, mid-task and low on real context, parrot the exact
+              // sample text back as a todo/skill name ("Create game.py") — i.e. this field's own
+              // schema example became the hijack. Keep examples abstract enough that echoing them
+              // verbatim can't plausibly look like a real, unrelated action.
+              content: { type: "string", description: "Task description, imperative mood (e.g. 'Add input validation', 'Fix the failing test')" },
               status:  { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"] },
             },
             required: ["id", "content", "status"],
@@ -396,6 +642,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["todos"],
     },
+    group: "state",
+    risk: "mutate",
+    planModeAllowed: true,
+    requiresApproval: false,
   },
   {
     name: "apply_patch",
@@ -419,6 +669,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["patches"],
     },
+    group: "files",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
   },
   {
     name: "web_fetch",
@@ -430,6 +684,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["url"],
     },
+    group: "web",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
   },
   {
     name: "create_folder",
@@ -445,6 +703,12 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["path"],
     },
+    group: "files",
+    risk: "mutate",
+    // Intentional change from legacy behavior: closes a hole where Plan mode
+    // could create directories (it wasn't in the old PLAN_MODE_DENIED set).
+    planModeAllowed: false,
+    requiresApproval: false,
   },
   {
     name: "register_tool",
@@ -459,10 +723,14 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["name", "description", "template"],
     },
+    group: "state",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
   },
   {
     name: "switch_model",
-    description: "Switch the app's active Ollama model. Use when the user asks to change models, or when a different model would suit the current task better.",
+    description: "Switch the app's active Ollama model. ONLY use when the user explicitly asks to change/switch models. Do not switch models on your own initiative just because another might fit better — the user must have asked.",
     parameters: {
       type: "object",
       properties: {
@@ -470,10 +738,14 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["model"],
     },
+    group: "app",
+    risk: "ui",
+    planModeAllowed: true,
+    requiresApproval: true,
   },
   {
     name: "switch_view",
-    description: "Navigate the user's UI to a different tab/view of the app.",
+    description: "Navigate the user's UI to a different tab. ONLY use when the user explicitly asks to go to / open / show another tab. NEVER use it to 'look something up', to reach a feature, or as a step while answering a question — switching the user's tab unprompted is disruptive. When in doubt, do not switch.",
     parameters: {
       type: "object",
       properties: {
@@ -481,10 +753,14 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["view"],
     },
+    group: "app",
+    risk: "ui",
+    planModeAllowed: true,
+    requiresApproval: true,
   },
   {
     name: "send_task_to_tab",
-    description: "Queue a task description for the agent in another tab to pick up later. Does not switch the user's view or run anything immediately — the user (or that tab's agent) starts it from a banner.",
+    description: "Queue a task for another tab's agent to pick up later (the user starts it from a banner; nothing runs immediately and the view does not change). ONLY use when the user explicitly asks to hand work to another tab. Do not use it to ask the user to do something or as a way to make progress on the current request.",
     parameters: {
       type: "object",
       properties: {
@@ -493,6 +769,95 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       },
       required: ["target_view", "task"],
     },
+    group: "app",
+    risk: "ui",
+    planModeAllowed: true,
+    requiresApproval: true,
+  },
+  {
+    name: "transcribe_video",
+    description: "Transcribe a video/audio file OR an online video (YouTube etc.) to text and return the transcript. For URLs it grabs captions when available (fast) and otherwise downloads the audio and transcribes it offline (ffmpeg + faster-whisper). Use this to summarize or 'watch' videos, or to learn/extract skills from them: transcribe, read the transcript, then save reusable skills with save_skill or write a document with write_file. Pass EITHER url (for online videos) OR path (for a file in the workspace). Requires the desktop app with the phone-agent Python pipeline installed.",
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "URL of an online video to transcribe (e.g. a YouTube link). Use this for videos on the web." },
+        path: { type: "string", description: "Path to a local video/audio file, relative to the workspace root (e.g. 'clips/tutorial.mp4'). Use this instead of url for files already in the workspace." },
+        whisper_model: { type: "string", description: "Optional whisper model size used only when audio must be transcribed: base (default, fastest), small, or medium (most accurate)." },
+      },
+      required: [],
+    },
+    group: "media",
+    risk: "execute",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "schedule_task",
+    description:
+      "Schedule a task to run automatically in the background on a recurring or future basis — even when the user isn't actively chatting ('every morning summarize my improvement queue', 'every 2 minutes append a note'). The task runs as a headless agent in the CURRENT workspace folder, so any files it writes (e.g. notes.md) land in the workspace root. The Rust backend ticks every 30s and fires due jobs, surviving app restarts. ONLY use when the user explicitly asks for something to happen automatically/on a schedule/recurring/unattended — never schedule work on your own initiative.",
+    parameters: {
+      type: "object",
+      properties: {
+        task: {
+          type: "string",
+          description: "The instruction for the scheduled agent run to execute, in natural English — NEVER shell code or commands. Examples: 'append the current date and time to notes.md', 'summarize my improvement queue and write to status.md'. Bad: 'echo $(date) >> file', 'date >> file', 'Get-Date'. The scheduled agent runs on the user's platform and will emit the correct commands; your job is to describe the goal in plain English.",
+        },
+        schedule: {
+          type: "string",
+          description: "Schedule descriptor. One of: 'interval:<seconds>' (e.g. 'interval:3600' for hourly, 'interval:120' for every 2 minutes), 'cron:<5-field-expr>' (e.g. 'cron:0 8 * * *' for 8am daily), or 'once:<unix_seconds>' for a single future run at that Unix timestamp (seconds).",
+        },
+      },
+      required: ["task", "schedule"],
+    },
+    group: "state",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "list_scheduled",
+    description: "List all scheduled background jobs (active, done, or cancelled), including each job's task text, schedule, status, and next run time.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "cancel_scheduled",
+    description: "Cancel (permanently delete) a previously scheduled background job by id. Use list_scheduled first to find the id.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "The job id, from list_scheduled." },
+      },
+      required: ["id"],
+    },
+    group: "state",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "spawn_subagent",
+    description:
+      "Delegate a sub-task to a separate, autonomous headless agent session that runs against the current workspace and reports back its result. Use this to fan out an independent chunk of work (e.g. 'summarize this directory', 'analyze src/ and report structure') without consuming your own context on it. The subagent gets read-only tools (read_file, list_directory, grep_files, find_files, web_search, web_fetch, get_system_info, git_status, git_diff, git_log, list_skills, calculator) — it can investigate but cannot write/delete files or run shell commands, and it cannot spawn further subagents. Requires an open workspace.",
+    parameters: {
+      type: "object",
+      properties: {
+        task: { type: "string", description: "The sub-task instruction for the subagent to carry out." },
+        model: { type: "string", description: "Optional model name to run the subagent with. Defaults to the current active model." },
+      },
+      required: ["task"],
+    },
+    group: "state",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
   },
 ];
 
@@ -619,6 +984,49 @@ function noWorkspace(call: ToolCall): ToolResult {
   };
 }
 
+/** Common wrong tool names local models emit → the real name. */
+const TOOL_ALIASES: Record<string, string> = {
+  install_dependencies: "install_deps", install_dependency: "install_deps", install_packages: "install_deps",
+  write_to_file: "write_file", create_file: "write_file", save_file: "write_file",
+  search_web: "web_search", google: "web_search", search: "web_search",
+  fetch_url: "web_fetch", fetch: "web_fetch",
+  search_files: "grep_files", grep: "grep_files", find_in_files: "grep_files",
+  find: "find_files", ls: "list_directory", list: "list_directory",
+  read: "read_file", write: "write_file", cat: "read_file",
+  run: "run_command", shell: "run_command", exec: "run_command", execute: "run_command", bash: "run_command",
+  transcribe: "transcribe_video", transcribe_audio: "transcribe_video",
+  mkdir: "create_folder", make_dir: "create_folder", create_directory: "create_folder", create_dir: "create_folder",
+  // scheduler / self-improvement — models frequently hyphenate these
+  schedule: "schedule_task", create_task: "schedule_task", add_task: "schedule_task",
+};
+
+let _knownToolNames: Set<string> | null = null;
+/** Lazily built (avoids module-load TDZ) set of all built-in tool names. */
+function knownToolNames(): Set<string> {
+  if (!_knownToolNames) _knownToolNames = new Set(TOOL_DEFINITIONS.map((t) => t.name));
+  return _knownToolNames;
+}
+
+/**
+ * Canonicalize a model-emitted tool name to a real built-in name. Handles
+ * exact matches, common aliases, and — crucially for weak local models — the
+ * very common "schedule-task"/"read-file" HYPHENATION of underscore names.
+ * Returns "" for an empty/blank name. MCP names (containing "__") pass through
+ * untouched. Unknown names are returned as-is for downstream error handling.
+ */
+export function canonicalToolName(rawName: string): string {
+  const name = (rawName ?? "").trim();
+  if (!name) return "";
+  if (name.includes("__")) return name; // MCP tool — leave as-is
+  const known = knownToolNames();
+  if (known.has(name)) return name;
+  if (TOOL_ALIASES[name]) return TOOL_ALIASES[name];
+  const underscored = name.replace(/-/g, "_");
+  if (known.has(underscored)) return underscored;
+  if (TOOL_ALIASES[underscored]) return TOOL_ALIASES[underscored];
+  return name;
+}
+
 /**
  * Resolve a path relative to the workspace root.
  * Collapses "." segments and resolves ".." against the accumulated stack.
@@ -724,6 +1132,16 @@ async function listEntries(
  *   5. Whitespace-normalized match (collapse all whitespace sequences)
  */
 function fuzzyFindMatch(content: string, oldString: string): [number, number] | null {
+  // Empty old_string has no anchor to match against — weak models reach for
+  // this to mean "just insert this text" (their mental model of "append").
+  // JS's String.indexOf("") always returns 0, so Tier 1 below would silently
+  // "match" position [0,0] and the caller's slice(0,ms)+new+slice(me) would
+  // PREPEND new content at the very START of the file instead of appending —
+  // no error, hadSideEffects still fires, but the write lands in the wrong
+  // place (looks like "nothing happened" to a user checking the end of the
+  // file for a new line). Treat an empty anchor as an explicit append-to-end.
+  if (oldString === "") return [content.length, content.length];
+
   // Tier 1 — exact
   let idx = content.indexOf(oldString);
   if (idx !== -1) return [idx, idx + oldString.length];
@@ -787,50 +1205,42 @@ export async function executeTool(
   workspacePath?: string   // fallback cwd for run_command when model omits it
 ): Promise<ToolResult> {
   try {
-    // ── Normalize tool names — models often hallucinate close-but-wrong names ──
-    const TOOL_ALIASES: Record<string, string> = {
-      install_dependencies: "install_deps",
-      install_dependency: "install_deps",
-      install_packages: "install_deps",
-      write_to_file: "write_file",
-      create_file: "write_file",
-      save_file: "write_file",
-      search_web: "web_search",
-      google: "web_search",
-      search: "web_search",
-      fetch_url: "web_fetch",
-      fetch: "web_fetch",
-      search_files: "grep_files",
-      grep: "grep_files",
-      find_in_files: "grep_files",
-      find: "find_files",
-      ls: "list_directory",
-      list: "list_directory",
-      read: "read_file",
-      write: "write_file",
-      cat: "read_file",
-      run: "run_command",
-      shell: "run_command",
-      exec: "run_command",
-      execute: "run_command",
-      bash: "run_command",
-      mkdir: "create_folder",
-      make_dir: "create_folder",
-      create_directory: "create_folder",
-      create_dir: "create_folder",
-    };
-    if (TOOL_ALIASES[call.name]) {
-      call = { ...call, name: TOOL_ALIASES[call.name] };
+    // ── Guard empty/malformed tool calls (weak models emit {name:"",...}) ────
+    if (!call.name || !call.name.trim()) {
+      return {
+        toolCallId: call.id, name: call.name ?? "", output: "",
+        error: "Empty tool call — no tool name was provided. Emit a valid tool call using one of the tools in your system prompt (e.g. schedule_task, write_file), or reply with plain text.",
+      };
+    }
+    // ── Normalize tool names (aliases + hyphen→underscore) ───────────────────
+    const canonical = canonicalToolName(call.name);
+    if (canonical && canonical !== call.name) {
+      call = { ...call, name: canonical };
     }
 
     // ── MCP dispatch: names are prefixed "serverId__toolName" ────────────────
     if (call.name.includes("__")) {
-      const [serverId] = call.name.split("__");
-      const server = useMcpStore.getState().servers.find((s) => s.id === serverId);
+      const sep = call.name.indexOf("__");
+      const serverId = call.name.slice(0, sep);
+      const realName = call.name.slice(sep + 2);
+      const servers = useMcpStore.getState().servers;
+      let server = servers.find((s) => s.id === serverId);
+      // Fallback: the prefix may be a STALE server id — e.g. the server was
+      // removed and re-added (getting a new uuid) while an older tool name
+      // lingers in conversation history and the model parrots it. Route by the
+      // real tool name to any connected server that actually exposes it, so
+      // re-adding a server doesn't force the user to start a fresh chat.
+      if (!server) {
+        server = servers.find(
+          (s) => s.status === "connected" && (s.tools ?? []).some((t) => t.name === `${s.id}__${realName}`)
+        );
+      }
       if (!server) {
         return { toolCallId: call.id, name: call.name, output: "", error: `MCP server '${serverId}' not found` };
       }
-      const output = await mcpCallTool(server, call.name, call.args);
+      // Reconstruct with the resolved server's id so mcpCallTool strips the
+      // prefix correctly (it keys off the server's CURRENT id, not the name's).
+      const output = await mcpCallTool(server, `${server.id}__${realName}`, call.args);
       return { toolCallId: call.id, name: call.name, output };
     }
 
@@ -855,6 +1265,23 @@ export async function executeTool(
           name: call.name,
           output: ctx.formatted,
         };
+      }
+
+      case "search_past_sessions": {
+        const query = argStr(call.args["query"]);
+        if (!query) throw new Error("Missing query argument");
+        const limitArg = call.args["limit"];
+        const limit = typeof limitArg === "number" && limitArg > 0 ? Math.floor(limitArg) : 8;
+        const hits = await searchSessions(query, limit);
+        const output = hits.length === 0
+          ? "No matching past sessions."
+          : hits
+              .map((h, i) => {
+                const date = new Date(h.created_at).toLocaleString();
+                return `${i + 1}. [${h.origin}] ${h.task} (${date}, ${h.outcome})\n   ${h.snippet}`;
+              })
+              .join("\n\n");
+        return { toolCallId: call.id, name: call.name, output };
       }
 
       case "list_directory": {
@@ -974,8 +1401,13 @@ export async function executeTool(
         }
 
         let patched: string;
-        if (replaceAll) {
-          // For replace_all, use split/join on normalized content
+        if (replaceAll && oldString !== "") {
+          // For replace_all, use split/join on normalized content. Guarded
+          // against oldString === "" above: JS splits an empty separator
+          // between EVERY character, which would interleave newString across
+          // the whole file instead of the single append fuzzyFindMatch
+          // resolves it to (see the empty-old_string case there) — replace_all
+          // has no sane meaning for "replace every occurrence of nothing".
           patched = original.split(oldString).join(newString);
           if (patched === original) {
             // Try with normalized line endings
@@ -1123,6 +1555,21 @@ export async function executeTool(
           platform: navigator.platform,
           user_agent: navigator.userAgent,
           tauri_mode: !!(window as unknown as Record<string, unknown>).__TAURI__,
+        };
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: JSON.stringify(info, null, 2),
+        };
+      }
+
+      case "get_current_datetime": {
+        const now = new Date();
+        const info = {
+          iso: now.toISOString(),
+          local: now.toLocaleString(),
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          unix_seconds: Math.floor(now.getTime() / 1000),
         };
         return {
           toolCallId: call.id,
@@ -1485,6 +1932,25 @@ export async function executeTool(
         };
       }
 
+      case "propose_feature": {
+        if (!dirHandle) return noWorkspace(call);
+        const title = argStr(call.args["title"]);
+        if (!title) throw new Error("Missing title");
+        const path = await saveImprovement(dirHandle, {
+          title,
+          motivation: argStr(call.args["motivation"]),
+          proposed_files: argStr(call.args["proposed_files"]),
+          acceptance_criteria: argStr(call.args["acceptance_criteria"]),
+          size_guess: argStr(call.args["size_guess"]),
+          body: argStr(call.args["details"]),
+        });
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Feature proposal drafted → ${path}. The user can review it in Settings → Feature proposals, or hand it to Claude Code to implement.`,
+        };
+      }
+
       case "list_skills": {
         if (!dirHandle) return noWorkspace(call);
         const skills = await loadSkills(dirHandle);
@@ -1498,11 +1964,46 @@ export async function executeTool(
       case "create_folder": {
         const folderPath = argStr(call.args["path"]);
         if (!folderPath) throw new Error("Missing path argument");
-        await tauriInvoke("fs_mkdir", { path: folderPath });
+        // Resolve relative paths against the workspace root so the folder lands
+        // inside the confined root (fs_mkdir refuses paths outside it). Absolute
+        // paths (already under the root) are passed through unchanged.
+        const isAbsolute = /^(?:[a-zA-Z]:[\\/]|[\\/])/.test(folderPath);
+        const targetPath = isAbsolute || !workspacePath
+          ? folderPath
+          : `${workspacePath.replace(/[\\/]+$/, "")}/${normalizeSubPath(folderPath)}`;
+        await tauriInvoke("fs_mkdir", { path: targetPath });
         return {
           toolCallId: call.id,
           name: call.name,
-          output: `Created folder: ${folderPath}`,
+          output: `Created folder: ${targetPath}`,
+        };
+      }
+
+      case "transcribe_video": {
+        const url = argStr(call.args["url"]).trim();
+        const whisperModel = argStr(call.args["whisper_model"]) || undefined;
+        let target: string;
+        let label: string;
+        if (url) {
+          target = url;
+          label = url;
+        } else {
+          const relPath = normalizeSubPath(argStr(call.args["path"]));
+          if (!relPath) throw new Error("Provide a url (online video) or path (workspace file) to transcribe.");
+          if (!workspacePath) {
+            throw new Error("Transcribing a local file requires the desktop app with an open workspace folder (needs the real file path). For online videos, pass url instead.");
+          }
+          target = `${workspacePath}/${relPath}`;
+          label = relPath;
+        }
+        const transcript = await tauriInvoke<string>("transcribe_video", {
+          videoPath: target,
+          whisperModel,
+        });
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Transcript of ${label}:\n\n${transcript}`,
         };
       }
 
@@ -1523,6 +2024,179 @@ export async function executeTool(
           toolCallId: call.id,
           name: call.name,
           output: `Tool registered: ${toolName} → .localmind/tools/${toolName}.json`,
+        };
+      }
+
+      case "schedule_task": {
+        // Accept the many arg names / formats weak models emit.
+        const task = argStr(call.args["task"]) || argStr(call.args["task_name"]) || argStr(call.args["name"]) || argStr(call.args["description"]) || argStr(call.args["prompt"]);
+        const rawSchedule = argStr(call.args["schedule"]) || argStr(call.args["interval"]) || argStr(call.args["every"]) || argStr(call.args["cron"]) || argStr(call.args["when"]) || argStr(call.args["frequency"]);
+        if (!task) throw new Error("Missing task — provide 'task' as a natural-language instruction (e.g. 'append the current time to notes.md').");
+        if (!rawSchedule) throw new Error("Missing schedule — provide 'schedule' like 'interval:120', '2m', 'every 2 minutes', or a cron expression.");
+        const schedule = normalizeSchedule(rawSchedule);
+        const spec = buildJobSpec(task, schedule);
+        // Idempotency: if an identical active job already exists, don't create a
+        // duplicate. Weak models sometimes re-emit schedule_task across rounds
+        // (or a completion-review nudge re-triggers it); scheduling the same
+        // thing twice is virtually never intended and would multiply the job's
+        // side effects. Return the existing job instead of stacking duplicates.
+        try {
+          const existing = await tauriInvoke<Array<{ id: string; spec: string; status: string }>>("jobs_list", {});
+          const dup = existing.find((j) => j.status === "active" && j.spec === spec);
+          if (dup) {
+            return {
+              toolCallId: call.id,
+              name: call.name,
+              output: `Already scheduled: "${task}" (${describeSchedule(schedule)}) is active as job ${dup.id}. No duplicate was created — this task is done.`,
+            };
+          }
+        } catch {
+          // jobs_list unavailable (non-Tauri / older backend) — fall through and insert.
+        }
+        const id = crypto.randomUUID();
+        const nextRunAt = computeInitialNextRun(schedule);
+        await tauriInvoke("jobs_insert", { id, spec, nextRunAt, status: "active" });
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Scheduled: "${task}" (${describeSchedule(schedule)}). Job id: ${id}. This task is now done — do not schedule it again.`,
+        };
+      }
+
+      case "list_scheduled": {
+        const jobs = await tauriInvoke<
+          Array<{ id: string; spec: string; next_run_at: number; status: string; created_at: number }>
+        >("jobs_list", {});
+        if (jobs.length === 0) {
+          return { toolCallId: call.id, name: call.name, output: "No scheduled jobs." };
+        }
+        const lines = jobs.map((j) => {
+          const parsed = parseJobSpec(j.spec);
+          const taskText = parsed?.task ?? "(unparseable spec)";
+          const scheduleText = parsed ? describeSchedule(parsed.schedule) : "?";
+          const nextRun = new Date(j.next_run_at).toLocaleString();
+          return `- [${j.status}] ${j.id}: "${taskText}" — ${scheduleText} — next: ${nextRun}`;
+        });
+        return { toolCallId: call.id, name: call.name, output: lines.join("\n") };
+      }
+
+      case "cancel_scheduled": {
+        const id = argStr(call.args["id"]);
+        if (!id) throw new Error("Missing id argument");
+        await tauriInvoke("jobs_cancel", { id });
+        return { toolCallId: call.id, name: call.name, output: `Cancelled scheduled job: ${id}` };
+      }
+
+      case "spawn_subagent": {
+        const subWorkspacePath = useAgentStore.getState().workspacePath ?? workspacePath;
+        if (!subWorkspacePath) {
+          throw new Error("spawn_subagent requires an open workspace — ask the user to open a folder first.");
+        }
+        const subTask = argStr(call.args["task"]);
+        if (!subTask) throw new Error("Missing task argument");
+        const subModel = argStr(call.args["model"]) || useModelSelectionStore.getState().selectedModel;
+        if (!subModel) throw new Error("No model specified and no default model is selected.");
+        const subHardware = useModelStore.getState().hardware;
+
+        // Dynamic import avoids a static circular dependency (headlessRunner.ts
+        // imports TOOL_DEFINITIONS from this file).
+        const { runHeadlessTask, HEADLESS_DEFAULT_ALLOWLIST } = await import("./headlessRunner");
+
+        const { record, transcript } = await runHeadlessTask({
+          workspacePath: subWorkspacePath,
+          modelRef: subModel,
+          task: subTask,
+          hardware: subHardware,
+          origin: "subagent",
+          agentBuildMode: true,
+          // Read-only allowlist: subagents can investigate but not mutate the
+          // workspace, run shell commands, or spawn further subagents (see
+          // HEADLESS_EXCLUDED_TOOLS in headlessRunner.ts for the recursion guard).
+          toolAllowlist: HEADLESS_DEFAULT_ALLOWLIST,
+        });
+
+        const trimmedTranscript = transcript.trim().slice(0, 4000);
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output:
+            `Subagent (${subModel}) finished — outcome: ${record.outcome}, ${record.roundsUsed} round(s).\n\n` +
+            `Summary: ${record.summary}\n\n` +
+            `Transcript:\n${trimmedTranscript}${transcript.trim().length > 4000 ? "\n\n…(truncated)" : ""}`,
+        };
+      }
+
+      case "read_clipboard": {
+        if (!isTauriEnv()) throw new Error("Not in Tauri desktop mode — launch with npm run tauri dev");
+        const { readText } = await import("@tauri-apps/plugin-clipboard-manager");
+        const text = await readText();
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: text || "(clipboard is empty)",
+        };
+      }
+
+      case "set_clipboard": {
+        if (!isTauriEnv()) throw new Error("Not in Tauri desktop mode — launch with npm run tauri dev");
+        const text = argStr(call.args["text"]);
+        if (!text) throw new Error("Missing text argument");
+        const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
+        await writeText(text);
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: "Copied text to clipboard.",
+        };
+      }
+
+      case "open_application": {
+        const name = argStr(call.args["name"]);
+        if (!name) throw new Error("Missing name argument");
+        const output = await tauriInvoke<string>("open_application", { name });
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output,
+        };
+      }
+
+      case "list_windows": {
+        const windows = await tauriInvoke<{ id: string; title: string }[]>("list_windows");
+        const output = windows.length
+          ? windows.map((w, i) => `${i + 1}. ${w.title} [${w.id}]`).join("\n")
+          : "(no visible windows found)";
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output,
+        };
+      }
+
+      case "focus_window": {
+        const id = argStr(call.args["id"]);
+        if (!id) throw new Error("Missing id argument");
+        const output = await tauriInvoke<string>("focus_window", { id });
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output,
+        };
+      }
+
+      case "take_screenshot": {
+        const result = await tauriInvoke<{ path: string; ocr_text: string; ocr_available: boolean }>(
+          "take_screenshot"
+        );
+        const maxLen = 4000;
+        const truncated = result.ocr_text.length > maxLen;
+        const text = truncated
+          ? `${result.ocr_text.slice(0, maxLen)}\n\n…(OCR text truncated, ${result.ocr_text.length} chars total)`
+          : result.ocr_text;
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Saved screenshot to: ${result.path}\n\n${text}`,
         };
       }
 
@@ -1548,7 +2222,7 @@ export async function executeTool(
           toolCallId: call.id,
           name: call.name,
           output: "",
-          error: `Unknown tool: ${call.name}`,
+          error: `Unknown tool "${call.name}" — no such tool exists. Do not call it again or invent tool names. To create/save a skill use save_skill (name, tags, content). To produce a report/document/file use write_file. Otherwise use one of the tools listed in your system prompt.`,
         };
       }
     }

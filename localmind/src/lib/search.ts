@@ -7,7 +7,43 @@ function stripHtml(s: string): string {
   return s.replace(/<[^>]+>/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\s+/g, " ").trim();
 }
 
-const DEV = import.meta.env.DEV;
+// ── Transport ──────────────────────────────────────────────────────────────────
+// In the packaged Tauri app, direct fetches to duckduckgo.com are CORS-blocked
+// by the native webview and the Vite dev proxy (`/ddg-*`) does not exist outside
+// `npm run dev` / `npm run tauri dev`. When running inside Tauri we route through
+// the Rust `http_fetch` command (no CORS there) against the real DDG endpoints.
+// Outside Tauri (plain browser dev mode) we keep using the dev-only proxy paths.
+
+function isTauri(): boolean {
+  return typeof window !== "undefined" && !!(window as unknown as Record<string, unknown>).__TAURI__;
+}
+
+async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const tauri = (window as unknown as Record<string, unknown>).__TAURI__;
+  const core = (tauri as Record<string, unknown>).core as { invoke?: (cmd: string, args?: unknown) => Promise<T> };
+  if (typeof core?.invoke !== "function") throw new Error("Tauri core.invoke unavailable");
+  return core.invoke(cmd, args);
+}
+
+/** Fetch `nativeUrl` via the Rust http_fetch command when in Tauri, otherwise
+ *  fetch `proxyUrl` (the Vite dev-server proxy path) directly. Returns null on
+ *  any failure so callers can treat it the same as an empty/failed response. */
+async function fetchBody(proxyUrl: string, nativeUrl: string): Promise<string | null> {
+  if (isTauri()) {
+    try {
+      return await tauriInvoke<string>("http_fetch", { url: nativeUrl, method: "GET" });
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const res = await fetch(proxyUrl);
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null;
+  }
+}
 
 // ── DDG Instant Answer API ────────────────────────────────────────────────────
 // Good for: Wikipedia abstracts, math answers, direct lookups.
@@ -15,11 +51,10 @@ const DEV = import.meta.env.DEV;
 
 async function fetchInstantAnswer(query: string): Promise<string[]> {
   const params = new URLSearchParams({ q: query, format: "json", no_redirect: "1", no_html: "1", skip_disambig: "1" });
-  const base = DEV ? "/ddg-search" : "https://api.duckduckgo.com";
   try {
-    const res = await fetch(`${base}/?${params}`);
-    if (!res.ok) return [];
-    const data = JSON.parse(await res.text()) as Record<string, unknown>;
+    const text = await fetchBody(`/ddg-search/?${params}`, `https://api.duckduckgo.com/?${params}`);
+    if (!text) return [];
+    const data = JSON.parse(text) as Record<string, unknown>;
     const lines: string[] = [];
     const answer = data.Answer as string | undefined;
     if (answer) lines.push(`Instant answer: ${stripHtml(answer)}`);
@@ -36,11 +71,10 @@ async function fetchInstantAnswer(query: string): Promise<string[]> {
 // lite.duckduckgo.com — minimal HTML table layout
 
 async function fetchLiteResults(query: string): Promise<Array<{ title: string; url: string; snippet: string }>> {
-  const base = DEV ? "/ddg-lite" : "https://lite.duckduckgo.com";
+  const q = encodeURIComponent(query);
   try {
-    const res = await fetch(`${base}/lite/?q=${encodeURIComponent(query)}`);
-    if (!res.ok) return [];
-    const html = await res.text();
+    const html = await fetchBody(`/ddg-lite/lite/?q=${q}`, `https://lite.duckduckgo.com/lite/?q=${q}`);
+    if (!html) return [];
 
     // Title links: <td class="result-link"><a href="...">Title</a>
     const titleRe = /class="result-link"[^>]*>[\s\S]*?<a\b[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
@@ -68,11 +102,10 @@ async function fetchLiteResults(query: string): Promise<Array<{ title: string; u
 // html.duckduckgo.com/html/ — full HTML results page, different bot detection
 
 async function fetchHtmlResults(query: string): Promise<Array<{ title: string; url: string; snippet: string }>> {
-  const base = DEV ? "/ddg-html" : "https://html.duckduckgo.com";
+  const q = encodeURIComponent(query);
   try {
-    const res = await fetch(`${base}/html/?q=${encodeURIComponent(query)}`);
-    if (!res.ok) return [];
-    const html = await res.text();
+    const html = await fetchBody(`/ddg-html/html/?q=${q}`, `https://html.duckduckgo.com/html/?q=${q}`);
+    if (!html) return [];
 
     // Result titles: <a class="result__a" href="...">Title</a>
     const titleRe = /class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;

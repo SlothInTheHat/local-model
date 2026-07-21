@@ -96,7 +96,9 @@ export function Terminal({ onRegisterRunner }: TerminalProps) {
     try {
       const result = await tauriInvoke<{ stdout: string; stderr: string; cwd: string; sandbox_blocked: boolean }>(
         "run_command",
-        { cmd: cmd.trim(), cwd: cwd || undefined, workspaceRoot: workspacePath ?? undefined }
+        // Confinement is enforced Rust-side against the registered workspace
+        // root(s); the cwd must already sit inside one of them.
+        { cmd: cmd.trim(), cwd: cwd || undefined }
       );
       if (result.stdout) appendLine({ type: "output", text: sanitizeOutput(result.stdout) });
       if (result.stderr) appendLine({ type: "error", text: sanitizeOutput(result.stderr) });

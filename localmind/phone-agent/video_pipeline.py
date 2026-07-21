@@ -57,11 +57,23 @@ def extract_audio(video_path: Path) -> Path:
 
 def transcribe(audio_path: Path) -> str:
     """Transcribe audio to text using faster-whisper (CPU, int8)."""
+    import gc
+
     from faster_whisper import WhisperModel
 
     model = WhisperModel(config.WHISPER_MODEL, device="cpu", compute_type="int8")
-    segments, _info = model.transcribe(str(audio_path))
-    return " ".join(segment.text.strip() for segment in segments)
+    try:
+        segments, _info = model.transcribe(str(audio_path))
+        text = " ".join(segment.text.strip() for segment in segments)
+    finally:
+        # Free the model promptly (it can be hundreds of MB / several GB) rather
+        # than waiting for the frame to be collected — matters for a long-running
+        # bot processing many videos. NOTE: this does NOT reliably release the
+        # audio-file handle on Windows, so callers must treat temp cleanup as
+        # best-effort (see process_video).
+        del model
+        gc.collect()
+    return text
 
 
 def _ollama_generate_json(prompt: str) -> dict | None:
@@ -142,7 +154,13 @@ def process_video(video_path: str | Path) -> tuple[str, list[str]]:
     try:
         transcript = transcribe(audio_path)
     finally:
-        audio_path.unlink(missing_ok=True)
+        # Best-effort cleanup: a still-locked temp WAV must never abort the
+        # pipeline after a successful transcription (Windows can hold the handle
+        # briefly). A leftover file in the OS temp dir is harmless.
+        try:
+            audio_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     transcript_path = _save_transcript(video_path, transcript)
     video_id = db.log_video(video_path.name, str(transcript_path))

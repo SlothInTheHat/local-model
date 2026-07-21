@@ -1,44 +1,44 @@
 import { useState } from "react";
-import { Plus, Trash2, RefreshCw, CheckCircle2, XCircle, Circle, ChevronDown, ChevronRight, Mail, HardDrive, Calendar, Globe, Check } from "lucide-react";
+import { Plus, Trash2, RefreshCw, CheckCircle2, XCircle, Circle, ChevronDown, ChevronRight, Mail, HardDrive, Calendar, Globe, Check, GraduationCap } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { Button } from "./ui/button";
 import { Card, CardContent } from "./ui/card";
 import { useMcpStore, type McpServer } from "../store/mcp";
-import { mcpInitialize, mcpListTools, mcpStopServer } from "../lib/mcp";
+import { connectMcpServer, mcpStopServer } from "../lib/mcp";
+import { MCP_PRESETS } from "../lib/mcpPresets";
 
-const QUICK_TEMPLATES = [
-  {
-    id: "gmail",
-    label: "Gmail",
-    Icon: Mail,
-    command: "npx",
-    args: "-y mcp-gmail",
-    description: "Read, search & send email (needs OAuth setup)",
-  },
-  {
-    id: "gdrive",
-    label: "Google Drive",
-    Icon: HardDrive,
-    command: "npx",
-    args: "-y @modelcontextprotocol/server-gdrive",
-    description: "Browse, read & create Drive files (needs OAuth setup)",
-  },
-  {
-    id: "gcal",
-    label: "Google Calendar",
-    Icon: Calendar,
-    command: "npx",
-    args: "-y google-calendar-mcp",
-    description: "View & create calendar events (needs OAuth setup)",
-  },
-  {
-    id: "browser",
-    label: "Browser",
-    Icon: Globe,
-    command: "npx",
-    args: "-y @playwright/mcp@latest",
-    description: "Automate browser navigation & forms",
-  },
-] as const;
+interface QuickTemplate {
+  id: string;
+  label: string;
+  Icon: LucideIcon;
+  command: string;
+  args: string;
+  description: string;
+  /** Env vars the server needs; KEY → placeholder value shown pre-filled in the form. */
+  env?: Record<string, string>;
+  /**
+   * Needs per-user credentials. Clicking the card opens the manual Add form
+   * pre-filled (so the user can supply the credential path / review the auth
+   * step) instead of silently creating a server that will fail to connect.
+   */
+  setup?: boolean;
+}
+
+// Icon is a UI-only concern, kept local to this component. Data (id/label/
+// command/args/description/env/setup) lives in lib/mcpPresets.ts — the
+// single source of truth also used by capabilityRegistry.ts for prompts.
+const PRESET_ICONS: Record<string, LucideIcon> = {
+  gmail: Mail,
+  gdrive: HardDrive,
+  gcal: Calendar,
+  canvas: GraduationCap,
+  browser: Globe,
+};
+
+const QUICK_TEMPLATES: QuickTemplate[] = MCP_PRESETS.map((p) => ({
+  ...p,
+  Icon: PRESET_ICONS[p.id] ?? Globe,
+}));
 
 const STATUS_ICON: Record<McpServer["status"], React.ReactNode> = {
   disconnected: <Circle className="size-3 text-muted-foreground" />,
@@ -62,15 +62,10 @@ export function McpSettings() {
   });
 
   async function connect(server: McpServer) {
-    setStatus(server.id, "connecting");
-    try {
-      await mcpInitialize(server);
-      const tools = await mcpListTools(server);
-      setTools(server.id, tools);
-      setStatus(server.id, "connected");
-    } catch (e) {
-      setStatus(server.id, "error", (e as Error).message);
-    }
+    // Shared with mcpAutoConnect.ts so the manual Connect button and the
+    // on-launch auto-reconnect can never drift out of sync (status updates,
+    // error-message handling, tool discovery all live in one place).
+    await connectMcpServer(server);
   }
 
   async function disconnect(server: McpServer) {
@@ -116,6 +111,21 @@ export function McpSettings() {
                 disabled={alreadyAdded}
                 onClick={() => {
                   if (alreadyAdded) return;
+                  // Credential-needing presets: open the manual form pre-filled
+                  // so the user can fill in their env/credential path. Others
+                  // (no auth) add in one click as before.
+                  if (t.setup) {
+                    setForm({
+                      label: t.label,
+                      transport: "stdio",
+                      command: t.command,
+                      args: t.args,
+                      env: Object.entries(t.env ?? {}).map(([k, v]) => `${k}=${v}`).join("\n"),
+                      url: "",
+                    });
+                    setAdding(true);
+                    return;
+                  }
                   addServer({
                     id: t.id,
                     label: t.label,

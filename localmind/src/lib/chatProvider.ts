@@ -9,6 +9,7 @@ import { runAgentTurn as runAgentTurnOllama } from "./agentLoop";
 import type { AgentEvent, AgentTurnOptions } from "./agentLoop";
 import type { ToolDef, ToolCall } from "./tools";
 import { useProvidersStore } from "../store/providers";
+import { acquireGeneration } from "./generationGate";
 
 export type { AgentTurnOptions };
 
@@ -252,14 +253,24 @@ export async function* streamChatForModel(
   messages: ChatMessage[],
   signal?: AbortSignal
 ): AsyncGenerator<string> {
-  const { providerId, modelName } = parseModelRef(modelRef);
-  if (providerId === "ollama") {
-    yield* streamChatOllama(modelName, messages, signal);
-    return;
+  // Held for the generator's entire lifetime: incremented on first .next()
+  // (generator bodies don't execute until iteration starts), released in
+  // `finally` so it fires exactly once even if the consumer stops iterating
+  // early (e.g. a `for await` `break`/abort triggers this generator's
+  // `.return()`, which runs pending `finally` blocks) or the stream throws.
+  const release = acquireGeneration();
+  try {
+    const { providerId, modelName } = parseModelRef(modelRef);
+    if (providerId === "ollama") {
+      yield* streamChatOllama(modelName, messages, signal);
+      return;
+    }
+    const cfg = resolveProvider(providerId);
+    if (!cfg) throw new Error(`Provider "${providerId}" not configured`);
+    yield* streamChatOpenAI(cfg.baseUrl, cfg.apiKey, modelName, messages, signal);
+  } finally {
+    release();
   }
-  const cfg = resolveProvider(providerId);
-  if (!cfg) throw new Error(`Provider "${providerId}" not configured`);
-  yield* streamChatOpenAI(cfg.baseUrl, cfg.apiKey, modelName, messages, signal);
 }
 
 export async function* runAgentTurnForModel(
@@ -269,12 +280,18 @@ export async function* runAgentTurnForModel(
   signal?: AbortSignal,
   options?: AgentTurnOptions
 ): AsyncGenerator<AgentEvent> {
-  const { providerId, modelName } = parseModelRef(modelRef);
-  if (providerId === "ollama") {
-    yield* runAgentTurnOllama(modelName, messages, tools, signal, options);
-    return;
+  // See streamChatForModel above for the acquire/release lifetime contract.
+  const release = acquireGeneration();
+  try {
+    const { providerId, modelName } = parseModelRef(modelRef);
+    if (providerId === "ollama") {
+      yield* runAgentTurnOllama(modelName, messages, tools, signal, options);
+      return;
+    }
+    const cfg = resolveProvider(providerId);
+    if (!cfg) throw new Error(`Provider "${providerId}" not configured`);
+    yield* runAgentTurnOpenAI(cfg.baseUrl, cfg.apiKey, modelName, messages, tools, signal);
+  } finally {
+    release();
   }
-  const cfg = resolveProvider(providerId);
-  if (!cfg) throw new Error(`Provider "${providerId}" not configured`);
-  yield* runAgentTurnOpenAI(cfg.baseUrl, cfg.apiKey, modelName, messages, tools, signal);
 }

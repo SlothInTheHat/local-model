@@ -1,6 +1,12 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+// Self-hosted fonts — LocalMind is offline-first, so fonts ship in the bundle
+// instead of the design's Google Fonts CDN `@import` (which would ping
+// Google on every launch and break offline rendering).
+import "@fontsource-variable/dm-sans";
+import "@fontsource/jetbrains-mono/400.css";
+import "@fontsource/jetbrains-mono/500.css";
 import "./index.css";
 
 // Catch unhandled errors and show them visibly instead of blank screen

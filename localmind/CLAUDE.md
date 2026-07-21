@@ -24,11 +24,10 @@ npm run tauri build
 ## Architecture
 
 ### Views (`src/types/app.ts`)
-`AppView = "chat" | "code" | "docs" | "models"` — the four top-level pages. `App.tsx` owns view state and routes to:
-- `ChatMessages` + `ChatInput` → chat view
-- `CodeEditor` (lazy) → Monaco editor with file tree + AI panel
-- `DocEditor` (lazy) → Tiptap editor with AI slash commands
-- `ModelManager` → model browser/downloader
+`AppView` now has 15 top-level tabs (chat, code, docs, models, terminal, agents, research, study, settings, image, skills, benchmarks, compare, memory, logs) — see `APP_VIEWS` and `VIEW_DESCRIPTIONS` in `src/types/app.ts` for the current, authoritative list rather than a hardcoded count here. `App.tsx` owns view state and routes to the corresponding view component per tab (several lazy-loaded, e.g. `CodeEditor`/Monaco, `DocEditor`/Tiptap).
+
+### Agent capabilities
+The agent's self-description (tabs + tools + MCP status) is generated at runtime, not hand-written — see `src/lib/capabilityRegistry.ts` (`buildCapabilityBlock`) as the single source of truth. Tool gating (Plan-mode allowance, approval requirements) is metadata-driven via `planModeAllowed`/`requiresApproval` on each `ToolDef` in `src/lib/tools.ts`, resolved by `resolveToolPolicy` in `src/lib/agentRuntime.ts`.
 
 ### Data flow
 `App.tsx` is the single orchestrator. It owns `selectedModel`, `agentMode`, `attachedImages`, and `systemPromptOpen` as local state, and wires them into every child. All Ollama API calls originate here via two paths:

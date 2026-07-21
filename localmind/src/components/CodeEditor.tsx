@@ -20,8 +20,9 @@ import { inlineHtmlResources } from "../lib/htmlPreview";
 import { loadSkills, saveSkill } from "../lib/skillEngine";
 import type { Skill } from "../lib/skillEngine";
 import { readProjectMemory, writeProjectMemory } from "../lib/projectMemory";
-import { loadDynamicTools, toOllamaTool } from "../lib/dynamicTools";
+import { loadDynamicTools } from "../lib/dynamicTools";
 import type { DynamicToolDef } from "../lib/dynamicTools";
+import { assembleSessionTools } from "../lib/capabilityRegistry";
 import {
   startSession, endSession, logRound, logToolCall, logToolResult, logAgentText,
 } from "../lib/agentLogger";
@@ -85,10 +86,6 @@ function runJavaScript(code: string): { output: string; error: boolean } {
     return { output: (err as Error).message, error: true };
   }
 }
-
-// Base tools — dynamic tools from workspace are merged in handleChatSend
-const BASE_TOOLS = getToolDefinitions();
-
 
 const isTauri = () => {
   const w = window as unknown as Record<string, unknown>;
@@ -162,7 +159,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
   const { hardware, vramOverride } = useModelStore();
   const { numCtxOverride } = useSettingsStore();
   const effectiveHardware = vramOverride != null && hardware ? { ...hardware, vramGb: vramOverride } : hardware;
-  const numCtx = resolveNumCtx(effectiveHardware, numCtxOverride);
+  const numCtx = resolveNumCtx(effectiveHardware, numCtxOverride, selectedModel);
 
   // Multi-file tabs
   interface OpenTab { path: string; content: string; isDirty: boolean; }
@@ -660,14 +657,10 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
       "install_deps", "todo_write",
       "git_status", "git_commit",
       "update_project_memory",
-      "create_folder",
+      "create_folder", "register_tool",
       "switch_model", "switch_view", "send_task_to_tab",
     ]);
-    const dynamicOllamaTools = dynamicToolDefs.map(toOllamaTool);
-    const CODE_TOOLS = [
-      ...BASE_TOOLS.filter((t) => ESSENTIAL_CODING_TOOLS.has(t.name)),
-      ...dynamicOllamaTools,
-    ];
+    const CODE_TOOLS = await assembleSessionTools({ dirHandle, essentialOnly: ESSENTIAL_CODING_TOOLS });
 
     // Build chat history — reconstruct proper tool call/result pairs so the
     // model knows what it did in previous rounds and doesn't re-simulate them as text.
@@ -1201,7 +1194,17 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                     // Ctrl+S to save
                     ed.addCommand(2048 | 49 /* S */, () => void handleSave());
                   }}
-                  options={{ minimap: { enabled: false }, fontSize: 13, wordWrap: "on", scrollBeyondLastLine: false }}
+                  options={{
+                    minimap: { enabled: false },
+                    fontSize: 13,
+                    wordWrap: "on",
+                    scrollBeyondLastLine: false,
+                    // The Nucleus island clips overlay content via `overflow:
+                    // hidden` + a 26px border-radius. Without this, Monaco's
+                    // overlay widgets (autocomplete, hover, find/replace) get
+                    // clipped mid-popup instead of portaling to <body>.
+                    fixedOverflowWidgets: true,
+                  }}
                 />
               </Suspense>
             </div>
@@ -1447,7 +1450,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                   title="Log request info to browser console (F12) to debug 500 errors"
                   className="text-muted-foreground hover:text-foreground text-[10px]"
                   onClick={() => {
-                    const ESSENTIAL = new Set(["read_file","write_file","patch_file","apply_patch","list_directory","grep_files","find_files","run_command","web_search","web_fetch","install_deps","todo_write","git_status","git_commit","update_project_memory"]);
+                    const ESSENTIAL = new Set(["read_file","write_file","patch_file","apply_patch","list_directory","grep_files","find_files","run_command","web_search","web_fetch","install_deps","todo_write","git_status","git_commit","update_project_memory","create_folder","register_tool","switch_model","switch_view","send_task_to_tab"]);
                     const { default: BASE } = { default: getToolDefinitions() };
                     const tools = BASE.filter(t => ESSENTIAL.has(t.name));
                     const toolsJson = JSON.stringify(tools);

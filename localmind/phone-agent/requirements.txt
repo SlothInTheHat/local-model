@@ -1,4 +1,5 @@
 python-telegram-bot>=21
 faster-whisper
+yt-dlp
 requests
 python-dotenv

@@ -27,12 +27,10 @@ materially changed, update this file as part of that change.**
 
 ## Agent tools
 
-- **Files**: read_file, write_file, patch_file, apply_patch, delete_file, list_directory, grep_files, find_files, create_folder
-- **Shell**: run_command, install_deps
-- **Git**: git_status, git_diff, git_log, git_add, git_commit
-- **Web**: web_search, web_fetch
-- **State**: todo_write, update_project_memory, save_global_memory, list_skills, save_skill, get_system_info
-- **App control**: switch_model (change the active Ollama model app-wide), switch_view (navigate the user's UI to another tab), send_task_to_tab (queue a task for another tab's agent without interrupting the user's current view)
+The authoritative tool list is generated at runtime from `TOOL_DEFINITIONS`
+metadata (`src/lib/tools.ts`) via `src/lib/capabilityRegistry.ts` — see that
+file rather than a hand-maintained list here (it also drives the agent's own
+system-prompt self-description and plan-mode/approval gating).
 
 ## Agent behaviors
 

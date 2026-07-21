@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import {
-  Plus, Trash2, Pencil, BookMarked, Save, X, Tag, Search, FolderOpen,
+  Plus, Trash2, Pencil, BookMarked, Save, X, Tag, Search, FolderOpen, Sparkles, Check,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "./ui/button";
@@ -8,6 +8,7 @@ import { Textarea } from "./ui/textarea";
 import { openWorkspace } from "../lib/fileSystem";
 import { loadSkills, saveSkill, deleteSkill } from "../lib/skillEngine";
 import { useAgentStore } from "../store/agent";
+import { usePendingSkillsStore, type PendingSkill } from "../store/pendingSkills";
 import type { Skill } from "../lib/skillEngine";
 
 const EXAMPLE_SKILL = `When debugging Docker containers:
@@ -19,6 +20,7 @@ const EXAMPLE_SKILL = `When debugging Docker containers:
 
 export function SkillRegistry() {
   const { dirHandle, setWorkspace } = useAgentStore();
+  const { pending: pendingSkills, remove: removePending } = usePendingSkillsStore();
 
   const [skills, setSkills] = useState<Skill[]>([]);
   const [loading, setLoading] = useState(false);
@@ -100,6 +102,19 @@ export function SkillRegistry() {
     }
   }
 
+  /** Approve an auto-distilled skill candidate: write it to .localmind/skills/ and drop it from the queue. */
+  async function approvePending(p: PendingSkill) {
+    if (!dirHandle) { toast.error("Open a workspace first to save this skill"); return; }
+    try {
+      await saveSkill(dirHandle, { name: p.name, tags: p.tags, content: p.content });
+      removePending(p.id);
+      setSkills(await loadSkills(dirHandle));
+      toast.success(`Skill approved: ${p.name}`);
+    } catch (err) {
+      toast.error(`Approve failed: ${(err as Error).message}`);
+    }
+  }
+
   async function handleDelete(skill: Skill) {
     if (!dirHandle) return;
     if (!window.confirm(`Delete skill "${skill.name}"? This cannot be undone.`)) return;
@@ -158,6 +173,33 @@ export function SkillRegistry() {
             <Button size="sm" variant="outline" className="text-xs h-7 gap-1" onClick={() => void handleOpenWorkspace()}>
               <FolderOpen className="size-3" /> Open workspace
             </Button>
+          </div>
+        )}
+
+        {/* Suggested (auto-distilled) skills awaiting approval — never saved silently. */}
+        {pendingSkills.length > 0 && (
+          <div className="border-b bg-amber-500/5">
+            <div className="px-3 py-2 text-[11px] font-semibold text-amber-600 dark:text-amber-400 flex items-center gap-1.5">
+              <Sparkles className="size-3" />
+              {pendingSkills.length} suggested from recent sessions
+            </div>
+            {pendingSkills.map((p) => (
+              <div key={p.id} className="px-3 pb-2.5 space-y-1">
+                <p className="text-xs font-medium truncate" title={p.name}>{p.name}</p>
+                {p.sourceTask && (
+                  <p className="text-[10px] text-muted-foreground truncate" title={p.sourceTask}>from: {p.sourceTask}</p>
+                )}
+                <p className="text-[10px] text-muted-foreground line-clamp-2">{p.content.slice(0, 140)}</p>
+                <div className="flex gap-1.5 pt-0.5">
+                  <Button size="sm" className="h-6 text-[11px] px-2 gap-1" onClick={() => void approvePending(p)} disabled={!dirHandle} title={dirHandle ? "Save to .localmind/skills/" : "Open a workspace first"}>
+                    <Check className="size-3" /> Approve
+                  </Button>
+                  <Button size="sm" variant="outline" className="h-6 text-[11px] px-2 gap-1" onClick={() => removePending(p.id)}>
+                    <X className="size-3" /> Dismiss
+                  </Button>
+                </div>
+              </div>
+            ))}
           </div>
         )}
 

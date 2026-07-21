@@ -24,3 +24,21 @@ dist-ssr
 *.sw?
 .claude
 .env
+
+# Secrets — OAuth client JSON, tokens, API keys. Never commit.
+secrets/
+*.keys.json
+gcp-oauth.keys.json
+*-credentials.json
+tokens.json
+
+# Agent runtime state, not source: skills/improvements/dynamic tools the
+# assistant writes into the open workspace at runtime.
+.localmind/
+
+# MCP scratch output (Playwright traces, page snapshots).
+src-tauri/.playwright-mcp/
+src-tauri/snapshot.md
+
+# Rust build output.
+src-tauri/target/

@@ -40,8 +40,8 @@ export function SystemPromptDialog({ open, onClose, convId }: Props) {
   return (
     <Dialog.Root open={open} onOpenChange={(v) => !v && onClose()}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 bg-black/40 z-40" />
-        <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-full max-w-lg bg-card border rounded-xl shadow-lg p-6 space-y-4 focus:outline-none">
+        <Dialog.Overlay className="fixed inset-0 bg-black/40 z-[100]" />
+        <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-[101] w-full max-w-lg bg-card border rounded-xl shadow-lg p-6 space-y-4 focus:outline-none">
           <div className="flex items-center justify-between">
             <Dialog.Title className="text-base font-semibold text-foreground">
               System Prompt

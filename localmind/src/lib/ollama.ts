@@ -1,3 +1,5 @@
+import { DEFAULT_OLLAMA_BASE_URL, useSettingsStore } from "../store/settings";
+
 export interface OllamaModel {
   name: string;
   modified_at: string;
@@ -13,10 +15,14 @@ export interface ChatMessage {
   tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }>;
 }
 
-const BASE_URL = "http://localhost:11434";
+/** Current configured Ollama base URL (no trailing slash), reading live from settings. */
+export function getOllamaBaseUrl(): string {
+  const url = useSettingsStore.getState().ollamaBaseUrl?.trim();
+  return (url ? url : DEFAULT_OLLAMA_BASE_URL).replace(/\/+$/, "");
+}
 
 export async function listModels(): Promise<OllamaModel[]> {
-  const res = await fetch(`${BASE_URL}/api/tags`);
+  const res = await fetch(`${getOllamaBaseUrl()}/api/tags`);
   if (!res.ok) throw new Error(`Ollama not reachable: ${res.status}`);
   const data = await res.json();
   return data.models ?? [];
@@ -32,7 +38,7 @@ export async function* pullModel(
   name: string,
   signal?: AbortSignal
 ): AsyncGenerator<PullUpdate> {
-  const res = await fetch(`${BASE_URL}/api/pull`, {
+  const res = await fetch(`${getOllamaBaseUrl()}/api/pull`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name, stream: true }),
@@ -67,7 +73,7 @@ export async function* pullModel(
 }
 
 export async function deleteModel(name: string): Promise<void> {
-  const res = await fetch(`${BASE_URL}/api/delete`, {
+  const res = await fetch(`${getOllamaBaseUrl()}/api/delete`, {
     method: "DELETE",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name }),
@@ -80,7 +86,7 @@ export async function* streamChat(
   messages: ChatMessage[],
   signal?: AbortSignal
 ): AsyncGenerator<string> {
-  const res = await fetch(`${BASE_URL}/api/chat`, {
+  const res = await fetch(`${getOllamaBaseUrl()}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ model, messages, stream: true }),

@@ -32,6 +32,7 @@ export function formatToolLabel(name: string, args: Record<string, unknown>): st
     case "switch_model":    return `🔀 Switching model to ${args["model"]}`;
     case "switch_view":     return `🧭 Switching view to ${args["view"]}`;
     case "send_task_to_tab": return `📨 Sending task to ${args["target_view"]}`;
+    case "transcribe_video": return `🎬 Transcribing ${String(args["url"] || path || args["path"] || "video").slice(0, 60)}`;
     default:                return `⚙ ${name}`;
   }
 }
@@ -75,6 +76,7 @@ export function summariseToolResult(name: string, args: Record<string, unknown>,
     case "switch_model":    return `🔀 Switched model to ${args["model"]}`;
     case "switch_view":     return `🧭 Switched view to ${args["view"]}`;
     case "send_task_to_tab": return `📨 Task queued for ${args["target_view"]}`;
+    case "transcribe_video": return `🎬 Transcribed ${String(args["url"] || path || args["path"] || "video").slice(0, 50)} — ${output.length} chars`;
     default:                return `⚙ ${name} — done`;
   }
 }

@@ -5,7 +5,7 @@
  *  - sse:   Remote server; JSON-RPC requests sent via POST, responses streamed via EventSource.
  */
 
-import type { McpServer } from "../store/mcp";
+import { useMcpStore, type McpServer } from "../store/mcp";
 import type { ToolDef } from "./tools";
 
 // ─── Tauri bridge ────────────────────────────────────────────────────────────
@@ -73,6 +73,17 @@ function getSseState(server: McpServer): SseState {
     } catch { /* ignore malformed */ }
   });
 
+  // Connection dropped (network blip, remote restart, etc). Close + evict the
+  // cached client so the next sendRequest re-establishes a fresh EventSource
+  // instead of silently sending POSTs into a dead stream. Any requests already
+  // pending on this connection still resolve via the existing 30s timeout in
+  // sendRequest — we don't need to reject them here.
+  es.onerror = () => {
+    es.close();
+    sseClients.delete(server.id);
+    useMcpStore.getState().setStatus(server.id, "error", "MCP SSE connection lost");
+  };
+
   const state: SseState = { es, pending, postUrl };
   sseClients.set(server.id, state);
   return state;
@@ -86,6 +97,70 @@ export function disconnectSse(serverId: string) {
   }
 }
 
+// ─── Crash recovery (stdio) ───────────────────────────────────────────────────
+
+// Matches the error strings src-tauri/src/mcp.rs returns from mcp_send_request
+// when the child process is gone: "MCP server '{id}' not running" (handle
+// missing), "MCP server channel closed" (writer task died), "MCP server
+// exited before responding..." / "MCP server exited on startup..." (process
+// died). Deliberately excludes the 120s timeout message — a slow-but-alive
+// server (e.g. downloading a package) shouldn't be treated as dead.
+function isDeadServerError(message: string): boolean {
+  return /not running|exited|channel closed/i.test(message);
+}
+
+// Per-server cooldown so a permanently-broken server doesn't respawn on every
+// single tool call — one reconnect attempt per RECONNECT_COOLDOWN_MS.
+const RECONNECT_COOLDOWN_MS = 10_000;
+const lastReconnectAttempt = new Map<string, number>();
+
+async function stdioInvoke(server: McpServer, req: string): Promise<JsonRpcResponse> {
+  const raw = await tauriInvoke<string>("mcp_send_request", {
+    id: server.id,
+    requestJson: req,
+  });
+  return parseResponse(raw);
+}
+
+/** Send a single JSON-RPC request over stdio, reconnecting once if the server process is dead. */
+async function sendStdioRequest(server: McpServer, req: string, isRetry = false): Promise<JsonRpcResponse> {
+  try {
+    return await stdioInvoke(server, req);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const err = e instanceof Error ? e : new Error(msg);
+    if (isRetry || !isDeadServerError(msg)) throw err;
+
+    const now = Date.now();
+    const last = lastReconnectAttempt.get(server.id) ?? 0;
+    if (now - last < RECONNECT_COOLDOWN_MS) {
+      // Reconnected too recently (or a reconnect is already unwinding above
+      // us on the call stack) — don't loop, just surface the error.
+      useMcpStore.getState().setStatus(server.id, "error", msg);
+      throw err;
+    }
+    lastReconnectAttempt.set(server.id, now);
+
+    try {
+      await mcpInitialize(server); // respawns the stdio process + re-runs the handshake
+    } catch (initErr) {
+      const initMsg = initErr instanceof Error ? initErr.message : String(initErr);
+      useMcpStore.getState().setStatus(server.id, "error", initMsg);
+      throw initErr instanceof Error ? initErr : new Error(initMsg);
+    }
+
+    try {
+      const resp = await sendStdioRequest(server, req, true);
+      useMcpStore.getState().setStatus(server.id, "connected");
+      return resp;
+    } catch (retryErr) {
+      const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+      useMcpStore.getState().setStatus(server.id, "error", retryMsg);
+      throw retryErr;
+    }
+  }
+}
+
 // ─── Core send ────────────────────────────────────────────────────────────────
 
 async function sendRequest(server: McpServer, method: string, params?: unknown): Promise<unknown> {
@@ -93,11 +168,7 @@ async function sendRequest(server: McpServer, method: string, params?: unknown):
   const reqId = (JSON.parse(req) as { id: string }).id;
 
   if (server.transport === "stdio") {
-    const raw = await tauriInvoke<string>("mcp_send_request", {
-      id: server.id,
-      requestJson: req,
-    });
-    const resp = parseResponse(raw);
+    const resp = await sendStdioRequest(server, req);
     if (resp.error) throw new Error(resp.error.message);
     return resp.result;
   }
@@ -183,6 +254,31 @@ export async function mcpCallTool(
 
   if (result.isError) throw new Error(text || "MCP tool returned an error");
   return text;
+}
+
+/**
+ * Connect to a server end-to-end (initialize handshake + list tools) and
+ * reflect the outcome in useMcpStore. Single shared code path used by both
+ * the McpSettings "Connect" button and mcpAutoConnect on app launch, so the
+ * two never drift out of sync.
+ */
+export async function connectMcpServer(server: McpServer): Promise<boolean> {
+  const { setStatus, setTools } = useMcpStore.getState();
+  setStatus(server.id, "connecting");
+  try {
+    await mcpInitialize(server);
+    const tools = await mcpListTools(server);
+    setTools(server.id, tools);
+    setStatus(server.id, "connected");
+    return true;
+  } catch (e) {
+    // Tauri rejects a failed invoke with the raw Err(String), not an Error
+    // object — so (e as Error).message would be undefined and the UI would
+    // show a red X with no explanation. Handle both shapes.
+    const msg = e instanceof Error ? e.message : String(e);
+    setStatus(server.id, "error", msg || "Connection failed (no error detail).");
+    return false;
+  }
 }
 
 /** Stop a stdio server. No-op for SSE servers. */

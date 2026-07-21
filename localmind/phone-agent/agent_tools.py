@@ -251,16 +251,25 @@ SKIP_DIRS = {
 # ─── Path / glob helpers ──────────────────────────────────────────────────
 
 def _resolve(path: str) -> Path:
+    workspace = config.WORKSPACE_DIR.resolve()
     path = (path or "").strip().lstrip("/\\")
     if not path:
-        return config.WORKSPACE_DIR
+        return workspace
     p = Path(path)
     if p.is_absolute():
         # Drive-letter/UNC absolute paths would otherwise make Path.__truediv__
         # discard WORKSPACE_DIR entirely and escape the workspace. Strip the
         # anchor and treat the rest as relative.
         p = Path(*p.parts[1:])
-    return config.WORKSPACE_DIR / p
+    # Resolve the full path and confine it to the workspace: stripping the
+    # anchor above does nothing about ".." segments, so an argument like
+    # "../../Users/x/.ssh/id_rsa" would otherwise escape. Reject anything that
+    # resolves outside the workspace root (path-traversal defense for a
+    # Telegram-reachable agent). This is enforced for EVERY path-taking tool.
+    resolved = (workspace / p).resolve()
+    if not resolved.is_relative_to(workspace):
+        raise ValueError("path escapes the workspace")
+    return resolved
 
 
 def _glob_to_regex(pattern: str) -> re.Pattern:
@@ -526,8 +535,22 @@ def _create_folder(path: str) -> str:
     return f"Created folder: {path}"
 
 
+# Cap on captured command output returned to the model (chars). Keeps a
+# runaway command (e.g. a build dumping MB of logs) from blowing up the
+# Telegram message / model context.
+_MAX_CMD_OUTPUT = 20_000
+
+
 def _run_command(cmd: str, cwd: str = "") -> str:
-    workdir = _resolve(cwd) if cwd else config.WORKSPACE_DIR
+    # Security note: this runs with shell=True, which is a shell-injection
+    # surface. It is retained deliberately — the agent genuinely needs
+    # compound shell commands (pipes, &&, redirection), and switching to
+    # shell=False would break that existing usage. The accepted mitigations
+    # are: (1) run_command is in MUTATING_TOOLS, so every invocation requires
+    # explicit inline Approve/Deny over Telegram before it executes; (2) cwd is
+    # always pinned inside the workspace via _resolve (which now rejects
+    # ..-escapes); (3) output is capped; (4) a hard timeout is enforced.
+    workdir = _resolve(cwd) if cwd else config.WORKSPACE_DIR.resolve()
     try:
         result = subprocess.run(
             cmd, shell=True, cwd=str(workdir),
@@ -537,6 +560,8 @@ def _run_command(cmd: str, cwd: str = "") -> str:
         return "Command timed out after 120 seconds."
 
     combined = "\n".join(s for s in (result.stdout, result.stderr) if s).strip()
+    if len(combined) > _MAX_CMD_OUTPUT:
+        combined = combined[:_MAX_CMD_OUTPUT] + "\n…(output truncated)"
     exit_note = f"[exit code: {result.returncode}]"
     return f"{combined}\n\n{exit_note}" if combined else exit_note
 

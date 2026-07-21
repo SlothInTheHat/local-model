@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Brain, Plus, Trash2, Search, Tag, X } from "lucide-react";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -20,7 +20,15 @@ function relativeTime(ts: number): string {
 }
 
 export function MemoryView() {
-  const { entries, embedModel, removeEntry, setEmbedModel } = useMemoryStore();
+  const { entries, embedModel, removeEntry, setEmbedModel, loadFromDb } = useMemoryStore();
+
+  // Memories now live in SQLite (WP1.4), hydrated lazily on first use by
+  // addMemory/searchMemory. This tab needs them visible even if the user
+  // opens it before ever searching or adding, so trigger hydration here too
+  // (loadFromDb is idempotent — a no-op once already hydrated).
+  useEffect(() => {
+    void loadFromDb();
+  }, [loadFromDb]);
 
   const [addText, setAddText] = useState("");
   const [addTags, setAddTags] = useState("");

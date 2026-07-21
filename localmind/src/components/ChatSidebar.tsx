@@ -6,9 +6,6 @@ import {
   Library,
   Brain,
   Cpu,
-  HardDrive,
-  MemoryStick,
-  Settings,
   Code2,
   FileText,
   TerminalSquare,
@@ -49,22 +46,9 @@ interface Props {
 }
 
 export function ChatSidebar({ view, onViewChange, selectedModel, onModelChange, onOpenSearch }: Props) {
-  const { conversations, activeId, newConversation, selectConversation, deleteConversation, renameConversation } =
-    useChatStore();
   const { hardware } = useModelStore();
 
-  const [searchQuery, setSearchQuery] = useState("");
   const [showMcp, setShowMcp] = useState(false);
-
-  const filteredConversations = searchQuery.trim()
-    ? conversations.filter(
-        (c) =>
-          c.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-          c.messages.some((m) =>
-            m.content.toLowerCase().includes(searchQuery.toLowerCase())
-          )
-      )
-    : conversations;
 
   // Cmd+K / Ctrl+K global shortcut
   useEffect(() => {
@@ -98,6 +82,7 @@ export function ChatSidebar({ view, onViewChange, selectedModel, onModelChange, 
     { id: "benchmarks", icon: <BarChart2 className="size-4" />,       label: "Benchmarks" },
     { id: "terminal",   icon: <TerminalSquare className="size-4" />,  label: "Terminal" },
     { id: "agents",     icon: <Bot className="size-4" />,             label: "Subagents" },
+    { id: "logs",       icon: <ScrollText className="size-4" />,      label: "Logs" },
   ];
 
   // Auto-expand "More" if the current view is in the secondary list
@@ -198,42 +183,8 @@ export function ChatSidebar({ view, onViewChange, selectedModel, onModelChange, 
 
         {/* Chat list (only in chat view) */}
         {view === "chat" && (
-          <div className="p-3 space-y-1">
-            <div className="flex items-center justify-between mb-1">
-              <span className="text-xs text-muted-foreground px-1">Recent Chats</span>
-              <Button
-                size="icon"
-                variant="ghost"
-                className="size-6"
-                onClick={() => newConversation(selectedModel)}
-              >
-                <Plus className="size-3" />
-              </Button>
-            </div>
-
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Filter chats…"
-              className="w-full text-xs px-2 py-1 rounded border border-border bg-background text-foreground placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-ring"
-            />
-
-            {filteredConversations.length === 0 && (
-              <p className="text-xs text-muted-foreground px-3 py-2">
-                {searchQuery ? "No results" : "No chats yet"}
-              </p>
-            )}
-            {filteredConversations.map((c) => (
-              <ConversationItem
-                key={c.id}
-                conv={c}
-                active={c.id === activeId}
-                onSelect={() => selectConversation(c.id)}
-                onDelete={() => deleteConversation(c.id)}
-                onRename={(title) => renameConversation(c.id, title)}
-              />
-            ))}
+          <div className="p-3">
+            <RecentChatsPanel selectedModel={selectedModel} />
           </div>
         )}
 
@@ -261,64 +212,118 @@ export function ChatSidebar({ view, onViewChange, selectedModel, onModelChange, 
       <div className="p-3 border-t space-y-2">
         <WorkspaceSelector />
         {hardware ? (
-          <>
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Cpu className="size-3 shrink-0" />
-              <span className="truncate">{hardware.cpuThreads} CPU threads</span>
-            </div>
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <HardDrive className="size-3 shrink-0" />
-              <span className="truncate">
-                {hardware.gpuName === "Unknown GPU" ? "GPU unknown" : hardware.gpuName}
-              </span>
-            </div>
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <MemoryStick className="size-3 shrink-0" />
-              <span>{hardware.ramGb} GB RAM</span>
-            </div>
-          </>
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground min-w-0">
+            <Cpu className="size-3 shrink-0" />
+            <span className="truncate">
+              {hardware.cpuThreads}c · {hardware.gpuName === "Unknown GPU" ? "GPU unknown" : hardware.gpuName} · {hardware.ramGb}GB
+            </span>
+          </div>
         ) : (
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             <Cpu className="size-3" />
             <span>Hardware not scanned</span>
           </div>
         )}
-        <div className="flex gap-1.5 mt-1">
-          <Button
-            variant={view === "models" ? "secondary" : "outline"}
-            size="sm"
-            className="flex-1 text-xs"
-            onClick={() => onViewChange("models")}
-          >
-            <Library className="size-3 mr-1" />
-            Models
-          </Button>
-          <Button
-            variant={view === "logs" ? "secondary" : "outline"}
-            size="sm"
-            className="flex-1 text-xs"
-            onClick={() => onViewChange("logs")}
-            title="Agent Logs"
-          >
-            <ScrollText className="size-3 mr-1" />
-            Logs
-          </Button>
-          <Button
-            variant={view === "settings" ? "secondary" : "outline"}
-            size="sm"
-            className="flex-1 text-xs"
-            onClick={() => onViewChange("settings")}
-          >
-            <Settings className="size-3 mr-1" />
-            Settings
-          </Button>
-        </div>
       </div>
     </aside>
   );
 }
 
-function ConversationItem({
+/**
+ * Recent-chats list: search filter, MAX_VISIBLE_CHATS cap, "+N more — search
+ * to find them" button, and ConversationItem rows. Lifted out of the retired
+ * sidebar layout so both the old aside (unused, kept for reference) and the
+ * new Nucleus chat drawer (see ChatDrawer.tsx) share the exact same logic.
+ */
+export function RecentChatsPanel({
+  selectedModel,
+  onAfterSelect,
+}: {
+  selectedModel: string;
+  onAfterSelect?: () => void;
+}) {
+  const { conversations, activeId, newConversation, selectConversation, deleteConversation, renameConversation } =
+    useChatStore();
+  const [searchQuery, setSearchQuery] = useState("");
+  const filterInputRef = useRef<HTMLInputElement>(null);
+
+  const searching = searchQuery.trim().length > 0;
+  const filteredConversations = searching
+    ? conversations.filter(
+        (c) =>
+          c.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+          c.messages.some((m) =>
+            m.content.toLowerCase().includes(searchQuery.toLowerCase())
+          )
+      )
+    : conversations;
+
+  // Cap the resting list — a long chat history otherwise dominates the panel.
+  // Search always shows every match (never capped).
+  const MAX_VISIBLE_CHATS = 8;
+  const visibleConversations = searching
+    ? filteredConversations
+    : filteredConversations.slice(0, MAX_VISIBLE_CHATS);
+  const hiddenChatCount = searching ? 0 : conversations.length - visibleConversations.length;
+
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-xs text-muted-foreground px-1">Recent Chats</span>
+        <Button
+          size="icon"
+          variant="ghost"
+          className="size-6"
+          onClick={() => {
+            newConversation(selectedModel);
+            onAfterSelect?.();
+          }}
+        >
+          <Plus className="size-3" />
+        </Button>
+      </div>
+
+      <input
+        ref={filterInputRef}
+        type="text"
+        value={searchQuery}
+        onChange={(e) => setSearchQuery(e.target.value)}
+        placeholder="Filter chats…"
+        className="w-full text-xs px-2 py-1 rounded border border-border bg-background text-foreground placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-ring"
+      />
+
+      {filteredConversations.length === 0 && (
+        <p className="text-xs text-muted-foreground px-3 py-2">
+          {searchQuery ? "No results" : "No chats yet"}
+        </p>
+      )}
+      {visibleConversations.map((c) => (
+        <ConversationItem
+          key={c.id}
+          conv={c}
+          active={c.id === activeId}
+          onSelect={() => {
+            selectConversation(c.id);
+            onAfterSelect?.();
+          }}
+          onDelete={() => deleteConversation(c.id)}
+          onRename={(title) => renameConversation(c.id, title)}
+        />
+      ))}
+      {hiddenChatCount > 0 && (
+        <button
+          type="button"
+          onClick={() => filterInputRef.current?.focus()}
+          className="w-full text-left px-3 py-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+        >
+          +{hiddenChatCount} more — search to find them
+        </button>
+      )}
+    </div>
+  );
+}
+
+export function ConversationItem({
   conv,
   active,
   onSelect,

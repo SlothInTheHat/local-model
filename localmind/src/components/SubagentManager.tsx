@@ -6,15 +6,17 @@ import { Textarea } from "./ui/textarea";
 import { Badge } from "./ui/badge";
 import { ScrollArea } from "./ui/scroll-area";
 import { cn } from "./ui/utils";
-import { streamChat } from "../lib/ollama";
 import { useModelStore } from "../store/models";
 import { useChatStore } from "../store/chat";
+import { useAgentStore } from "../store/agent";
+import { useSessionResultsStore } from "../store/sessionResults";
+import { runHeadlessTask, HEADLESS_DEFAULT_ALLOWLIST } from "../lib/headlessRunner";
 import { MODEL_LIBRARY } from "../lib/modelLibrary";
 import type { ModelSpec } from "../lib/modelLibrary";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type AgentStatus = "idle" | "running" | "done" | "error";
+type AgentStatus = "queued" | "running" | "done" | "error" | "idle";
 
 interface Subagent {
   id: string;
@@ -25,7 +27,14 @@ interface Subagent {
   vramGb: number;
   createdAt: number;
   expanded: boolean;
+  /** SessionResult.id once the run has been persisted to useSessionResultsStore. */
+  resultId?: string;
 }
+
+/** Real subagents run as headless agent sessions with tools, capped at this
+ * many concurrent runs (VRAM contention — see SubagentManager audit). Extra
+ * spawns wait in a queue and start as running slots free up. */
+const MAX_CONCURRENT = 2;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -89,18 +98,22 @@ function VramBar({ total, used, pending }: { total: number; used: number; pendin
 export function SubagentManager() {
   const { hardware, vramOverride } = useModelStore();
   const { availableModels } = useChatStore();
+  const workspacePath = useAgentStore((s) => s.workspacePath);
+  const sessionResultCount = useSessionResultsStore(
+    (s) => s.results.filter((r) => r.origin === "subagent").length
+  );
 
   const totalVram = vramOverride ?? hardware?.vramGb ?? 0;
 
   const [agents, setAgents] = useState<Subagent[]>([]);
   const [selectedModel, setSelectedModel] = useState(availableModels[0] ?? "");
   const [task, setTask] = useState("");
-  const [systemPrompt, setSystemPrompt] = useState(
-    "You are a focused AI subagent. Complete the assigned task concisely and return your result."
-  );
-  const [showSysPrompt, setShowSysPrompt] = useState(false);
 
   const abortRefs = useRef<Record<string, AbortController>>({});
+  // Params for queued agents that haven't started yet (looked up when a slot frees up).
+  const paramsRef = useRef<Record<string, { model: string; task: string }>>({});
+  const queueRef = useRef<string[]>([]);
+  const runningCountRef = useRef(0);
 
   const runningVram = agents
     .filter((a) => a.status === "running")
@@ -121,44 +134,52 @@ export function SubagentManager() {
     setAgents((prev) => prev.map((a) => (a.id === id ? { ...a, ...patch } : a)));
   }
 
-  async function spawnAgent() {
-    if (!selectedModel || !task.trim()) {
-      toast.error("Select a model and enter a task.");
-      return;
+  function pumpQueue() {
+    while (runningCountRef.current < MAX_CONCURRENT && queueRef.current.length > 0) {
+      const id = queueRef.current.shift()!;
+      const params = paramsRef.current[id];
+      if (!params) continue;
+      runningCountRef.current++;
+      updateAgent(id, { status: "running" });
+      void runOne(id, params).finally(() => {
+        runningCountRef.current--;
+        delete paramsRef.current[id];
+        pumpQueue();
+      });
     }
+  }
 
-    const id = uid();
-    const vramGb = vramForModel(selectedModel);
-    const newAgent: Subagent = {
-      id,
-      model: selectedModel,
-      task: task.trim(),
-      status: "running",
-      output: "",
-      vramGb,
-      createdAt: Date.now(),
-      expanded: true,
-    };
-
-    setAgents((prev) => [newAgent, ...prev]);
-    setTask("");
-
+  async function runOne(id: string, params: { model: string; task: string }) {
     const abort = new AbortController();
     abortRefs.current[id] = abort;
-
-    const messages = [
-      { role: "system" as const, content: systemPrompt },
-      { role: "user" as const, content: task.trim() },
-    ];
-
     try {
-      for await (const chunk of streamChat(selectedModel, messages, abort.signal)) {
-        setAgents((prev) =>
-          prev.map((a) => (a.id === id ? { ...a, output: a.output + chunk } : a))
-        );
+      const { record, transcript } = await runHeadlessTask({
+        workspacePath: workspacePath!,
+        modelRef: params.model,
+        task: params.task,
+        hardware,
+        origin: "subagent",
+        agentBuildMode: true,
+        // Read-only by default — parallel subagents writing files concurrently
+        // is footgun-prone, so fan-out subagents get analysis tools only
+        // (read_file, list_directory, grep_files, find_files, web_search,
+        // web_fetch, get_system_info, git_status/diff/log, list_skills,
+        // calculator). See HEADLESS_DEFAULT_ALLOWLIST in headlessRunner.ts.
+        toolAllowlist: HEADLESS_DEFAULT_ALLOWLIST,
+        signal: abort.signal,
+      });
+
+      const finalOutput = transcript.trim().length > 0 ? transcript.trim() : record.summary;
+
+      if (record.outcome === "aborted") {
+        updateAgent(id, { status: "idle", output: finalOutput, resultId: record.id });
+      } else if (record.outcome === "error") {
+        updateAgent(id, { status: "error", output: finalOutput || "Error running subagent.", resultId: record.id });
+        toast.error(`Subagent error (${params.model})`);
+      } else {
+        updateAgent(id, { status: "done", output: finalOutput, resultId: record.id });
+        toast.success(`Subagent (${params.model}) finished`);
       }
-      updateAgent(id, { status: "done" });
-      toast.success(`Subagent (${selectedModel}) finished`);
     } catch (err) {
       const e = err as Error;
       if (e.name === "AbortError") {
@@ -172,8 +193,45 @@ export function SubagentManager() {
     }
   }
 
+  function spawnAgent() {
+    if (!selectedModel || !task.trim()) {
+      toast.error("Select a model and enter a task.");
+      return;
+    }
+    if (!workspacePath) {
+      toast.error("Subagents need an open workspace — open a project folder first.");
+      return;
+    }
+
+    const id = uid();
+    const vramGb = vramForModel(selectedModel);
+    const newAgent: Subagent = {
+      id,
+      model: selectedModel,
+      task: task.trim(),
+      status: "queued",
+      output: "",
+      vramGb,
+      createdAt: Date.now(),
+      expanded: true,
+    };
+
+    setAgents((prev) => [newAgent, ...prev]);
+    paramsRef.current[id] = { model: selectedModel, task: task.trim() };
+    queueRef.current.push(id);
+    setTask("");
+    pumpQueue();
+  }
+
   function stopAgent(id: string) {
-    abortRefs.current[id]?.abort();
+    if (abortRefs.current[id]) {
+      abortRefs.current[id].abort();
+      return;
+    }
+    // Not started yet — just drop it from the queue.
+    queueRef.current = queueRef.current.filter((qid) => qid !== id);
+    delete paramsRef.current[id];
+    updateAgent(id, { status: "idle" });
   }
 
   function removeAgent(id: string) {
@@ -199,10 +257,15 @@ export function SubagentManager() {
         <div>
           <h2 className="text-sm font-medium">Subagent Manager</h2>
           <p className="text-[11px] text-muted-foreground">
-            Delegate tasks to multiple parallel AI agents
+            Delegate tasks to real, tool-using agent sessions (read-only, max {MAX_CONCURRENT} at once)
           </p>
         </div>
         <div className="flex-1" />
+        {sessionResultCount > 0 && (
+          <span className="text-[11px] text-muted-foreground" title="Subagent runs persist in Session Results even after this view unmounts">
+            {sessionResultCount} persisted in Session Results
+          </span>
+        )}
         {agents.some((a) => a.status === "done") && (
           <Button size="sm" variant="outline" className="text-xs h-7" onClick={combineOutputs}>
             Copy All Results
@@ -213,6 +276,12 @@ export function SubagentManager() {
       <div className="flex flex-1 min-h-0 overflow-hidden">
         {/* Left panel: spawn controls */}
         <div className="w-72 shrink-0 border-r bg-card flex flex-col p-4 gap-4 overflow-y-auto">
+          {!workspacePath && (
+            <div className="text-[11px] text-destructive bg-destructive/10 border border-destructive/30 rounded p-2">
+              No workspace open — subagents need an open project folder to run (they read files from it). Open a folder first.
+            </div>
+          )}
+
           {/* VRAM budget */}
           {totalVram > 0 ? (
             <VramBar total={totalVram} used={runningVram} pending={canFit ? selectedVram : 0} />
@@ -285,35 +354,15 @@ export function SubagentManager() {
               rows={4}
               className="text-xs min-h-[80px]"
               onKeyDown={(e) => {
-                if (e.key === "Enter" && e.ctrlKey) { e.preventDefault(); void spawnAgent(); }
+                if (e.key === "Enter" && e.ctrlKey) { e.preventDefault(); spawnAgent(); }
               }}
             />
-            <p className="text-[10px] text-muted-foreground">Ctrl+Enter to spawn</p>
-          </div>
-
-          {/* System prompt (collapsible) */}
-          <div className="space-y-1">
-            <button
-              type="button"
-              className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground w-full"
-              onClick={() => setShowSysPrompt((v) => !v)}
-            >
-              {showSysPrompt ? <ChevronUp className="size-3" /> : <ChevronDown className="size-3" />}
-              System prompt
-            </button>
-            {showSysPrompt && (
-              <Textarea
-                value={systemPrompt}
-                onChange={(e) => setSystemPrompt(e.target.value)}
-                rows={3}
-                className="text-xs min-h-[60px]"
-              />
-            )}
+            <p className="text-[10px] text-muted-foreground">Ctrl+Enter to spawn · read-only tools (no writes, no shell)</p>
           </div>
 
           <Button
-            onClick={() => void spawnAgent()}
-            disabled={!selectedModel || !task.trim()}
+            onClick={spawnAgent}
+            disabled={!selectedModel || !task.trim() || !workspacePath}
             className="w-full gap-2"
           >
             <Plus className="size-4" />
@@ -341,7 +390,7 @@ export function SubagentManager() {
               <Cpu className="size-10 opacity-20" />
               <p className="text-sm">No agents spawned yet</p>
               <p className="text-xs max-w-xs text-center">
-                Select a model, enter a task, and click Spawn Agent to run parallel AI workers.
+                Select a model, enter a task, and click Spawn Agent to run parallel, tool-using agent sessions against the current workspace.
               </p>
             </div>
           ) : (
@@ -384,6 +433,7 @@ function AgentCard({
       agent.status === "error" && "border-destructive/40",
       agent.status === "done" && "border-green-500/30",
       agent.status === "running" && "border-primary/40",
+      agent.status === "queued" && "border-amber-400/40",
     )}>
       {/* Card header */}
       <div
@@ -398,7 +448,7 @@ function AgentCard({
           {agent.task.slice(0, 80)}{agent.task.length > 80 ? "…" : ""}
         </span>
         <div className="flex items-center gap-1 shrink-0">
-          {agent.status === "running" && (
+          {(agent.status === "running" || agent.status === "queued") && (
             <Button size="sm" variant="ghost" className="h-6 px-1.5 text-xs" onClick={(e) => { e.stopPropagation(); onStop(); }}>
               <Square className="size-3" />
             </Button>
@@ -422,16 +472,19 @@ function AgentCard({
             {agent.output ? (
               <pre className="text-xs whitespace-pre-wrap font-mono text-foreground leading-5">
                 {agent.output}
-                {agent.status === "running" && <span className="animate-pulse">▌</span>}
               </pre>
             ) : (
               <span className="text-xs text-muted-foreground italic">
-                {agent.status === "running" ? "Working…" : "No output"}
+                {agent.status === "running"
+                  ? "Working… (headless agent session — output appears when it finishes)"
+                  : agent.status === "queued"
+                  ? "Waiting for a free slot (max 2 concurrent subagents)…"
+                  : "No output"}
               </span>
             )}
           </div>
-          {agent.status === "done" && agent.output && (
-            <div className="px-3 py-2 border-t flex gap-2">
+          {(agent.status === "done" || agent.status === "error") && agent.output && (
+            <div className="px-3 py-2 border-t flex gap-2 items-center flex-wrap">
               <Button
                 size="sm" variant="outline" className="text-xs h-6 px-2"
                 onClick={() => {
@@ -444,6 +497,11 @@ function AgentCard({
               <span className="text-[10px] text-muted-foreground self-center">
                 {agent.vramGb} GB VRAM · {new Date(agent.createdAt).toLocaleTimeString()}
               </span>
+              {agent.resultId && (
+                <span className="text-[10px] text-muted-foreground self-center" title="Persisted in Session Results — survives this view unmounting">
+                  · saved (session result {agent.resultId.slice(0, 8)})
+                </span>
+              )}
             </div>
           )}
         </div>
@@ -459,6 +517,7 @@ function StatusBadge({ status }: { status: AgentStatus }) {
       className={cn(
         "text-[10px] px-1.5 py-0 h-4 shrink-0",
         status === "running" && "bg-primary/20 text-primary animate-pulse",
+        status === "queued" && "bg-amber-100 text-amber-700",
         status === "done" && "bg-green-100 text-green-700",
         status === "error" && "bg-red-100 text-red-700",
         status === "idle" && "bg-muted text-muted-foreground",

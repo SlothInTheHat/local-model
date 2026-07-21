@@ -1,7 +1,6 @@
 import type { ChatMessage } from "./ollama";
+import { getOllamaBaseUrl } from "./ollama";
 import type { ToolDef, ToolCall } from "./tools";
-
-const BASE_URL = "http://localhost:11434";
 
 export interface AgentEvent {
   type: "text_delta" | "tool_calls" | "done" | "error";
@@ -62,24 +61,68 @@ const SHELL_LANGS = new Set([
   "pip",           // treat ```pip blocks as shell commands
 ]);
 
+/**
+ * Extract {name, args} from a parsed JSON object, tolerating the many shapes
+ * local models emit: {name|tool|tool_name|function_name, arguments|args|
+ * parameters|params|input}, and the OpenAI-style {function:{name, arguments}}.
+ */
+function extractCallFromObj(obj: Record<string, unknown>): ToolCall | null {
+  let name = (obj["name"] ?? obj["tool"] ?? obj["tool_name"] ?? obj["function_name"]) as unknown;
+  let rawArgs = obj["arguments"] ?? obj["args"] ?? obj["parameters"] ?? obj["params"] ?? obj["input"];
+  const fn = obj["function"];
+  if (typeof fn === "object" && fn) {
+    const f = fn as Record<string, unknown>;
+    if (typeof name !== "string" || !name) name = f["name"];
+    if (rawArgs === undefined) rawArgs = f["arguments"] ?? f["params"];
+  } else if (typeof fn === "string" && (typeof name !== "string" || !name)) {
+    name = fn;
+  }
+  if (typeof name !== "string" || !name) return null;
+  return { id: crypto.randomUUID(), name, args: parseArgs(rawArgs as Record<string, unknown> | string) };
+}
+
+/** Parse JSON, repairing the common local-model deviations: unquoted keys and single quotes. */
+function lenientJsonParse(s: string): Record<string, unknown> | null {
+  try { return JSON.parse(s) as Record<string, unknown>; } catch { /* try to repair below */ }
+  try {
+    const fixed = s
+      .replace(/([{,]\s*)([A-Za-z_$][\w$]*)\s*:/g, '$1"$2":')   // quote bare keys
+      .replace(/'((?:[^'\\]|\\.)*)'/g, '"$1"');                  // single → double quotes
+    return JSON.parse(fixed) as Record<string, unknown>;
+  } catch { return null; }
+}
+
+/** Find balanced top-level {...} JSON object substrings (handles unfenced tool calls). */
+function findJsonObjectSpans(text: string): string[] {
+  const spans: string[] = [];
+  let depth = 0, start = -1, inStr = false, esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "{") { if (depth === 0) start = i; depth++; }
+    else if (c === "}") { if (depth > 0) { depth--; if (depth === 0 && start !== -1) { spans.push(text.slice(start, i + 1)); start = -1; } } }
+  }
+  return spans;
+}
+
 function extractTextToolCalls(text: string): { calls: ToolCall[]; cleanText: string } {
   const calls: ToolCall[] = [];
 
-  // ── Pass 1: JSON blocks with {name, arguments} ────────────────────────────
+  // ── Pass 1: fenced JSON blocks (```json / ```tool / bare ```) ─────────────
   const jsonBlockRe = /```(?:json|tool_call|tool)?\s*\n([\s\S]*?)\n```/g;
   const stripped1 = text.replace(jsonBlockRe, (fullMatch, inner: string) => {
     const trimmed = inner.trim();
     if (!trimmed.startsWith("{")) return fullMatch;
     try {
-      const obj = JSON.parse(trimmed) as Record<string, unknown>;
-      const name = obj["name"] as string | undefined;
-      if (typeof name !== "string" || !name) return fullMatch;
-      const rawArgs = obj["arguments"] ?? obj["args"] ?? obj["parameters"] ?? {};
-      calls.push({
-        id: crypto.randomUUID(),
-        name,
-        args: parseArgs(rawArgs as Record<string, unknown> | string),
-      });
+      const call = extractCallFromObj(JSON.parse(trimmed) as Record<string, unknown>);
+      if (!call) return fullMatch;
+      calls.push(call);
       return "";
     } catch {
       return fullMatch;
@@ -88,19 +131,40 @@ function extractTextToolCalls(text: string): { calls: ToolCall[]; cleanText: str
 
   if (calls.length > 0) return { calls, cleanText: stripped1.trim() };
 
-  // ── Pass 2: Inline JSON {name, arguments} objects ─────────────────────────
-  const inlineRe = /\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"(?:arguments|args|parameters)"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
-  const stripped2 = text.replace(inlineRe, (fullMatch, name: string, argsStr: string) => {
+  // ── Pass 2: bare (unfenced) JSON objects anywhere in the text ─────────────
+  // Local models often emit {"tool":"...","params":{...}} or {"name":...} with
+  // no code fence. Scan balanced-brace spans and extract any tool-call-shaped one.
+  let stripped2 = text;
+  for (const span of findJsonObjectSpans(text)) {
     try {
-      const args = JSON.parse(argsStr) as Record<string, unknown>;
-      calls.push({ id: crypto.randomUUID(), name, args });
-      return "";
+      const call = extractCallFromObj(JSON.parse(span) as Record<string, unknown>);
+      if (call) {
+        calls.push(call);
+        stripped2 = stripped2.replace(span, "");
+      }
     } catch {
-      return fullMatch;
+      // not valid JSON — skip
     }
-  });
+  }
 
   if (calls.length > 0) return { calls, cleanText: stripped2.trim() };
+
+  // ── Pass 2.5: function-call syntax  tool_name({ ...args... })  ─────────────
+  // Local models often "call" a tool by writing it as code, e.g.
+  //   schedule_task({ name: "x", interval: "2m", command: "..." })
+  // The identifier is the tool name and the object is the args (repaired for
+  // unquoted keys). Unknown names still fail safely downstream (approval/error).
+  const fnCallRe = /\b([a-zA-Z_][a-zA-Z0-9_]{2,40})\s*\(\s*(\{[\s\S]*?\})\s*\)/g;
+  let stripped25 = text;
+  let fm: RegExpExecArray | null;
+  while ((fm = fnCallRe.exec(text)) !== null) {
+    const obj = lenientJsonParse(fm[2]);
+    if (obj) {
+      calls.push({ id: crypto.randomUUID(), name: fm[1], args: obj });
+      stripped25 = stripped25.replace(fm[0], "");
+    }
+  }
+  if (calls.length > 0) return { calls, cleanText: stripped25.trim() };
 
   // ── Pass 3: Shell code blocks → run_command ───────────────────────────────
   // Match ```sh / ```bash / ```cmd / etc. blocks and convert each to a run_command call.
@@ -150,7 +214,7 @@ export async function* runAgentTurn(
 
   let response: Response;
   try {
-    response = await fetch(`${BASE_URL}/api/chat`, {
+    response = await fetch(`${getOllamaBaseUrl()}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

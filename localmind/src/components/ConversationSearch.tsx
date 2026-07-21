@@ -1,26 +1,56 @@
 import { useState, useEffect, useRef } from "react";
-import { Search } from "lucide-react";
+import { Search, History } from "lucide-react";
 import { useChatStore } from "../store/chat";
+import { searchSessions } from "../lib/sessionSearch";
+import type { SessionSearchRow } from "../lib/sessionSearch";
 
 interface Props {
   open: boolean;
   onClose: () => void;
   onSelect: (convId: string) => void;
+  /** Called when a "Past sessions" hit is picked — since headless-run hits
+   *  (task-queue/scheduler/subagent) have no chat conversation to open, this
+   *  routes to the Logs tab instead of onSelect. */
+  onSelectPastSession?: () => void;
 }
 
-export function ConversationSearch({ open, onClose, onSelect }: Props) {
+export function ConversationSearch({ open, onClose, onSelect, onSelectPastSession }: Props) {
   const { conversations } = useChatStore();
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
+  const [pastSessions, setPastSessions] = useState<SessionSearchRow[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (open) {
       setQuery("");
       setSelected(0);
+      setPastSessions([]);
       setTimeout(() => inputRef.current?.focus(), 50);
     }
   }, [open]);
+
+  // Past-session search (WP4.3) — debounced, and only while the overlay is
+  // open. searchSessions itself resolves to [] in browser mode / on error, so
+  // this section just stays empty there.
+  useEffect(() => {
+    if (!open) return;
+    const q = query.trim();
+    if (!q) {
+      setPastSessions([]);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      searchSessions(q, 8).then((rows) => {
+        if (!cancelled) setPastSessions(rows);
+      });
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [query, open]);
 
   const results = query.trim()
     ? conversations
@@ -35,6 +65,26 @@ export function ConversationSearch({ open, onClose, onSelect }: Props) {
   function handleSelect(id: string) {
     onSelect(id);
     onClose();
+  }
+
+  function handleSelectPastSession() {
+    onSelectPastSession?.();
+    onClose();
+  }
+
+  /** Render an FTS5 snippet() string, turning its `[...]` match delimiters
+   *  into a highlight instead of showing the brackets literally. */
+  function renderFtsSnippet(snippet: string): React.ReactNode {
+    const parts = snippet.split(/(\[[^\]]*\])/g);
+    return parts.map((part, i) =>
+      part.startsWith("[") && part.endsWith("]") ? (
+        <mark key={i} className="bg-primary/20 text-foreground rounded">
+          {part.slice(1, -1)}
+        </mark>
+      ) : (
+        part
+      )
+    );
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
@@ -74,7 +124,7 @@ export function ConversationSearch({ open, onClose, onSelect }: Props) {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center pt-[20vh] bg-black/50"
+      className="fixed inset-0 z-[100] flex items-start justify-center pt-[20vh] bg-black/50"
       onClick={onClose}
     >
       <div
@@ -126,6 +176,37 @@ export function ConversationSearch({ open, onClose, onSelect }: Props) {
             );
           })}
         </div>
+
+        {/* Past sessions (WP4.3) — headless run transcripts + indexed chat
+            history via FTS, separate from the in-memory conversation list
+            above. Click-only (not part of ↑↓ nav): a hit may be a headless
+            run with no conversation to open, so selecting one just routes to
+            the Logs tab (least-invasive — see onSelectPastSession callers). */}
+        {query.trim() && pastSessions.length > 0 && (
+          <div className="max-h-60 overflow-y-auto border-t">
+            <p className="px-4 pt-2 pb-1 text-[10px] font-semibold text-muted-foreground flex items-center gap-1.5">
+              <History className="size-3" /> Past sessions
+            </p>
+            {pastSessions.map((hit) => (
+              <button
+                key={hit.id}
+                onClick={handleSelectPastSession}
+                className="w-full text-left px-4 py-2.5 flex flex-col gap-0.5 transition-colors hover:bg-accent/50"
+              >
+                <span className="flex items-center gap-2 text-sm font-medium text-foreground truncate">
+                  <span className="text-[9px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-muted text-muted-foreground shrink-0">
+                    {hit.origin}
+                  </span>
+                  <span className="truncate">{hit.task || "(untitled)"}</span>
+                </span>
+                <span className="text-xs text-muted-foreground truncate">{renderFtsSnippet(hit.snippet)}</span>
+                <span className="text-[10px] text-muted-foreground">
+                  {hit.outcome} · {new Date(hit.created_at).toLocaleDateString()}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
 
         <div className="px-4 py-2 border-t text-[10px] text-muted-foreground flex gap-3">
           <span>↑↓ navigate</span>

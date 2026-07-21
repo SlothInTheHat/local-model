@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
-import { ScrollText, Trash2, Download, Copy, ChevronDown, ChevronRight } from "lucide-react";
+import { ScrollText, Trash2, Download, Copy, ChevronDown, ChevronRight, Clock } from "lucide-react";
 import { Button } from "./ui/button";
 import { toast } from "sonner";
 import { getAllSessions, deleteSession, formatSessionForAnalysis } from "../lib/agentLogger";
 import type { AgentSession, LoggedEvent } from "../lib/agentLogger";
+import { useSessionResultsStore } from "../store/sessionResults";
+import type { SessionResult } from "../store/sessionResults";
 
 function relativeTime(ts: number): string {
   const diff = Date.now() - ts;
@@ -154,6 +156,96 @@ function SessionRow({ session, onDelete }: { session: AgentSession; onDelete: ()
   );
 }
 
+function outcomeBadge(outcome: SessionResult["outcome"]): { label: string; className: string } {
+  switch (outcome) {
+    case "completed": return { label: "✓ done", className: "text-green-600" };
+    case "error": return { label: "✗ failed", className: "text-red-500" };
+    case "aborted": return { label: "aborted", className: "text-muted-foreground" };
+    case "hit_round_limit": return { label: "round limit", className: "text-amber-500" };
+  }
+}
+
+/**
+ * Unattended runs (scheduler / task-queue / subagents) go through
+ * runHeadlessTask and record into useSessionResultsStore — a completely
+ * different path from the interactive Code-tab sessions above (which log via
+ * agentLogger.ts). There was previously NO way to see what one of these runs
+ * actually did: the toast is a one-line, auto-dismissing summary. This is the
+ * only place to see the real per-tool-call steps and the real timestamp a
+ * scheduled job fired, e.g. to check it's actually firing on the interval you
+ * expect rather than guessing from the schedule's "next run" display.
+ */
+function UnattendedRunRow({ result }: { result: SessionResult }) {
+  const [expanded, setExpanded] = useState(false);
+  const badge = outcomeBadge(result.outcome);
+  const durSecs = Math.round((result.finishedAt - result.startedAt) / 1000);
+
+  return (
+    <div className="border-b last:border-b-0">
+      <button
+        type="button"
+        className="w-full flex items-start gap-2 px-4 py-3 hover:bg-muted/30 transition-colors text-left"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <div className="mt-0.5 text-muted-foreground shrink-0">
+          {expanded ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-xs text-foreground truncate">{result.task}</p>
+          <div className="flex items-center gap-2 mt-1 flex-wrap">
+            <span className="text-[10px] text-muted-foreground font-mono">{result.origin}</span>
+            <span className="text-[10px] text-muted-foreground" title={new Date(result.startedAt).toString()}>
+              {new Date(result.startedAt).toLocaleString()}
+            </span>
+            <span className="text-[10px] text-muted-foreground">{durSecs}s · {result.roundsUsed} round{result.roundsUsed !== 1 ? "s" : ""}</span>
+            <span className={`text-[10px] font-medium ${badge.className}`}>{badge.label}</span>
+          </div>
+        </div>
+      </button>
+
+      {expanded && (
+        <div className="px-4 pb-3 space-y-1 border-t bg-muted/10">
+          <p className="text-[10px] text-muted-foreground pt-2">{result.summary}</p>
+          {result.steps.length > 0 && (
+            <div className="space-y-0.5 max-h-72 overflow-y-auto py-1">
+              {result.steps.map((s, i) => (
+                <div key={i} className="text-[10px] font-mono text-foreground/80 pl-1">▶ {s}</div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function UnattendedRunsSection() {
+  const { results, clear } = useSessionResultsStore();
+  const sorted = [...results].sort((a, b) => b.startedAt - a.startedAt);
+
+  return (
+    <div className="border-b shrink-0">
+      <div className="px-4 py-2 flex items-center gap-2 bg-muted/20 border-b">
+        <Clock className="size-3.5 text-muted-foreground" />
+        <h3 className="text-xs font-medium">Unattended runs</h3>
+        <span className="text-[10px] text-muted-foreground">{sorted.length} (scheduler / task queue / subagents)</span>
+        {sorted.length > 0 && (
+          <Button size="sm" variant="outline" className="ml-auto h-6 text-[10px] text-destructive hover:bg-destructive/10" onClick={clear}>
+            Clear
+          </Button>
+        )}
+      </div>
+      {sorted.length === 0 ? (
+        <p className="text-[11px] text-muted-foreground px-4 py-3">No scheduled/queued/subagent runs yet.</p>
+      ) : (
+        <div className="max-h-64 overflow-y-auto divide-y">
+          {sorted.map((r) => <UnattendedRunRow key={r.id} result={r} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function AgentLogs() {
   const [sessions, setSessions] = useState<AgentSession[]>([]);
   const [loading, setLoading] = useState(true);
@@ -193,6 +285,8 @@ export function AgentLogs() {
           )}
         </div>
       </div>
+
+      <UnattendedRunsSection />
 
       <div className="border-b bg-muted/20 px-4 py-2 shrink-0">
         <p className="text-xs text-muted-foreground">

@@ -2,7 +2,6 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Brain, ChevronDown, ChevronRight } from "lucide-react";
-import { Card, CardContent } from "./ui/card";
 import { cn } from "./ui/utils";
 import type { ChatMessage } from "../lib/ollama";
 
@@ -10,6 +9,12 @@ interface Props {
   messages: ChatMessage[];
   isStreaming: boolean;
 }
+
+// Organic blob bubble radii — cycled by message position, from the Nucleus
+// design reference (designs/src/App.tsx USER_R / AI_R).
+const USER_R = ["20px 20px 3px 20px", "22px 20px 5px 20px", "20px 24px 3px 20px"];
+const AI_R = ["3px 20px 20px 20px", "5px 22px 20px 20px", "3px 20px 24px 20px"];
+const MSG_IN_ANIMATION = "msgIn 0.28s cubic-bezier(0.34, 1.3, 0.64, 1)";
 
 export function ChatMessages({ messages, isStreaming }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -67,11 +72,12 @@ export function ChatMessages({ messages, isStreaming }: Props) {
       onScroll={onScroll}
       className="flex-1 min-h-0 overflow-y-auto"
     >
-      <div className="w-full px-6 py-6 space-y-6">
+      <div className="max-w-3xl mx-auto px-6 py-6 space-y-6">
         {messages.map((msg, i) => (
           <MessageRow
             key={i}
             msg={msg}
+            index={i}
             isLast={i === messages.length - 1}
             isStreaming={isStreaming}
           />
@@ -132,15 +138,26 @@ function clamp(text: string): { text: string; clamped: boolean } {
 
 const MessageRow = memo(function MessageRow({
   msg,
+  index,
   isLast,
   isStreaming,
 }: {
   msg: ChatMessage;
+  index: number;
   isLast: boolean;
   isStreaming: boolean;
 }) {
   const [showFull, setShowFull] = useState(false);
   const isUser = msg.role === "user";
+
+  // Hooks must run unconditionally before any early return — rows are keyed by
+  // array index, so a slot's role can change on chat swap and the hook count
+  // must stay constant across renders.
+  const { text: displayContent, clamped } = useMemo(() => clamp(msg.content ?? ""), [msg.content]);
+  const rendered = useMemo(
+    () => (showFull ? sanitize(msg.content ?? "") : displayContent),
+    [showFull, msg.content, displayContent],
+  );
 
   // Tool result system messages — render as collapsible chip
   if (msg.role === "system" && msg.content.startsWith("[Tool result:")) {
@@ -167,23 +184,24 @@ const MessageRow = memo(function MessageRow({
       <div className="flex gap-3 justify-end">
         <div className="flex-1 max-w-2xl space-y-1 text-right">
           <div className="text-xs text-muted-foreground">You</div>
-          <Card className="inline-block text-left">
-            <CardContent className="p-3">
-              <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
-              {msg.images && msg.images.length > 0 && (
-                <div className="flex gap-1.5 mt-2 flex-wrap">
-                  {msg.images.map((b64, i) => (
-                    <img
-                      key={i}
-                      src={`data:image/png;base64,${b64}`}
-                      alt={`Attachment ${i + 1}`}
-                      className="size-16 object-cover rounded border border-border"
-                    />
-                  ))}
-                </div>
-              )}
-            </CardContent>
-          </Card>
+          <div
+            style={{ borderRadius: USER_R[index % 3], animation: MSG_IN_ANIMATION }}
+            className="inline-block text-left px-4 py-2.5 bg-primary text-primary-foreground"
+          >
+            <p className="text-sm whitespace-pre-wrap leading-[1.65]">{msg.content}</p>
+            {msg.images && msg.images.length > 0 && (
+              <div className="flex gap-1.5 mt-2 flex-wrap">
+                {msg.images.map((b64, i) => (
+                  <img
+                    key={i}
+                    src={`data:image/png;base64,${b64}`}
+                    alt={`Attachment ${i + 1}`}
+                    className="size-16 object-cover rounded border border-border"
+                  />
+                ))}
+              </div>
+            )}
+          </div>
         </div>
         <div className="size-8 rounded-full bg-accent border flex items-center justify-center shrink-0 mt-5">
           <span className="text-[10px] font-semibold text-accent-foreground">ME</span>
@@ -192,13 +210,10 @@ const MessageRow = memo(function MessageRow({
     );
   }
 
-  // Sanitizing/clamping a large tool-result message on every keystroke of a
-  // later streaming response is what causes the UI to lock up — memoize per-message.
-  const { text: displayContent, clamped } = useMemo(() => clamp(msg.content ?? ""), [msg.content]);
-  const rendered = useMemo(
-    () => (showFull ? sanitize(msg.content ?? "") : displayContent),
-    [showFull, msg.content, displayContent],
-  );
+  // Waiting for the first token: the placeholder assistant message has been
+  // added (content === "") but nothing has streamed in yet. Show the design's
+  // bouncing-dot indicator instead of an empty markdown block.
+  const isThinking = isLast && isStreaming && !msg.content?.trim();
 
   return (
     <div className="flex gap-3">
@@ -207,12 +222,34 @@ const MessageRow = memo(function MessageRow({
       </div>
       <div className="flex-1 space-y-1 min-w-0 overflow-hidden">
         <div className="text-xs text-muted-foreground">LocalMind Assistant</div>
-        <div className="prose prose-sm max-w-none prose-pre:bg-muted prose-pre:border prose-code:text-foreground prose-p:my-1.5 prose-headings:font-medium overflow-hidden">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>
-            {rendered || " "}
-          </ReactMarkdown>
-          {isLast && isStreaming && (
-            <span className="inline-block w-0.5 h-4 bg-foreground/40 animate-pulse ml-0.5 align-middle" />
+        <div
+          style={{ borderRadius: AI_R[index % 3], animation: MSG_IN_ANIMATION }}
+          className={cn(
+            "bg-card border border-border overflow-hidden",
+            isThinking
+              ? "px-4 py-3 inline-block"
+              : "px-4 py-2.5 prose prose-sm max-w-none prose-pre:bg-muted prose-pre:border prose-code:text-foreground prose-p:my-1.5 prose-headings:font-medium"
+          )}
+        >
+          {isThinking ? (
+            <div className="flex gap-1.5 items-center h-4">
+              {[0, 1, 2].map((i) => (
+                <span
+                  key={i}
+                  className="block w-1.5 h-1.5 rounded-full bg-muted-foreground/40"
+                  style={{ animation: "nbounce 1s ease-in-out infinite", animationDelay: `${i * 0.14}s` }}
+                />
+              ))}
+            </div>
+          ) : (
+            <>
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {rendered || " "}
+              </ReactMarkdown>
+              {isLast && isStreaming && (
+                <span className="inline-block w-0.5 h-4 bg-foreground/40 animate-pulse ml-0.5 align-middle" />
+              )}
+            </>
           )}
         </div>
         {clamped && !showFull && (

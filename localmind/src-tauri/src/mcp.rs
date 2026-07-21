@@ -10,6 +10,9 @@ type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>;
 struct StdioHandle {
     /// Send (json_request, reply_channel) to the writer task.
     sender: std::sync::mpsc::SyncSender<(String, oneshot::Sender<String>)>,
+    /// Rolling capture of the child's stderr, so a startup failure can be
+    /// surfaced to the user instead of a generic "exited unexpectedly".
+    stderr: Arc<Mutex<String>>,
 }
 
 static STDIO_SERVERS: OnceLock<Mutex<HashMap<String, StdioHandle>>> = OnceLock::new();
@@ -38,7 +41,7 @@ pub async fn mcp_start_server(
         .env("PATH", crate::effective_path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn MCP server '{cmd}': {e}"))?;
 
@@ -49,12 +52,33 @@ pub async fn mcp_start_server(
         .env("PATH", crate::effective_path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn MCP server '{cmd}': {e}"))?;
 
     let mut stdin = child.stdin.take().ok_or("No stdin on child process")?;
     let stdout = child.stdout.take().ok_or("No stdout on child process")?;
+    let stderr = child.stderr.take();
+
+    // Capture stderr into a rolling buffer (last ~4 KB) so startup failures —
+    // e.g. a missing OAuth credential or a bad package name — are visible.
+    let stderr_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    if let Some(stderr) = stderr {
+        let buf = Arc::clone(&stderr_buf);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(mut s) = buf.lock() {
+                    s.push_str(&line);
+                    s.push('\n');
+                    if s.len() > 8192 {
+                        let trimmed: String = s.chars().skip(s.chars().count().saturating_sub(4000)).collect();
+                        *s = trimmed;
+                    }
+                }
+            }
+        });
+    }
 
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
     let pending_reader = Arc::clone(&pending);
@@ -109,7 +133,7 @@ pub async fn mcp_start_server(
     });
 
     if let Ok(mut map) = servers().lock() {
-        map.insert(id, StdioHandle { sender: tx });
+        map.insert(id, StdioHandle { sender: tx, stderr: stderr_buf });
     }
 
     // Let the child run independently.
@@ -131,11 +155,12 @@ pub fn mcp_stop_server(id: String) {
 /// Send a JSON-RPC request to a running stdio server and return the response JSON.
 #[tauri::command]
 pub async fn mcp_send_request(id: String, request_json: String) -> Result<String, String> {
-    let sender = {
+    let (sender, stderr_buf) = {
         let map = servers().lock().map_err(|e| e.to_string())?;
-        map.get(&id)
-            .map(|h| h.sender.clone())
-            .ok_or_else(|| format!("MCP server '{id}' not running"))?
+        let h = map
+            .get(&id)
+            .ok_or_else(|| format!("MCP server '{id}' not running"))?;
+        (h.sender.clone(), Arc::clone(&h.stderr))
     };
 
     let (reply_tx, reply_rx) = oneshot::channel::<String>();
@@ -144,8 +169,30 @@ pub async fn mcp_send_request(id: String, request_json: String) -> Result<String
         .send((request_json, reply_tx))
         .map_err(|_| "MCP server channel closed".to_string())?;
 
-    tokio::time::timeout(std::time::Duration::from_secs(120), reply_rx)
-        .await
-        .map_err(|_| "MCP request timed out after 120s (server may still be downloading — try again in a moment)".to_string())?
-        .map_err(|_| "MCP server process exited unexpectedly — check that the command/package name is correct and that npx can reach npm".to_string())
+    match tokio::time::timeout(std::time::Duration::from_secs(120), reply_rx).await {
+        Err(_) => Err(
+            "MCP request timed out after 120s (server may still be downloading — try again in a moment)"
+                .to_string(),
+        ),
+        Ok(Ok(line)) => Ok(line),
+        // The reply channel was dropped → the server process exited before
+        // responding. Surface whatever it wrote to stderr so the user can see
+        // the real cause (missing OAuth credentials, bad package name, etc.).
+        Ok(Err(_)) => {
+            let captured = stderr_buf.lock().map(|s| s.trim().to_string()).unwrap_or_default();
+            if captured.is_empty() {
+                Err("MCP server exited before responding, with no error output. Check the command/package name and that npx can reach npm.".to_string())
+            } else {
+                let tail: String = captured
+                    .chars()
+                    .rev()
+                    .take(1000)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                Err(format!("MCP server exited on startup. Its error output:\n{tail}"))
+            }
+        }
+    }
 }

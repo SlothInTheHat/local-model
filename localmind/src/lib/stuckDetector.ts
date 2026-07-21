@@ -31,7 +31,7 @@ export function errorRecoveryHint(output: string): string | null {
   return null;
 }
 
-const REPEATABLE_TOOLS = new Set(["run_command", "web_search", "web_fetch", "install_deps"]);
+const REPEATABLE_TOOLS = new Set(["run_command", "web_search", "web_fetch", "install_deps", "schedule_task"]);
 const READ_ONLY_TOOLS = new Set(["read_file", "list_directory", "grep_files", "find_files"]);
 
 /**
@@ -107,7 +107,7 @@ export class StuckDetector {
     if (this.lastFingerprintCount >= StuckDetector.DUPLICATE_LIMIT) {
       this.lastFingerprint = "";
       this.lastFingerprintCount = 0;
-      return `[BLOCKED — LOOP] You called ${call.name} with identical arguments ${StuckDetector.DUPLICATE_LIMIT} times in a row. This call was NOT executed. Try something different — re-read the relevant file, or move to the next todo item.`;
+      return `[BLOCKED — LOOP] You called ${call.name} with identical arguments ${StuckDetector.DUPLICATE_LIMIT} times in a row. This call was NOT executed. Try something different — re-read the relevant file, or move to the next todo item. If you're blocked because a capability is missing, use register_tool (a shell one-liner) or propose_feature (an app change) instead of retrying.`;
     }
 
     // 5. Management-tool streak (planning without acting)

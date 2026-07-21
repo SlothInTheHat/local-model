@@ -2,39 +2,45 @@
 @plugin "@tailwindcss/typography";
 @custom-variant dark (&:is(.dark *));
 
+@theme {
+  --font-sans: 'DM Sans Variable', 'DM Sans', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+}
+
 :root {
   --font-size: 16px;
-  --background: #ffffff;
-  --foreground: oklch(0.145 0 0);
-  --card: #ffffff;
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: #030213;
-  --primary-foreground: oklch(1 0 0);
-  --secondary: oklch(0.95 0.0058 264.53);
-  --secondary-foreground: #030213;
-  --muted: #ececf0;
-  --muted-foreground: #717182;
-  --accent: #e9ebef;
-  --accent-foreground: #030213;
+  /* Warm paper palette — retuned from the Nucleus design reference. */
+  --background: #F0EDE7;
+  --foreground: #111111;
+  --card: #FAFAF9;
+  --card-foreground: #111111;
+  --popover: #FAFAF9;
+  --popover-foreground: #111111;
+  --primary: #0A0A0A;
+  --primary-foreground: #ffffff;
+  --secondary: #EAE6DE;
+  --secondary-foreground: #0A0A0A;
+  --muted: #E7E2D9;
+  --muted-foreground: #6B6660;
+  --accent: #E3DED4;
+  --accent-foreground: #0A0A0A;
   --destructive: #d4183d;
   --destructive-foreground: #ffffff;
-  --border: rgba(0, 0, 0, 0.1);
+  --border: rgba(0, 0, 0, 0.07);
   --input: transparent;
-  --input-background: #f3f3f5;
+  --input-background: #F5F3EE;
   --switch-background: #cbced4;
   --font-weight-medium: 500;
   --font-weight-normal: 400;
   --ring: oklch(0.708 0 0);
-  --radius: 0.625rem;
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: #030213;
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
+  --radius: 1rem;
+  --sidebar: #EAE6DE;
+  --sidebar-foreground: #111111;
+  --sidebar-primary: #0A0A0A;
+  --sidebar-primary-foreground: #FAFAF9;
+  --sidebar-accent: #E3DED4;
+  --sidebar-accent-foreground: #0A0A0A;
+  --sidebar-border: rgba(0, 0, 0, 0.07);
   --sidebar-ring: oklch(0.708 0 0);
 }
 
@@ -80,17 +86,72 @@
     box-sizing: border-box;
   }
 
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
   body {
     @apply bg-background text-foreground;
-    font-family: Inter, system-ui, -apple-system, sans-serif;
+    font-family: var(--font-sans);
     height: 100vh;
     overflow: hidden;
     margin: 0;
+  }
+
+  code,
+  pre,
+  kbd {
+    font-family: var(--font-mono);
   }
 
   #root {
     height: 100vh;
     width: 100%;
     display: flex;
+  }
+
+  /* Hidden scrollbars — the warm-paper design keeps chrome invisible */
+  ::-webkit-scrollbar {
+    display: none;
+  }
+
+  * {
+    scrollbar-width: none;
+  }
+}
+
+/* ─── Chat bubble / status-pill animations (Nucleus reference) ────────────── */
+
+@keyframes msgIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes ndot {
+  0%,
+  100% {
+    opacity: 0.25;
+    transform: scale(0.75);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes nbounce {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-4px);
   }
 }

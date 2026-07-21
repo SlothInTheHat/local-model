@@ -1,7 +1,100 @@
 use std::process::Command;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::collections::HashSet;
 use serde::Serialize;
+use tauri::Emitter;
+
+// ─── Workspace confinement (AD-3: confinement lives in Rust state) ────────────
+//
+// The native fs_* commands and run_command's cwd are confined to a set of
+// workspace roots the frontend registers via `register_workspace_root` when a
+// user opens a folder. Any path outside every registered root is refused.
+//
+// LIMITATION (documented honestly): run_command executes a shell, so the shell
+// itself can still touch anything on disk (absolute paths, network, etc.). The
+// confinement here only covers the *cwd* the command starts in and the fs_*
+// API surface — arbitrary shell side effects are gated by the user approval
+// dialog in the UI, not by this layer.
+
+/// Canonicalized roots the frontend has registered. A path is allowed iff it is
+/// inside (or equal to) one of these. Empty until a workspace is opened.
+static REGISTERED_ROOTS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn registered_roots() -> &'static Mutex<HashSet<PathBuf>> {
+    REGISTERED_ROOTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// True if `candidate` is inside (or equal to) any root. All paths must already
+/// be canonicalized. `starts_with` is component-wise, so `/foo/bar` is NOT
+/// considered inside `/foo/ba`.
+fn path_within_any(candidate: &Path, roots: &HashSet<PathBuf>) -> bool {
+    roots.iter().any(|r| candidate.starts_with(r))
+}
+
+/// Canonicalize a path that may not exist yet: canonicalize the nearest existing
+/// ancestor (which resolves any `..` and symlinks in the existing portion), then
+/// re-append the not-yet-existing trailing components. This closes `..` escape
+/// tricks while still allowing writes/mkdir to new paths under a root.
+fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
+    if let Ok(c) = dunce::canonicalize(path) {
+        return Some(c);
+    }
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path;
+    loop {
+        let parent = cur.parent()?;
+        let file = cur.file_name()?.to_os_string();
+        if let Ok(canon_parent) = dunce::canonicalize(parent) {
+            let mut result = canon_parent;
+            result.push(&file);
+            for comp in suffix.iter().rev() {
+                result.push(comp);
+            }
+            return Some(result);
+        }
+        suffix.push(file);
+        cur = parent;
+    }
+}
+
+/// Resolve `path` and ensure it is confined to a registered workspace root.
+/// Returns the canonical path on success, or a human-readable refusal error.
+fn ensure_confined(path: &str) -> Result<PathBuf, String> {
+    let target = canonicalize_lenient(Path::new(path))
+        .ok_or_else(|| format!("Path confinement: cannot resolve '{path}'"))?;
+    let guard = registered_roots()
+        .lock()
+        .map_err(|_| "Path confinement: roots lock poisoned".to_string())?;
+    if guard.is_empty() {
+        return Err(format!(
+            "Path confinement: no workspace root registered — refusing to access '{}'. Open a workspace folder first.",
+            target.display()
+        ));
+    }
+    if path_within_any(&target, &guard) {
+        Ok(target)
+    } else {
+        Err(format!(
+            "Path confinement: '{}' is outside the registered workspace root(s). Access denied.",
+            target.display()
+        ))
+    }
+}
+
+/// Register a workspace root the fs_* commands and run_command are allowed to
+/// touch. Called by the frontend whenever a user opens a folder. Canonicalizes
+/// so later confinement checks compare like-for-like.
+#[tauri::command]
+fn register_workspace_root(path: String) -> Result<(), String> {
+    let canon = dunce::canonicalize(&path)
+        .map_err(|e| format!("Cannot register workspace root '{path}': {e}"))?;
+    registered_roots()
+        .lock()
+        .map_err(|_| "roots lock poisoned".to_string())?
+        .insert(canon);
+    Ok(())
+}
 
 // ─── Ollama lifecycle ─────────────────────────────────────────────────────────
 
@@ -126,6 +219,88 @@ pub(crate) fn effective_path() -> &'static str {
 mod mcp;
 use mcp::{mcp_start_server, mcp_stop_server, mcp_send_request};
 
+mod transcribe;
+use transcribe::transcribe_video;
+
+mod db;
+use db::{
+    memory_upsert, memory_all, memory_delete, memory_touch,
+    jobs_insert, jobs_list, jobs_due, jobs_update_next, jobs_cancel,
+    session_insert, session_search,
+};
+
+mod tray;
+use tray::set_close_to_tray;
+
+mod os_tools;
+use os_tools::{open_application, list_windows, focus_window, take_screenshot};
+
+// ─── Generic HTTP fetch (used by the frontend for requests that would hit CORS
+// in the packaged webview, e.g. web search against DuckDuckGo) ────────────────
+
+const HTTP_FETCH_MAX_BYTES: u64 = 2 * 1024 * 1024; // 2MB cap on response body
+
+/// Fetch a URL from Rust (no CORS restrictions apply here) and return the body
+/// as text. Used by src/lib/search.ts when running inside Tauri so packaged
+/// builds can reach DuckDuckGo directly instead of relying on the Vite dev-only
+/// proxy paths (`/ddg-search`, `/ddg-lite`, `/ddg-html`).
+#[tauri::command]
+fn http_fetch(
+    url: String,
+    method: Option<String>,
+    body: Option<String>,
+    headers: Option<Vec<(String, String)>>,
+) -> Result<String, String> {
+    use std::io::Read;
+
+    let method = method.unwrap_or_else(|| "GET".to_string()).to_uppercase();
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(20))
+        .build();
+
+    let mut req = agent.request(&method, &url);
+
+    let mut has_user_agent = false;
+    if let Some(hdrs) = &headers {
+        for (k, v) in hdrs {
+            if k.eq_ignore_ascii_case("user-agent") {
+                has_user_agent = true;
+            }
+            req = req.set(k, v);
+        }
+    }
+    // Some endpoints (DuckDuckGo included) 403 requests with no/odd User-Agent.
+    if !has_user_agent {
+        req = req.set(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        );
+    }
+
+    let result = match &body {
+        Some(b) => req.send_string(b),
+        None => req.call(),
+    };
+
+    match result {
+        Ok(resp) => {
+            let mut reader = resp.into_reader().take(HTTP_FETCH_MAX_BYTES);
+            let mut buf = String::new();
+            reader
+                .read_to_string(&mut buf)
+                .map_err(|e| format!("http_fetch: failed reading response body: {e}"))?;
+            Ok(buf)
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let body_text = resp.into_string().unwrap_or_default();
+            let snippet: String = body_text.chars().take(300).collect();
+            Err(format!("http_fetch: HTTP {code}: {snippet}"))
+        }
+        Err(e) => Err(format!("http_fetch: request failed: {e}")),
+    }
+}
+
 // ─── Native file system commands (used instead of File System Access API) ────
 
 #[derive(Serialize)]
@@ -138,21 +313,24 @@ pub struct FsEntry {
 /// Read a file as UTF-8 text.
 #[tauri::command]
 fn fs_read_file(path: String) -> Result<String, String> {
-    std::fs::read_to_string(&path).map_err(|e| e.to_string())
+    let p = ensure_confined(&path)?;
+    std::fs::read_to_string(&p).map_err(|e| e.to_string())
 }
 
 /// Write text content to a file (creates parent directories as needed).
 #[tauri::command]
 fn fs_write_file(path: String, content: String) -> Result<(), String> {
-    if let Some(parent) = std::path::Path::new(&path).parent() {
+    let p = ensure_confined(&path)?;
+    if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::write(&path, content.as_bytes()).map_err(|e| e.to_string())
+    std::fs::write(&p, content.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// List immediate children of a directory.
 #[tauri::command]
 fn fs_list_dir(path: String) -> Result<Vec<FsEntry>, String> {
+    let path = ensure_confined(&path)?;
     let rd = std::fs::read_dir(&path).map_err(|e| e.to_string())?;
     let mut entries = Vec::new();
     for item in rd.flatten() {
@@ -172,7 +350,8 @@ fn fs_list_dir(path: String) -> Result<Vec<FsEntry>, String> {
 /// Delete a file or directory.
 #[tauri::command]
 fn fs_delete(path: String, recursive: bool) -> Result<(), String> {
-    let p = std::path::Path::new(&path);
+    let p = ensure_confined(&path)?;
+    let p = p.as_path();
     if p.is_dir() {
         if recursive {
             std::fs::remove_dir_all(p).map_err(|e| e.to_string())
@@ -185,6 +364,11 @@ fn fs_delete(path: String, recursive: bool) -> Result<(), String> {
 }
 
 /// Return true if the path exists on disk.
+///
+/// Intentionally left UNCONFINED: this is read-only and is used to validate a
+/// remembered workspace path *before* it can be opened/registered (see
+/// openWorkspaceByPath in src/lib/fileSystem.ts). Confining it would create a
+/// chicken-and-egg problem (you cannot register a root you cannot first check).
 #[tauri::command]
 fn fs_exists(path: String) -> bool {
     std::path::Path::new(&path).exists()
@@ -193,13 +377,15 @@ fn fs_exists(path: String) -> bool {
 /// Create a directory (and all parents).
 #[tauri::command]
 fn fs_mkdir(path: String) -> Result<(), String> {
-    std::fs::create_dir_all(&path).map_err(|e| e.to_string())
+    let p = ensure_confined(&path)?;
+    std::fs::create_dir_all(&p).map_err(|e| e.to_string())
 }
 
 /// Read a file as a base64-encoded string (used for inlining binary assets in HTML preview).
 #[tauri::command]
 fn fs_read_file_base64(path: String) -> Result<String, String> {
-    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let p = ensure_confined(&path)?;
+    let bytes = std::fs::read(&p).map_err(|e| e.to_string())?;
     Ok(base64_encode(&bytes))
 }
 
@@ -253,44 +439,87 @@ fn open_workspace_dialog() -> Option<String> {
         .map(|p| p.to_string_lossy().to_string())
 }
 
-/// Canonicalize a path, returning None if it does not exist.
-fn try_canonicalize(p: &str) -> Option<PathBuf> {
-    Path::new(p).canonicalize().ok()
+/// Split a command string on top-level `&&` (outside single/double quotes),
+/// returning the trimmed segments. PowerShell backtick escapes inside double
+/// quotes are preserved verbatim so a `&&` cannot hide behind an escape.
+fn split_top_level_and(cmd: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut cur = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = cmd.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_double && c == '`' {
+            // PowerShell escape inside double quotes: keep escape + next char.
+            cur.push(c);
+            if let Some(n) = chars.next() { cur.push(n); }
+            continue;
+        }
+        match c {
+            '\'' if !in_double => { in_single = !in_single; cur.push(c); }
+            '"' if !in_single => { in_double = !in_double; cur.push(c); }
+            '&' if !in_single && !in_double && chars.peek() == Some(&'&') => {
+                chars.next(); // consume the second '&'
+                segments.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(c),
+        }
+    }
+    segments.push(cur.trim().to_string());
+    segments
 }
 
-/// Check that `candidate` is inside `root` (both must be canonicalized first).
-fn is_within(root: &Path, candidate: &Path) -> bool {
-    candidate.starts_with(root)
+/// Translate `A && B && C` into PowerShell that short-circuits on failure:
+/// `A; if ($?) { B; if ($?) { C } }`.
+///
+/// Windows PowerShell 5.1 (which we invoke as `powershell`) does not support the
+/// `&&` operator at all, and the previous naive `" && " -> " ; "` rewrite was
+/// wrong: `;` runs the next command even when the first fails (silently breaking
+/// `build && deploy` guards) and it also corrupted `&&` appearing inside quoted
+/// strings. This quote-aware, short-circuiting translation fixes both (S5).
+fn translate_and_for_powershell(cmd: &str) -> String {
+    let segments = split_top_level_and(cmd);
+    if segments.len() <= 1 {
+        return cmd.to_string();
+    }
+    // Build nested if-blocks from the inside out so a failure at any stage stops
+    // every later stage (a flat `; if ($?)` chain would not short-circuit).
+    let mut iter = segments.into_iter().rev();
+    let mut acc = iter.next().unwrap();
+    for seg in iter {
+        acc = format!("{seg}; if ($?) {{ {acc} }}");
+    }
+    acc
 }
 
-/// Run a shell command, optionally sandboxed to a workspace root.
-/// If workspace_root is provided:
-///   - the cwd must be inside the root before running
-///   - if a `cd` causes the new cwd to escape, it is reset to the root and
-///     sandbox_blocked = true is returned
+/// Run a shell command, confined to a registered workspace root.
+///
+/// The starting cwd must be inside a registered root (defaults to the first
+/// registered root when the caller omits it). If a leading `cd` moves the
+/// resulting cwd outside every root, it is reset to a root and
+/// sandbox_blocked = true is returned. See the confinement LIMITATION note near
+/// REGISTERED_ROOTS: the shell can still touch arbitrary paths itself; this only
+/// bounds the cwd and is backed by the UI approval gate.
 #[tauri::command]
 fn run_command(
     cmd: String,
     cwd: Option<String>,
-    workspace_root: Option<String>,
 ) -> Result<CommandResult, String> {
-    let work_dir_str = cwd.as_deref().filter(|s| !s.is_empty()).unwrap_or(".");
+    // Default cwd to the first registered root when the model omits it.
+    let default_root: Option<String> = registered_roots()
+        .lock()
+        .ok()
+        .and_then(|g| g.iter().next().map(|p| p.to_string_lossy().to_string()));
+    let work_dir_owned: String = cwd
+        .filter(|s| !s.is_empty())
+        .or(default_root)
+        .unwrap_or_else(|| ".".to_string());
+    let work_dir_str = work_dir_owned.as_str();
 
-    // Resolve and validate cwd against workspace root before running
-    if let Some(ref root_str) = workspace_root {
-        if let (Some(abs_root), Some(abs_cwd)) = (
-            try_canonicalize(root_str),
-            try_canonicalize(work_dir_str),
-        ) {
-            if !is_within(&abs_root, &abs_cwd) {
-                return Err(format!(
-                    "Workspace sandbox: '{}' is outside the workspace root '{}'",
-                    abs_cwd.display(),
-                    abs_root.display()
-                ));
-            }
-        }
-    }
+    // Confine the starting cwd to a registered root before running anything.
+    let work_dir_canon = ensure_confined(work_dir_str)?;
+    let work_dir_str = work_dir_canon.to_str().unwrap_or(work_dir_str);
 
     // Run with a 30-second timeout so GUI apps (OpenCV, pygame, etc.) don't block forever.
     // Uses std::process::Child so cwd is always respected (tokio jobs ignore cwd).
@@ -301,7 +530,7 @@ fn run_command(
     #[cfg(target_os = "windows")]
     let output = {
         use std::process::Stdio;
-        let ps_cmd = cmd.replace(" && ", " ; ");
+        let ps_cmd = translate_and_for_powershell(&cmd);
         let child = Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
             .env("PATH", effective_path())
@@ -383,19 +612,26 @@ fn run_command(
         .canonicalize()
         .unwrap_or_else(|_| Path::new(work_dir_str).to_path_buf());
 
-    // Enforce sandbox on the resulting cwd
-    let (final_cwd, sandbox_blocked) = if let Some(ref root_str) = workspace_root {
-        if let Some(abs_root) = try_canonicalize(root_str) {
-            if !is_within(&abs_root, &new_cwd_canon) {
-                (abs_root.to_string_lossy().to_string(), true)
-            } else {
-                (new_cwd_canon.to_string_lossy().to_string(), false)
+    // Enforce confinement on the resulting cwd: if a `cd` escaped every root,
+    // reset to a registered root and flag sandbox_blocked.
+    let (final_cwd, sandbox_blocked) = {
+        let guard = registered_roots().lock().ok();
+        match guard {
+            Some(roots) if !roots.is_empty() => {
+                if path_within_any(&new_cwd_canon, &roots) {
+                    (new_cwd_canon.to_string_lossy().to_string(), false)
+                } else {
+                    // Escaped every root — reset to a registered root.
+                    let fallback = roots
+                        .iter()
+                        .next()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| work_dir_str.to_string());
+                    (fallback, true)
+                }
             }
-        } else {
-            (new_cwd_canon.to_string_lossy().to_string(), false)
+            _ => (new_cwd_canon.to_string_lossy().to_string(), false),
         }
-    } else {
-        (new_cwd_canon.to_string_lossy().to_string(), false)
     };
 
     Ok(CommandResult {
@@ -642,12 +878,218 @@ fn query_gpu_info() -> Vec<GpuInfo> {
     vec![]
 }
 
+// ─── Background scheduler (WP2.2) ──────────────────────────────────────────
+//
+// Ticks every 30s: finds due jobs (SQLite `jobs` table, status='active' AND
+// next_run_at <= now), emits a `job-due` event per job (id + spec — the
+// frontend owns interpreting `spec` and actually running the agent task via
+// the headless runtime; per AD-6 the tick only ever emits events + updates
+// the DB, it never runs agent work itself), then advances each job's
+// next_run_at/status:
+//   - "interval:<secs>"  -> next_run_at = (previous) next_run_at + secs*1000,
+//                           stays active. Anchored on the job's own prior
+//                           schedule point rather than `now` so tick latency
+//                           (up to SCHEDULER_TICK_SECS) and job-processing
+//                           time never compound into drift across firings —
+//                           only whether we happened to catch the anchor
+//                           within this tick's granularity, not when the tick
+//                           ran, decides the next fire time. If we're behind
+//                           by more than one interval (app was closed, or a
+//                           tick landed unusually late), whole missed
+//                           occurrences are skipped — never rapid-fired — to
+//                           land on the first anchor point strictly after
+//                           now; see `compute_next_run`.
+//   - "once:<unix_secs>" -> status becomes "done" (fires once, never again)
+//   - "cron:<expr>"      -> next occurrence computed via the `cron` crate;
+//                           a bare 5-field expression (no seconds field) is
+//                           normalized by prepending "0 " since the `cron`
+//                           crate's parser requires a leading seconds field.
+//
+// All timestamps in the `jobs` table (`next_run_at`, and the ms-since-epoch
+// values schedule descriptors are computed against) are milliseconds since
+// the Unix epoch — the same unit as `db::now_ms()` and JS `Date.now()` — so
+// the TS side (src/lib/scheduler.ts, src/lib/tools.ts) never has to convert.
+//
+// Catch-up policy: a job whose next_run_at is more than 24h in the past is
+// NOT fired (it's treated as stale/abandoned while the app was closed) — its
+// next_run_at is rolled forward without emitting `job-due`. Jobs overdue by
+// less than 24h (the common case: app closed overnight) DO fire once on the
+// next tick after launch, then resume their normal cadence.
+const SCHEDULER_TICK_SECS: u64 = 30;
+const CATCH_UP_LIMIT_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Parse the `schedule` field out of a job's opaque JSON `spec` string.
+/// Returns None if the JSON is malformed or the field is missing.
+fn extract_schedule(spec: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(spec).ok()?;
+    v.get("schedule")?.as_str().map(|s| s.to_string())
+}
+
+/// Compute (next_run_at_ms, status) for a job that just fired (or was
+/// skipped for being too stale), given its schedule descriptor, the job's
+/// previous `next_run_at` (the anchor its cadence is measured from), and the
+/// current time in ms since epoch.
+fn compute_next_run(schedule: &str, prev_next_run_at: i64, now_ms: i64) -> (i64, String) {
+    if let Some(rest) = schedule.strip_prefix("interval:") {
+        let secs: i64 = rest.trim().parse().unwrap_or(3600);
+        let step = secs.max(1) * 1000;
+        // Anchor on the PREVIOUS scheduled point, not `now` — otherwise every
+        // firing is pushed back by however late the tick/processing was, and
+        // that lateness compounds cycle over cycle (a 60s job drifting to
+        // 60-90s and wandering further with each tick).
+        let mut next = prev_next_run_at + step;
+        if next <= now_ms {
+            // We're behind by one or more whole intervals (app was closed, or
+            // a tick ran later than a full `step`) — skip the missed
+            // occurrences rather than rapid-firing catch-up ticks. Land on
+            // the first anchor point strictly after `now` (integer ceil-div;
+            // `next > now_ms` holds for any step >= 1 and diff >= 1).
+            let diff = now_ms - next + 1;
+            let missed = (diff + step - 1) / step;
+            next += missed * step;
+        }
+        return (next, "active".to_string());
+    }
+    if schedule.starts_with("once:") {
+        // One-shot jobs never reschedule — mark done regardless of the
+        // timestamp (it has already fired, by definition, once we get here).
+        return (now_ms, "done".to_string());
+    }
+    if let Some(expr) = schedule.strip_prefix("cron:") {
+        if let Some(next) = compute_next_cron(expr.trim(), now_ms) {
+            return (next, "active".to_string());
+        }
+        // Unparseable cron expression — don't wedge the job into a tight
+        // retry loop; push it an hour out and let the tick try again later
+        // (the job stays visible/editable rather than silently vanishing).
+        eprintln!("[scheduler] could not parse cron expression '{expr}', deferring 1h");
+        return (now_ms + 60 * 60 * 1000, "active".to_string());
+    }
+    eprintln!("[scheduler] unrecognized schedule descriptor '{schedule}', deferring 1h");
+    (now_ms + 60 * 60 * 1000, "active".to_string())
+}
+
+/// Compute the next cron occurrence strictly after `now_ms`, returned as ms
+/// since epoch. Accepts either a standard 5-field expression (min hour dom
+/// month dow) or a 6-field one with a leading seconds field.
+fn compute_next_cron(expr: &str, now_ms: i64) -> Option<i64> {
+    use std::str::FromStr;
+    let field_count = expr.split_whitespace().count();
+    let normalized = if field_count == 5 { format!("0 {expr}") } else { expr.to_string() };
+    let schedule = cron::Schedule::from_str(&normalized).ok()?;
+    let after = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms)?;
+    let next = schedule.after(&after).next()?;
+    Some(next.timestamp_millis())
+}
+
+// ─── Ollama watchdog ────────────────────────────────────────────────────────
+//
+// ensure_ollama_running() previously only ran once at app startup. If the
+// Ollama server crashes/hangs later (observed under VRAM thrash from
+// concurrent generations), nothing brought it back until the user restarted
+// the app. Piggyback a health check onto the existing 30s scheduler tick
+// instead of spawning a second timer loop.
+//
+// Debounced: a single failed TCP connect could just be a transient hiccup
+// (the connect_timeout is only 300ms), so we require two consecutive down
+// ticks — i.e. Ollama unreachable for a sustained ~30s+ — before restarting.
+// This does NOT get confused by a slow model load: the health check only
+// tests whether something is listening on the port, which happens as soon as
+// `ollama serve` binds, well before any model weights are loaded.
+static WATCHDOG_DOWN_STREAK: OnceLock<Mutex<u32>> = OnceLock::new();
+
+fn watchdog_check() {
+    let streak_lock = WATCHDOG_DOWN_STREAK.get_or_init(|| Mutex::new(0));
+
+    if is_ollama_running() {
+        if let Ok(mut streak) = streak_lock.lock() {
+            *streak = 0;
+        }
+        return;
+    }
+
+    let Ok(mut streak) = streak_lock.lock() else { return };
+    *streak += 1;
+    if *streak >= 2 {
+        eprintln!(
+            "[watchdog] Ollama unreachable on 127.0.0.1:11434 for {} consecutive checks — restarting",
+            *streak
+        );
+        ensure_ollama_running();
+        *streak = 0;
+    }
+}
+
+/// Run a single scheduler tick: query due jobs and process each. Errors are
+/// logged, never propagated — a broken tick must never crash the app.
+fn run_scheduler_tick(app: &tauri::AppHandle) {
+    watchdog_check();
+
+    let db = match db::get_db_for_tick(app) {
+        Ok(db) => db,
+        Err(e) => { eprintln!("[scheduler] cannot open db: {e}"); return; }
+    };
+    let conn = match db.lock() {
+        Ok(c) => c,
+        Err(_) => { eprintln!("[scheduler] db lock poisoned"); return; }
+    };
+    let now = db::now_ms();
+    let due = match db::jobs_due_at(&conn, now) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("[scheduler] jobs_due_at failed: {e}"); return; }
+    };
+    for job in due {
+        let Some(schedule) = extract_schedule(&job.spec) else {
+            eprintln!("[scheduler] job {} has an unparseable spec, skipping this tick", job.id);
+            continue;
+        };
+        let overdue_ms = now - job.next_run_at;
+        if overdue_ms > CATCH_UP_LIMIT_MS {
+            eprintln!(
+                "[scheduler] job {} overdue by >{}h, skipping fire and rolling forward",
+                job.id,
+                CATCH_UP_LIMIT_MS / 3_600_000
+            );
+        } else if let Err(e) = app.emit("job-due", &job) {
+            eprintln!("[scheduler] failed to emit job-due for {}: {e}", job.id);
+        }
+        let (next_run_at, status) = compute_next_run(&schedule, job.next_run_at, now);
+        if let Err(e) = db::jobs_update_next_conn(&conn, &job.id, next_run_at, &status) {
+            eprintln!("[scheduler] failed to update job {}: {e}", job.id);
+        }
+    }
+}
+
+/// Spawn the background scheduler loop (WP2.2). Ticks every
+/// SCHEDULER_TICK_SECS for the lifetime of the app; see `run_scheduler_tick`
+/// for the per-tick logic. Kept intentionally lightweight (DB query + event
+/// emit only) — all agent execution happens in TS (AD-6).
+fn spawn_scheduler(app_handle: tauri::AppHandle) {
+    // Use Tauri's managed Tokio runtime, not bare `tokio::spawn`: this runs from
+    // the `setup()` hook where no Tokio reactor is entered on the current thread,
+    // so `tokio::spawn`/`tokio::time::interval` would panic ("no reactor running").
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(SCHEDULER_TICK_SECS));
+        // Default `Burst` would fire this loop back-to-back for every missed
+        // tick after a long stall (laptop suspend) — wasted DB queries, and
+        // pointless besides, since compute_next_run anchors each job's next
+        // fire off its own prior next_run_at rather than tick timing, so a
+        // single post-wake tick already catches every job up correctly.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            run_scheduler_tick(&app_handle);
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             open_workspace_dialog,
+            register_workspace_root,
             run_command,
             get_cwd,
             get_system_info,
@@ -655,6 +1097,7 @@ pub fn run() {
             mcp_start_server,
             mcp_stop_server,
             mcp_send_request,
+            transcribe_video,
             fs_read_file,
             fs_write_file,
             fs_list_dir,
@@ -662,11 +1105,72 @@ pub fn run() {
             fs_exists,
             fs_mkdir,
             fs_read_file_base64,
+            memory_upsert,
+            memory_all,
+            memory_delete,
+            memory_touch,
+            jobs_insert,
+            jobs_list,
+            jobs_due,
+            jobs_update_next,
+            jobs_cancel,
+            session_insert,
+            session_search,
+            http_fetch,
+            set_close_to_tray,
+            open_application,
+            list_windows,
+            focus_window,
+            take_screenshot,
         ])
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--hidden"]),
+        ))
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    // Any registered shortcut lands here; we only register one
+                    // (Ctrl+Shift+Space) so no need to match on `_shortcut`.
+                    // Fire on key-down only — HotKeyState::Released would
+                    // otherwise toggle the window twice per press.
+                    if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        tray::toggle_main_window(app);
+                    }
+                })
+                .build(),
+        )
         .setup(|app| {
             // Start Ollama in a background thread so the UI loads immediately.
             // If Ollama is already running (user-managed), this is a no-op.
             std::thread::spawn(ensure_ollama_running);
+
+            // WP2.2: background job scheduler — ticks every 30s and emits
+            // `job-due` events for due jobs; src/lib/scheduler.ts listens and
+            // executes them via the headless agent runtime (AD-6: the tick
+            // lives in Rust, execution lives in TS).
+            spawn_scheduler(app.handle().clone());
+
+            // WP5.1: tray icon, right-click menu, and close-to-tray window
+            // interception. See tray.rs.
+            if let Err(e) = tray::init(app.handle()) {
+                eprintln!("[tray] failed to initialize system tray: {e}");
+            }
+
+            // WP5.1: global hotkey (Ctrl+Shift+Space) to show/hide the main
+            // window from anywhere in the OS. Registration can fail if
+            // another app already owns the combo — log and keep going rather
+            // than crash, per the plugin's own advice that shortcuts are
+            // "inherently dangerous" to assume exclusive ownership of.
+            {
+                use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
+                let hotkey = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
+                if let Err(e) = app.global_shortcut().register(hotkey) {
+                    eprintln!("[hotkey] could not register Ctrl+Shift+Space (likely owned by another app): {e}");
+                }
+            }
 
             #[cfg(debug_assertions)]
             {
@@ -692,4 +1196,128 @@ pub fn run() {
                 }
             }
         });
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roots(paths: &[&str]) -> HashSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    // ── Path containment (WP0.1: S3 confinement logic) ───────────────────────
+    #[test]
+    fn within_root_is_allowed() {
+        let r = roots(&["/home/user/ws"]);
+        assert!(path_within_any(Path::new("/home/user/ws"), &r));
+        assert!(path_within_any(Path::new("/home/user/ws/src/main.rs"), &r));
+    }
+
+    #[test]
+    fn outside_root_is_refused() {
+        let r = roots(&["/home/user/ws"]);
+        assert!(!path_within_any(Path::new("/etc/passwd"), &r));
+        assert!(!path_within_any(Path::new("/home/user"), &r));
+    }
+
+    #[test]
+    fn sibling_prefix_is_not_confused_for_child() {
+        // "/home/user/ws" must NOT contain "/home/user/ws-secret" (component-wise).
+        let r = roots(&["/home/user/ws"]);
+        assert!(!path_within_any(Path::new("/home/user/ws-secret/data"), &r));
+    }
+
+    #[test]
+    fn multiple_roots_any_match() {
+        let r = roots(&["/a/proj1", "/b/proj2"]);
+        assert!(path_within_any(Path::new("/b/proj2/file"), &r));
+        assert!(!path_within_any(Path::new("/c/other"), &r));
+    }
+
+    // ── && translation (WP0.5: S5 PowerShell chaining) ───────────────────────
+    #[test]
+    fn single_command_is_untouched() {
+        assert_eq!(translate_and_for_powershell("echo hi"), "echo hi");
+    }
+
+    #[test]
+    fn and_becomes_short_circuit() {
+        // `false && echo hi` must guard echo behind success, so hi is not printed.
+        assert_eq!(
+            translate_and_for_powershell("false && echo hi"),
+            "false; if ($?) { echo hi }"
+        );
+    }
+
+    #[test]
+    fn chained_and_nests_right() {
+        assert_eq!(
+            translate_and_for_powershell("a && b && c"),
+            "a; if ($?) { b; if ($?) { c } }"
+        );
+    }
+
+    #[test]
+    fn and_inside_quotes_is_not_split() {
+        // The `&&` here is data, not an operator — it must survive verbatim.
+        assert_eq!(
+            translate_and_for_powershell("echo \"a && b\""),
+            "echo \"a && b\""
+        );
+        assert_eq!(
+            translate_and_for_powershell("echo 'x && y'"),
+            "echo 'x && y'"
+        );
+    }
+
+    #[test]
+    fn split_counts_top_level_segments() {
+        assert_eq!(split_top_level_and("a && b").len(), 2);
+        assert_eq!(split_top_level_and("echo \"a && b\"").len(), 1);
+        assert_eq!(split_top_level_and("single").len(), 1);
+    }
+
+    // ── Scheduler interval anchoring (drift fix) ─────────────────────────────
+    #[test]
+    fn interval_advances_from_previous_anchor_not_now() {
+        // Tick ran late (processed 25s after the anchor) — next_run_at must
+        // still be prev + interval, not now + interval, or lateness compounds.
+        let prev_anchor = 1_000_000_i64;
+        let now = prev_anchor + 25_000; // tick fired 25s late
+        let (next, status) = compute_next_run("interval:60", prev_anchor, now);
+        assert_eq!(next, prev_anchor + 60_000);
+        assert_eq!(status, "active");
+    }
+
+    #[test]
+    fn interval_behind_by_three_lands_on_first_future_anchor() {
+        // App was asleep well past several 60s anchors. The original anchor
+        // sequence from prev_anchor=0 is 60_000, 120_000, 180_000, 240_000...
+        // now=185_000 falls between the 3rd (180_000) and 4th (240_000), so
+        // the first anchor strictly after now is 240_000 — occurrences at
+        // 60_000/120_000/180_000 must be skipped, not rapid-fired.
+        let prev_anchor = 0_i64;
+        let now = 185_000_i64;
+        let (next, _status) = compute_next_run("interval:60", prev_anchor, now);
+        assert_eq!(next, 240_000);
+    }
+
+    #[test]
+    fn interval_next_run_is_always_strictly_after_now() {
+        // Sweep a range of "how late did we catch this" offsets, including
+        // exact anchor hits and multi-interval overruns, and confirm the
+        // invariant compute_next_run relies on (next > now) always holds.
+        let step = 60_000_i64;
+        let prev_anchor = 1_700_000_000_000_i64;
+        for behind in [0_i64, 1, 59_999, 60_000, 60_001, 125_001, 999_999] {
+            let now = prev_anchor + behind;
+            let (next, _status) = compute_next_run("interval:60", prev_anchor, now);
+            assert!(
+                next > now,
+                "next ({next}) must be strictly after now ({now}) for behind={behind}"
+            );
+        }
+    }
 }
