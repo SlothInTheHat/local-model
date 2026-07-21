@@ -392,7 +392,7 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
   },
   {
     name: "open_application",
-    description: "Launch an application, file, or URL by name/path using the OS shell (like typing it into Start/Spotlight). Does not resolve or validate the name — the OS handles lookup.",
+    description: "Launch an application, file, or URL by name/path using the OS shell (like typing it into Start/Spotlight). Does not resolve or validate the name — the OS handles lookup. On Windows, the display name in the Start menu is often NOT the executable name: use 'mspaint' for Paint, 'calc' for Calculator, 'cmd' for Command Prompt, 'notepad' for Notepad, 'explorer' for File Explorer. If a call fails or the app doesn't appear, retry once with the likely executable name — do not go searching the workspace filesystem for it.",
     parameters: {
       type: "object",
       properties: {

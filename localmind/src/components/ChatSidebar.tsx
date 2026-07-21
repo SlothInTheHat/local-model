@@ -233,7 +233,8 @@ export function ChatSidebar({ view, onViewChange, selectedModel, onModelChange, 
  * Recent-chats list: search filter, MAX_VISIBLE_CHATS cap, "+N more — search
  * to find them" button, and ConversationItem rows. Lifted out of the retired
  * sidebar layout so both the old aside (unused, kept for reference) and the
- * new Nucleus chat drawer (see ChatDrawer.tsx) share the exact same logic.
+ * persistent chat-view panel (see ChatSidePanel.tsx) share the exact same
+ * logic.
  */
 export function RecentChatsPanel({
   selectedModel,

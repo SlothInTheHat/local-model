@@ -46,6 +46,30 @@ export function isOllamaModel(ref: string): boolean {
   return parseModelRef(ref).providerId === "ollama";
 }
 
+/**
+ * Turn a failed OpenAI-compatible response into a concise, human-readable
+ * message. Reads the JSON error body (OpenRouter/OpenAI both send
+ * `{error:{message}}`) instead of surfacing a bare status code, and
+ * special-cases 429 — the most common failure under an agent loop's rapid
+ * back-to-back requests, especially on free-tier models.
+ */
+async function describeProviderError(res: Response): Promise<string> {
+  const body = await res.text().catch(() => "");
+  let detail = "";
+  try {
+    const json = JSON.parse(body) as { error?: { message?: string } | string; message?: string };
+    detail = (typeof json.error === "string" ? json.error : json.error?.message) ?? json.message ?? "";
+  } catch {
+    detail = body.trim();
+  }
+  detail = detail.slice(0, 300);
+
+  if (res.status === 429) {
+    return `Provider is rate-limiting this request (429)${detail ? `: ${detail}` : ""} — common on free-tier models when an agent loop fires requests back-to-back; wait a moment, or switch to a paid/local model.`;
+  }
+  return detail ? `Provider error ${res.status}: ${detail}` : `Provider error ${res.status}`;
+}
+
 // ─── OpenAI-compatible streaming chat ────────────────────────────────────────
 
 export async function* streamChatOpenAI(
@@ -74,8 +98,7 @@ export async function* streamChatOpenAI(
   });
 
   if (!res.ok) {
-    const body = await res.text().catch(() => `HTTP ${res.status}`);
-    throw new Error(`${res.status}: ${body}`);
+    throw new Error(await describeProviderError(res));
   }
   if (!res.body) throw new Error("No response body");
 
@@ -167,7 +190,7 @@ export async function* runAgentTurnOpenAI(
   }
 
   if (!res.ok) {
-    yield { type: "error", error: `Provider error ${res.status}` };
+    yield { type: "error", error: await describeProviderError(res) };
     return;
   }
   if (!res.body) {

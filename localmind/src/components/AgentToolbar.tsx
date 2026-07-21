@@ -1,4 +1,5 @@
-import { FolderOpen, Pencil, Trash2, List, Calculator, Globe, TerminalSquare, Info, GitBranch, Plug } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { FolderOpen, Pencil, Trash2, List, Calculator, Globe, TerminalSquare, Info, GitBranch, Plug, SlidersHorizontal } from "lucide-react";
 import { cn } from "./ui/utils";
 import type { ToolName } from "../lib/tools";
 import { useMcpStore } from "../store/mcp";
@@ -17,7 +18,16 @@ interface ToolButton {
   group?: "git";
 }
 
+/**
+ * Agent tool settings. Used to render the full tool-toggle list inline
+ * (very cluttered per user feedback); now it's a single small icon button
+ * (with a "N enabled" badge) that opens a popover containing the exact same
+ * toggles. All handlers (onToggle/onOpenDir) are unchanged — only the
+ * presentation moved behind the trigger. Closes on outside-click and Escape.
+ */
 export function AgentToolbar({ enabled, onToggle, dirHandle, onOpenDir }: Props) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
   const allServers = useMcpStore((s) => s.servers);
   const mcpServers = allServers.filter((sv) => sv.enabled && sv.status === "connected");
 
@@ -40,56 +50,105 @@ export function AgentToolbar({ enabled, onToggle, dirHandle, onOpenDir }: Props)
 
   const coreTools = tools.filter((t) => !t.group);
   const gitTools = tools.filter((t) => t.group === "git");
-
+  const enabledCount = tools.filter((t) => enabled[t.name]).length;
   const dirName = dirHandle?.name ?? null;
 
+  // Close on outside-click and Escape.
+  useEffect(() => {
+    if (!open) return;
+    function onMouseDown(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("mousedown", onMouseDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onMouseDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
   return (
-    <div className="flex items-center gap-1 px-4 py-1.5 border-b bg-muted/40 flex-wrap">
-      <span className="text-xs text-muted-foreground mr-1 shrink-0">Tools:</span>
+    <div className="relative shrink-0" ref={ref}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        title={`Agent tools — ${enabledCount} enabled`}
+        className={cn(
+          "flex items-center gap-1 h-7 px-2 rounded-full transition-colors",
+          enabledCount > 0 || open
+            ? "bg-primary/10 text-primary"
+            : "text-muted-foreground hover:text-foreground hover:bg-accent"
+        )}
+      >
+        <SlidersHorizontal className="size-4" />
+        {enabledCount > 0 && (
+          <span className="text-[10px] font-medium leading-none">{enabledCount}</span>
+        )}
+      </button>
 
-      {coreTools.map((t) => (
-        <ToolBtn key={t.name} tool={t} enabled={enabled[t.name]} onToggle={onToggle} />
-      ))}
-
-      {/* Git group separator */}
-      <span className="text-xs text-muted-foreground mx-0.5">|</span>
-      {gitTools.map((t) => (
-        <ToolBtn key={t.name} tool={t} enabled={enabled[t.name]} onToggle={onToggle} />
-      ))}
-
-      {/* Connected MCP server tools */}
-      {mcpServers.length > 0 && (
-        <>
-          <span className="text-xs text-muted-foreground mx-0.5">|</span>
-          {mcpServers.map((srv) => (
-            <span
-              key={srv.id}
-              className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-violet-100 text-violet-700 border border-violet-200"
-              title={`${srv.tools.length} tools from ${srv.label}`}
-            >
-              <Plug className="size-3" />
-              {srv.label} ({srv.tools.length})
-            </span>
-          ))}
-        </>
-      )}
-
-      <div className="ml-auto">
-        <button
-          type="button"
-          onClick={onOpenDir}
-          title={dirName ? `Workspace: ${dirName}` : "Open workspace folder"}
-          className={cn(
-            "flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors border",
-            dirName
-              ? "bg-primary/10 text-primary border-primary/30"
-              : "bg-background text-muted-foreground border-border hover:text-foreground"
-          )}
+      {/* Popover opens upward — this trigger lives near the chat input at the
+          bottom of the column, so a downward popover would run off-screen. */}
+      {open && (
+        <div
+          // Anchored right, opening leftward and upward: the trigger sits in
+          // the input bar's right-hand icon cluster, so a left-anchored panel
+          // this wide would run past the island edge and be cut off by the
+          // island's overflow:hidden.
+          className="absolute right-0 bottom-full mb-2 z-40 w-[380px] max-w-[80vw] max-h-72 overflow-y-auto rounded-lg border bg-card shadow-lg p-2.5"
         >
-          <FolderOpen className="size-3.5" />
-          {dirName ?? "Open folder"}
-        </button>
-      </div>
+          <div className="flex items-center gap-1 flex-wrap">
+            <span className="text-xs text-muted-foreground mr-1 shrink-0 w-full mb-1">
+              Agent tools
+            </span>
+            {coreTools.map((t) => (
+              <ToolBtn key={t.name} tool={t} enabled={enabled[t.name]} onToggle={onToggle} />
+            ))}
+
+            {/* Git group separator */}
+            <span className="text-xs text-muted-foreground mx-0.5">|</span>
+            {gitTools.map((t) => (
+              <ToolBtn key={t.name} tool={t} enabled={enabled[t.name]} onToggle={onToggle} />
+            ))}
+
+            {/* Connected MCP server tools */}
+            {mcpServers.length > 0 && (
+              <>
+                <span className="text-xs text-muted-foreground mx-0.5">|</span>
+                {mcpServers.map((srv) => (
+                  <span
+                    key={srv.id}
+                    className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-violet-100 text-violet-700 border border-violet-200"
+                    title={`${srv.tools.length} tools from ${srv.label}`}
+                  >
+                    <Plug className="size-3" />
+                    {srv.label} ({srv.tools.length})
+                  </span>
+                ))}
+              </>
+            )}
+          </div>
+
+          <div className="mt-2 pt-2 border-t">
+            <button
+              type="button"
+              onClick={onOpenDir}
+              title={dirName ? `Workspace: ${dirName}` : "Open workspace folder"}
+              className={cn(
+                "flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors border",
+                dirName
+                  ? "bg-primary/10 text-primary border-primary/30"
+                  : "bg-background text-muted-foreground border-border hover:text-foreground"
+              )}
+            >
+              <FolderOpen className="size-3.5" />
+              {dirName ?? "Open folder"}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

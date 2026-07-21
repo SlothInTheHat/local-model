@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-import { AlertCircle, SlidersHorizontal, Volume2, VolumeX, Lightbulb, FolderTree } from "lucide-react";
+import { AlertCircle, SlidersHorizontal, Volume2, VolumeX, Lightbulb, FolderTree, Maximize2, Minimize2 } from "lucide-react";
 import { toast, Toaster } from "sonner";
 import { recommendModel } from "./lib/modelRecommender";
 import { listModels, pullModel } from "./lib/ollama";
@@ -29,7 +29,7 @@ import { initTrayIntegration } from "./lib/trayIntegration";
 import { syncConversationsToFts } from "./lib/sessionSearch";
 import { QueuedTaskBanner } from "./components/QueuedTaskBanner";
 import { Nucleus } from "./components/Nucleus";
-import { ChatDrawer } from "./components/ChatDrawer";
+import { ChatSidePanel } from "./components/ChatSidePanel";
 import { ConversationSearch } from "./components/ConversationSearch";
 import { ChatMessages } from "./components/ChatMessages";
 import { ChatInput } from "./components/ChatInput";
@@ -124,7 +124,14 @@ export default function App() {
   const [showFileTree, setShowFileTree] = useState(false);
   const [previewFile, setPreviewFile] = useState<{ handle: FileSystemFileHandle; path: string } | null>(null);
   const [ttsEnabled, setTtsEnabled] = useState(false);
-  const [chatDrawerOpen, setChatDrawerOpen] = useState(false);
+  // Persistent left panel inside the chat view (recent chats/model/MCP) —
+  // replaces the old slide-over ChatDrawer. Defaults open in chat view;
+  // toggled by the Nucleus's history icon (onToggleChatSidebar).
+  const [chatSidebarOpen, setChatSidebarOpen] = useState(true);
+  // Windowed (floating island) vs fullscreen (fills the app window) — CSS/layout
+  // only, no Tauri window API calls. Toggled from the island's top-right button,
+  // visible across all 15 views.
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   // Nucleus floating-island mount choreography: seed → compact → expanded.
   const [pillState, setPillState] = useState<"seed" | "compact" | "expanded">("seed");
@@ -140,34 +147,75 @@ export default function App() {
   const isIslandExpanded = pillState === "expanded";
   const isIslandCompact = pillState === "compact";
   const isWideView = VIEW_WIDTH[view] === "wide";
+  // Chat's side panels (chat sidebar, file tree, preview) used to float over
+  // the 580px chat column as absolute overlays because they didn't fit;
+  // they're now real flex siblings (see the chat view JSX below), so the
+  // island itself has to widen to make room for them instead. The more of
+  // them are open at once, the wider the island needs to be — additive
+  // rather than a single "any panel open" cutover.
+  const chatSidebarShown = view === "chat" && chatSidebarOpen;
+  const chatFileTreeShown = view === "chat" && showFileTree && !!dirHandle;
+  const chatPreviewShown = view === "chat" && !!previewFile;
+  const openChatPanelCount =
+    (chatSidebarShown ? 1 : 0) + (chatFileTreeShown ? 1 : 0) + (chatPreviewShown ? 1 : 0);
+  const chatPanelsOpen = openChatPanelCount > 0;
+
+  const expandedWidth =
+    openChatPanelCount >= 3
+      ? "min(1850px, calc(100vw - 24px))" // sidebar + file tree + preview all open
+      : openChatPanelCount === 2
+      ? "min(1600px, calc(100vw - 24px))" // any two of sidebar/tree/preview open
+      : isWideView || chatPanelsOpen
+      ? "min(1400px, calc(100vw - 24px))" // reuse the existing "wide" value
+      : "min(580px, calc(100vw - 24px))";
 
   const islandStyle: CSSProperties = {
     position: "fixed",
-    top: "18px",
+    top: isFullscreen ? "0px" : "18px",
+    // Horizontal position is deliberately CONSTANT. Animating `left`
+    // (50%→0) and `transform` (translateX(-50%)→none) together made the
+    // fullscreen toggle jitter — two compounding positional animations on an
+    // overshooting curve. A 100vw box centered at left:50% with
+    // translateX(-50%) already spans exactly 0→100vw, so width alone gets us
+    // there with no positional motion at all.
     left: "50%",
     transform: "translateX(-50%)",
     zIndex: 50,
     overflow: "hidden",
     display: "flex",
     flexDirection: "column",
-    width: isIslandExpanded
-      ? isWideView
-        ? "min(1400px, calc(100vw - 24px))"
-        : "min(580px, calc(100vw - 24px))"
+    width: isFullscreen
+      ? "100vw"
+      : isIslandExpanded
+      ? expandedWidth
       : isIslandCompact
       ? "160px"
       : "0px",
-    height: isIslandExpanded ? "calc(100vh - 36px)" : isIslandCompact ? "40px" : "0px",
-    borderRadius: isIslandExpanded ? "26px" : "9999px",
+    height: isFullscreen
+      ? "100vh"
+      : isIslandExpanded
+      ? "calc(100vh - 36px)"
+      : isIslandCompact
+      ? "40px"
+      : "0px",
+    borderRadius: isFullscreen ? "0px" : isIslandExpanded ? "26px" : "9999px",
     background: isIslandExpanded ? "var(--card)" : "#0A0A0A",
     border: isIslandExpanded ? "1px solid rgba(0,0,0,0.09)" : "1px solid transparent",
-    boxShadow: isIslandExpanded
+    boxShadow: isFullscreen
+      ? "none"
+      : isIslandExpanded
       ? "0 8px 60px rgba(0,0,0,0.1), 0 2px 8px rgba(0,0,0,0.05)"
       : "0 2px 16px rgba(0,0,0,0.18)",
+    // No overshoot on the shell: a curve >1 on `width` would push the box past
+    // 100vw mid-flight going fullscreen, which reads as a jitter at the edges.
+    // (The bounce lives on the small Nucleus pill instead, where overshooting
+    // costs nothing.) `left`/`transform` are intentionally absent — they no
+    // longer change.
     transition: [
-      "width 0.65s cubic-bezier(0.34, 1.12, 0.64, 1)",
-      "height 0.65s cubic-bezier(0.34, 1.12, 0.64, 1)",
-      "border-radius 0.65s cubic-bezier(0.34, 1.12, 0.64, 1)",
+      "width 0.65s cubic-bezier(0.32, 0.72, 0, 1)",
+      "height 0.65s cubic-bezier(0.32, 0.72, 0, 1)",
+      "top 0.65s cubic-bezier(0.32, 0.72, 0, 1)",
+      "border-radius 0.65s cubic-bezier(0.32, 0.72, 0, 1)",
       "background 0.4s ease",
       "box-shadow 0.4s ease",
     ].join(", "),
@@ -724,6 +772,22 @@ export default function App() {
 
         {isIslandExpanded && (
           <>
+            {/* Windowed / fullscreen toggle — pinned to the island's top-right
+                corner, visible across all 15 views (lives in the shell here,
+                not per-view). CSS/layout fullscreen only — no Tauri window
+                APIs are touched. */}
+            <button
+              type="button"
+              onClick={() => setIsFullscreen((v) => !v)}
+              title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+              // z-40: must clear the Nucleus row (z-30), which spans the full
+              // island width at this same vertical band and would otherwise
+              // swallow the click.
+              className="absolute top-3 right-3 z-40 size-7 rounded-full flex items-center justify-center text-black/30 hover:text-black/60 hover:bg-black/5 transition-colors"
+            >
+              {isFullscreen ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
+            </button>
+
             <Nucleus
               view={view}
               onViewChange={setView}
@@ -731,18 +795,44 @@ export default function App() {
               isStreaming={isStreaming}
               isSearching={isSearching}
               agentMode={agentMode}
-              onToggleDrawer={() => setChatDrawerOpen((v) => !v)}
+              onToggleChatSidebar={() => setChatSidebarOpen((v) => !v)}
             />
 
             {/* Hairline divider */}
             <div className="mx-4 mt-3 border-t border-black/[0.05] shrink-0" />
 
-            {/* Content area — relative so the chat drawer (and, within the
-                chat view, the file tree / preview flyouts) can overlay it
-                without fighting the island's adaptive width for space. */}
+            {/* Content area — relative so the chat view's side panels (chat
+                sidebar / file tree / preview) can size themselves as real
+                flex siblings without fighting the island's adaptive width
+                for space (the island itself widens instead, see
+                expandedWidth/openChatPanelCount above). */}
             <div className="relative flex-1 min-h-0 flex flex-col overflow-hidden">
               {view === "chat" ? (
-          <div className="relative flex flex-1 min-h-0 overflow-hidden">
+          <div className="flex flex-1 min-h-0 overflow-hidden">
+            {/* Persistent chat sidebar — real flex sibling on the left,
+                leftmost of the chat-view panels (recent chats/new chat,
+                model switching, MCP). Toggled via the Nucleus's history icon
+                (onToggleChatSidebar); replaces the old slide-over ChatDrawer. */}
+            {chatSidebarOpen && (
+              <div className="w-64 shrink-0 border-r bg-card overflow-hidden">
+                <ChatSidePanel selectedModel={selectedModel} onModelChange={setSelectedModel} />
+              </div>
+            )}
+
+            {/* File tree — a real flex sibling on the left of the chat column
+                (not an absolute overlay) whenever it's toggled on; the island
+                widens to make room for it (see expandedWidth/chatPanelsOpen
+                above), exactly like the pre-island layout did. */}
+            {showFileTree && dirHandle && (
+              <div className="w-56 shrink-0 border-r bg-card overflow-hidden">
+                <FileTree
+                  dirHandle={dirHandle}
+                  onOpenFile={(handle, path) => setPreviewFile({ handle, path })}
+                  onOpenDir={() => void handleOpenDir()}
+                />
+              </div>
+            )}
+
             <div className="flex flex-col flex-1 min-w-0 min-h-0 overflow-hidden">
               {/* Top bar */}
               <div className="h-14 border-b bg-card px-4 flex items-center justify-between shrink-0">
@@ -822,16 +912,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Agent toolbar */}
-              {agentMode && (
-                <AgentToolbar
-                  enabled={toolsEnabled}
-                  onToggle={(name) => setToolEnabled(name, !toolsEnabled[name])}
-                  dirHandle={dirHandle}
-                  onOpenDir={() => void handleOpenDir()}
-                />
-              )}
-
               {/* Error banner */}
               {ollamaError && (
                 <div className="flex items-center gap-2 px-4 py-2 bg-destructive/10 border-b border-destructive/20 text-destructive text-xs shrink-0">
@@ -881,6 +961,14 @@ export default function App() {
                   setAgentMode(next);
                   toast.info(next ? "Agent mode ON — model can use tools" : "Agent mode OFF", { duration: 2500 });
                 }}
+                agentToolbarSlot={
+                  <AgentToolbar
+                    enabled={toolsEnabled}
+                    onToggle={(name) => setToolEnabled(name, !toolsEnabled[name])}
+                    dirHandle={dirHandle}
+                    onOpenDir={() => void handleOpenDir()}
+                  />
+                }
                 attachedImages={attachedImages}
                 onAttachImages={(b64s) => setAttachedImages((prev) => [...prev, ...b64s])}
                 onRemoveImage={(i) =>
@@ -889,26 +977,12 @@ export default function App() {
               />
             </div>
 
-            {/* File tree — narrow-view adaptation: the island's adaptive width
-                (580px for chat) can't fit a side-by-side tree + chat + preview
-                layout like the old wide sidebar shell could, so this and the
-                preview panel below slide over the chat as flyouts instead of
-                claiming permanent width. Toggle/open behavior is unchanged. */}
-            {showFileTree && dirHandle && (
-              <div className="absolute inset-y-0 left-0 z-10 w-56 max-w-[70%] border-r bg-card overflow-hidden shadow-[4px_0_20px_rgba(0,0,0,0.08)]">
-                <FileTree
-                  dirHandle={dirHandle}
-                  onOpenFile={(handle, path) => setPreviewFile({ handle, path })}
-                  onOpenDir={() => void handleOpenDir()}
-                />
-              </div>
-            )}
-
             {/* File preview panel — read-only widget so the agent's file work
                 (or anything the user browses via the tree) can be viewed inline
-                without switching to the Code tab / Monaco. */}
+                without switching to the Code tab / Monaco. Real flex sibling
+                on the right of the chat column, like the tree above. */}
             {previewFile && (
-              <div className="absolute inset-y-0 right-0 z-10 w-96 max-w-[85%] overflow-hidden shadow-[-4px_0_20px_rgba(0,0,0,0.08)]">
+              <div className="w-96 shrink-0 border-l bg-card overflow-hidden">
                 <FilePreviewPanel
                   handle={previewFile.handle}
                   path={previewFile.path}
@@ -987,14 +1061,6 @@ export default function App() {
                   )}
                 </div>
               )}
-
-              {/* Recent-chats drawer — overlays whichever view is currently
-                  visible; toggled by the icon button next to the Nucleus. */}
-              <ChatDrawer
-                open={chatDrawerOpen}
-                onClose={() => setChatDrawerOpen(false)}
-                selectedModel={selectedModel}
-              />
             </div>
           </>
         )}

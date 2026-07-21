@@ -20,8 +20,11 @@ export const VIEW_WIDTH: Record<AppView, "narrow" | "wide"> = {
   research: "narrow",
   study: "narrow",
   skills: "narrow",
-  settings: "narrow",
   agents: "narrow",
+  // Settings is the densest screen in the app (workspace, hardware, model,
+  // providers, MCP, desktop integration, scheduled jobs, feature proposals);
+  // its forms and two-column rows clip at the narrow width.
+  settings: "wide",
   code: "wide",
   compare: "wide",
   benchmarks: "wide",

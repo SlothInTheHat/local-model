@@ -73,15 +73,22 @@ export function ChatMessages({ messages, isStreaming }: Props) {
       className="flex-1 min-h-0 overflow-y-auto"
     >
       <div className="max-w-3xl mx-auto px-6 py-6 space-y-6">
-        {messages.map((msg, i) => (
-          <MessageRow
-            key={i}
-            msg={msg}
-            index={i}
-            isLast={i === messages.length - 1}
-            isStreaming={isStreaming}
-          />
-        ))}
+        {messages.map((msg, i) => {
+          // Tool-result rows carry no name of their own — the preceding
+          // assistant message is the empty `tool_calls` carrier that named it.
+          const toolName =
+            msg.role === "tool" ? messages[i - 1]?.tool_calls?.[0]?.function?.name : undefined;
+          return (
+            <MessageRow
+              key={i}
+              msg={msg}
+              index={i}
+              isLast={i === messages.length - 1}
+              isStreaming={isStreaming}
+              toolName={toolName}
+            />
+          );
+        })}
         {/* Anchor element — we scroll the container directly instead */}
         <div className="h-px" />
       </div>
@@ -89,21 +96,35 @@ export function ChatMessages({ messages, isStreaming }: Props) {
   );
 }
 
-function ToolResultChip({ content }: { content: string }) {
+// role:"tool" content is the raw string the model sees back — either a tool's
+// output, or one of stuckDetector.ts's internal nudges / agentRuntime.ts's
+// denial message. Give those a plain-English label instead of shouting the
+// raw bracketed text in the chat transcript; the full text stays on expand.
+function toolChipLabel(content: string, toolName?: string): string {
+  const trimmed = content.trimStart();
+  if (trimmed.startsWith("[BLOCKED")) return "Blocked";
+  if (trimmed.startsWith("[SAME ERROR")) return "Retry guard";
+  if (trimmed === "Tool call denied by user.") return "Denied";
+  return toolName || "Tool result";
+}
+
+function ToolResultChip({ content, label: labelOverride }: { content: string; label?: string }) {
   const [expanded, setExpanded] = useState(false);
 
-  // Extract tool name from "[Tool result: <name>]" prefix
+  // Extract tool name from "[Tool result: <name>]" prefix (legacy system-message shape)
   const match = content.match(/^\[Tool result:\s*([^\]]+)\]/);
-  const label = match ? match[1].trim() : "Tool result";
+  const label = labelOverride ?? (match ? match[1].trim() : "Tool result");
   const body = match ? content.slice(match[0].length).trim() : content;
 
   return (
     <div className="inline-flex flex-col max-w-full">
+      {/* Chrome-free: these are transcript asides, not content. No surface or
+          border — just quiet text that stays out of the conversation's way. */}
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
         className={cn(
-          "flex items-center gap-1 px-2 py-1 rounded text-xs bg-muted text-muted-foreground hover:text-foreground transition-colors border border-border w-fit"
+          "flex items-center gap-1 py-0.5 text-xs text-muted-foreground hover:text-foreground transition-colors w-fit"
         )}
       >
         {expanded ? (
@@ -114,7 +135,7 @@ function ToolResultChip({ content }: { content: string }) {
         <span className="font-mono">{label}</span>
       </button>
       {expanded && body && (
-        <pre className="mt-1 text-xs bg-muted border rounded p-2 overflow-x-auto max-w-full whitespace-pre-wrap font-mono text-muted-foreground">
+        <pre className="mt-1 mb-1 text-xs overflow-x-auto max-w-full whitespace-pre-wrap font-mono text-muted-foreground/80">
           {sanitize(body).slice(0, 8000)}
           {body.length > 8000 && "\n…(truncated)"}
         </pre>
@@ -141,11 +162,13 @@ const MessageRow = memo(function MessageRow({
   index,
   isLast,
   isStreaming,
+  toolName,
 }: {
   msg: ChatMessage;
   index: number;
   isLast: boolean;
   isStreaming: boolean;
+  toolName?: string;
 }) {
   const [showFull, setShowFull] = useState(false);
   const isUser = msg.role === "user";
@@ -162,7 +185,7 @@ const MessageRow = memo(function MessageRow({
   // Tool result system messages — render as collapsible chip
   if (msg.role === "system" && msg.content.startsWith("[Tool result:")) {
     return (
-      <div className="flex justify-center">
+      <div className="flex justify-start">
         <ToolResultChip content={msg.content} />
       </div>
     );
@@ -171,7 +194,7 @@ const MessageRow = memo(function MessageRow({
   // Generic system messages — subtle gray banner
   if (msg.role === "system") {
     return (
-      <div className="flex justify-center">
+      <div className="flex justify-start">
         <div className="text-xs text-muted-foreground bg-muted rounded px-3 py-1 border italic max-w-2xl">
           {msg.content}
         </div>
@@ -179,35 +202,50 @@ const MessageRow = memo(function MessageRow({
     );
   }
 
+  // Tool results (and internal agent-loop nudges, which also arrive as
+  // role:"tool" — see toolChipLabel) — collapsed chip, never a prose bubble.
+  if (msg.role === "tool") {
+    return (
+      <div className="flex justify-start">
+        <ToolResultChip content={msg.content} label={toolChipLabel(msg.content, toolName)} />
+      </div>
+    );
+  }
+
   if (isUser) {
     return (
-      <div className="flex gap-3 justify-end">
-        <div className="flex-1 max-w-2xl space-y-1 text-right">
-          <div className="text-xs text-muted-foreground">You</div>
-          <div
-            style={{ borderRadius: USER_R[index % 3], animation: MSG_IN_ANIMATION }}
-            className="inline-block text-left px-4 py-2.5 bg-primary text-primary-foreground"
-          >
-            <p className="text-sm whitespace-pre-wrap leading-[1.65]">{msg.content}</p>
-            {msg.images && msg.images.length > 0 && (
-              <div className="flex gap-1.5 mt-2 flex-wrap">
-                {msg.images.map((b64, i) => (
-                  <img
-                    key={i}
-                    src={`data:image/png;base64,${b64}`}
-                    alt={`Attachment ${i + 1}`}
-                    className="size-16 object-cover rounded border border-border"
-                  />
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-        <div className="size-8 rounded-full bg-accent border flex items-center justify-center shrink-0 mt-5">
-          <span className="text-[10px] font-semibold text-accent-foreground">ME</span>
+      <div className="flex justify-end">
+        <div
+          style={{ borderRadius: USER_R[index % 3], animation: MSG_IN_ANIMATION }}
+          className="inline-block max-w-2xl text-left px-4 py-2.5 bg-primary text-primary-foreground"
+        >
+          <p className="text-sm whitespace-pre-wrap leading-[1.65]">{msg.content}</p>
+          {msg.images && msg.images.length > 0 && (
+            <div className="flex gap-1.5 mt-2 flex-wrap">
+              {msg.images.map((b64, i) => (
+                <img
+                  key={i}
+                  src={`data:image/png;base64,${b64}`}
+                  alt={`Attachment ${i + 1}`}
+                  className="size-16 object-cover rounded border border-border"
+                />
+              ))}
+            </div>
+          )}
         </div>
       </div>
     );
+  }
+
+  // Only role:"assistant" reaches here. App.tsx pushes blank-content assistant
+  // messages as scaffolding: the onRoundStart placeholder for round > 1, and
+  // the empty tool_calls carrier (its tool name now surfaces on the chip
+  // above instead). Render nothing for those — UNLESS this is the live
+  // "thinking" placeholder (last message, still streaming), which keeps the
+  // bouncing-dot indicator below.
+  const isBlank = !msg.content?.trim();
+  if (isBlank && !(isLast && isStreaming)) {
+    return null;
   }
 
   // Waiting for the first token: the placeholder assistant message has been
@@ -216,16 +254,12 @@ const MessageRow = memo(function MessageRow({
   const isThinking = isLast && isStreaming && !msg.content?.trim();
 
   return (
-    <div className="flex gap-3">
-      <div className="size-8 rounded-full bg-primary flex items-center justify-center shrink-0 mt-5">
-        <Brain className="size-4 text-primary-foreground" />
-      </div>
-      <div className="flex-1 space-y-1 min-w-0 overflow-hidden">
-        <div className="text-xs text-muted-foreground">LocalMind Assistant</div>
+    <div className="flex justify-start">
+      <div className="max-w-2xl min-w-0 space-y-1">
         <div
           style={{ borderRadius: AI_R[index % 3], animation: MSG_IN_ANIMATION }}
           className={cn(
-            "bg-card border border-border overflow-hidden",
+            "bg-bubble border border-border overflow-hidden",
             isThinking
               ? "px-4 py-3 inline-block"
               : "px-4 py-2.5 prose prose-sm max-w-none prose-pre:bg-muted prose-pre:border prose-code:text-foreground prose-p:my-1.5 prose-headings:font-medium"

@@ -14,6 +14,15 @@ use std::process::Command;
 /// do. Deliberately does no resolution or validation of `name` — the shell
 /// itself resolves PATH entries, registered app names, and file associations,
 /// which is both simpler and more capable than reimplementing that lookup.
+///
+/// Waits for the launcher command (`.output()`, not `.spawn()`) so a nonzero
+/// exit status — Windows' `start` reports failed lookups this way — becomes
+/// an `Err` instead of a blind "Launched X". This only waits on the shell
+/// launcher handing off, not on the launched app's lifetime, so it returns
+/// promptly either way. Exit status is not 100% reliable for every failure
+/// shape (e.g. a GUI "no association" dialog can appear instead of a clean
+/// nonzero exit), so even the success path is worded as a request, not a
+/// confirmed launch.
 #[tauri::command]
 pub fn open_application(name: String) -> Result<String, String> {
     if name.trim().is_empty() {
@@ -21,34 +30,44 @@ pub fn open_application(name: String) -> Result<String, String> {
     }
 
     #[cfg(target_os = "windows")]
-    {
+    let output = {
         // `start` is a cmd builtin, not an exe, so it must run through cmd.exe.
         // The first "" argument is `start`'s window-title parameter — required
         // whenever the target itself might contain spaces/quotes, otherwise
         // `start` misinterprets a quoted target as the title.
         Command::new("cmd")
             .args(["/C", "start", "", &name])
-            .spawn()
-            .map_err(|e| format!("Failed to launch '{name}': {e}"))?;
-    }
+            .output()
+            .map_err(|e| format!("Failed to launch '{name}': {e}"))?
+    };
 
     #[cfg(target_os = "macos")]
-    {
-        Command::new("open")
-            .arg(&name)
-            .spawn()
-            .map_err(|e| format!("Failed to launch '{name}': {e}"))?;
-    }
+    let output = Command::new("open")
+        .arg(&name)
+        .output()
+        .map_err(|e| format!("Failed to launch '{name}': {e}"))?;
 
     #[cfg(target_os = "linux")]
-    {
-        Command::new("xdg-open")
-            .arg(&name)
-            .spawn()
-            .map_err(|e| format!("Failed to launch '{name}': {e}"))?;
+    let output = Command::new("xdg-open")
+        .arg(&name)
+        .output()
+        .map_err(|e| format!("Failed to launch '{name}': {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!(
+                "Windows could not launch '{name}' (exit code {:?}). '{name}' may not be a recognized application, file, or URL — retry with the underlying executable name (e.g. 'mspaint' for Paint, 'calc' for Calculator, 'cmd' for Command Prompt) rather than searching the workspace filesystem.",
+                output.status.code()
+            )
+        } else {
+            format!("Failed to launch '{name}': {stderr}")
+        });
     }
 
-    Ok(format!("Launched {name}"))
+    Ok(format!(
+        "Requested launch of '{name}' via the OS shell. If it did not appear, '{name}' may not be the right name — retry with the underlying executable name (e.g. 'mspaint' for Paint, 'calc' for Calculator)."
+    ))
 }
 
 // ─── Window control + screenshot/OCR (WP5.2b) ──────────────────────────────

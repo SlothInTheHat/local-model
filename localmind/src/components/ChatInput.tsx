@@ -17,6 +17,10 @@ interface Props {
   // Agent mode
   agentMode: boolean;
   onToggleAgentMode: () => void;
+  // Agent tool settings trigger+popover (AgentToolbar), rendered next to the
+  // agent-mode toggle only while agent mode is on. Passed as a slot so
+  // ChatInput doesn't need to know about ToolName/tool-toggle wiring.
+  agentToolbarSlot?: React.ReactNode;
   // Image attachments
   attachedImages: string[];
   onAttachImages: (b64s: string[]) => void;
@@ -33,6 +37,7 @@ export function ChatInput({
   onToggleWebSearch,
   agentMode,
   onToggleAgentMode,
+  agentToolbarSlot,
   attachedImages,
   onAttachImages,
   onRemoveImage,
@@ -229,6 +234,10 @@ export function ChatInput({
             >
               <Bot className="size-4" />
             </button>
+
+            {/* Agent tool settings — only shown while agent mode is on;
+                the popover itself lives in AgentToolbar. */}
+            {agentMode && agentToolbarSlot}
 
             {/* Mic — voice input */}
             <button
