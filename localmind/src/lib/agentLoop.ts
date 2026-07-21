@@ -1,5 +1,5 @@
 import type { ChatMessage } from "./ollama";
-import { getOllamaBaseUrl } from "./ollama";
+import { getOllamaBaseUrl, createStallWatchdog, stallError, STREAM_STALL_TIMEOUT_MS } from "./ollama";
 import type { ToolDef, ToolCall } from "./tools";
 
 export interface AgentEvent {
@@ -212,6 +212,13 @@ export async function* runAgentTurn(
 ): AsyncGenerator<AgentEvent> {
   const ollamaTools = tools.map(toOllamaTool);
 
+  // Inactivity watchdog — a wedged Ollama (port open, model loaded, inference
+  // never returns) would otherwise hang this generator forever, leaving an
+  // unattended task stuck in "running" and holding the single-flight
+  // generation gate so the scheduler and task queue silently stop too.
+  // See STREAM_STALL_TIMEOUT_MS in ollama.ts for the full failure mode.
+  const watchdog = createStallWatchdog(signal, STREAM_STALL_TIMEOUT_MS);
+
   let response: Response;
   try {
     response = await fetch(`${getOllamaBaseUrl()}/api/chat`, {
@@ -224,10 +231,12 @@ export async function* runAgentTurn(
         stream: true,
         ...(options?.numCtx ? { options: { num_ctx: options.numCtx } } : {}),
       }),
-      signal,
+      signal: watchdog.signal,
     });
+    watchdog.bump();
   } catch (err) {
-    yield { type: "error", error: (err as Error).message };
+    watchdog.dispose();
+    yield { type: "error", error: watchdog.isStalled() ? stallError("Ollama").message : (err as Error).message };
     return;
   }
 
@@ -247,9 +256,11 @@ export async function* runAgentTurn(
   const accumulatedToolCalls: OllamaToolCall[] = [];
   let accumulatedText = "";
 
+  try {
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
+    watchdog.bump(); // progress — restart the inactivity clock
 
     const lines = decoder.decode(value, { stream: true }).split("\n").filter(Boolean);
 
@@ -295,6 +306,18 @@ export async function* runAgentTurn(
         return;
       }
     }
+  }
+  } catch (err) {
+    // A stall mid-stream (server wedged after sending some tokens) surfaces
+    // as an error event rather than hanging or throwing past the caller.
+    // A caller-initiated abort still propagates untouched.
+    if (watchdog.isStalled()) {
+      yield { type: "error", error: stallError("Ollama").message };
+      return;
+    }
+    throw err;
+  } finally {
+    watchdog.dispose();
   }
 
   // End of stream without explicit done message

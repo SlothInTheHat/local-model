@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Eye, EyeOff, CheckCircle2, XCircle, RefreshCw, Settings, User, GitBranch, Globe, Plug, Clock, Trash2, Lightbulb, Check, Monitor, Keyboard, FolderOpen, Cpu, Sparkles } from "lucide-react";
+import { Eye, EyeOff, CheckCircle2, XCircle, RefreshCw, Settings, User, GitBranch, Globe, Plug, Clock, Trash2, Lightbulb, Check, Monitor, Keyboard, FolderOpen, Cpu, Sparkles, Copy, Network, Layers } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { Card, CardContent } from "./ui/card";
@@ -12,9 +12,12 @@ import { useProvidersStore } from "../store/providers";
 import { useModelStore } from "../store/models";
 import { useAgentStore } from "../store/agent";
 import { useModelSelectionStore } from "../store/modelSelection";
+import { useChatStore } from "../store/chat";
+import { useMemoryStore } from "../store/memory";
 import { recommendedNumCtx } from "../lib/contextSize";
 import { isTauriEnv } from "../lib/fileSystem";
 import { supportsNativeTools } from "../lib/modelCapabilities";
+import { resolveRoleWithReason, type ModelRole } from "../lib/modelRoles";
 import { WorkspaceSelector } from "./WorkspaceSelector";
 import { ModelSelector } from "./ModelSelector";
 import { McpSettings } from "./McpSettings";
@@ -589,10 +592,18 @@ function FeatureProposalsSection() {
 
 // ─── Desktop integration (WP5.1: tray, close-to-tray, autostart, hotkey) ─────
 
+// Must match src-tauri/src/ipc.rs's IPC_BIND_ADDR — kept as a literal here
+// (not fetched from Rust) since it's baked into the binary, not runtime
+// config.
+const IPC_ENDPOINT = "http://127.0.0.1:41777";
+
 function DesktopIntegrationSection() {
   const { closeToTray, setCloseToTray } = useSettingsStore();
   const [autostartOn, setAutostartOn] = useState(false);
   const [autostartBusy, setAutostartBusy] = useState(false);
+  const [ipcToken, setIpcToken] = useState<string | null>(null);
+  const [showIpcToken, setShowIpcToken] = useState(false);
+  const [ipcCopied, setIpcCopied] = useState(false);
   const tauri = isTauriEnv();
 
   useEffect(() => {
@@ -602,6 +613,24 @@ function DesktopIntegrationSection() {
       .then(setAutostartOn)
       .catch(() => {/* leave default (off) if the plugin can't be reached */});
   }, [tauri]);
+
+  useEffect(() => {
+    if (!tauri) return;
+    tauriInvoke<string>("get_ipc_token")
+      .then(setIpcToken)
+      .catch((e) => console.error("[settings] could not load IPC token:", e));
+  }, [tauri]);
+
+  async function copyIpcToken() {
+    if (!ipcToken) return;
+    try {
+      await navigator.clipboard.writeText(ipcToken);
+      setIpcCopied(true);
+      setTimeout(() => setIpcCopied(false), 1500);
+    } catch (e) {
+      toast.error(`Could not copy token: ${(e as Error).message}`);
+    }
+  }
 
   async function toggleAutostart(next: boolean) {
     if (!tauri) return;
@@ -654,6 +683,150 @@ function DesktopIntegrationSection() {
           <Keyboard className="size-3.5 shrink-0" />
           Global hotkey <kbd className="px-1.5 py-0.5 rounded border border-border bg-muted font-mono text-[11px]">Ctrl+Shift+Space</kbd> shows/hides LocalMind from anywhere.
         </div>
+
+        {tauri && (
+          <div className="pt-3 border-t border-border space-y-2">
+            <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+              <Network className="size-4" />
+              Local IPC listener
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              Other local programs on this machine (e.g. the phone-agent Telegram bridge) can hand LocalMind a task by
+              POSTing to the endpoint below with this bearer token. Every task still goes through the normal queue,
+              approval gates, and tool allowlist — nothing bypasses them.
+            </p>
+            <Field label="Endpoint">
+              <input
+                type="text"
+                value={IPC_ENDPOINT}
+                readOnly
+                className="w-full text-sm px-3 py-1.5 rounded-md border border-border bg-muted text-foreground outline-none font-mono"
+              />
+            </Field>
+            <Field label="Bearer token">
+              <div className="relative flex items-center gap-2">
+                <div className="relative flex-1">
+                  <input
+                    type={showIpcToken ? "text" : "password"}
+                    value={ipcToken ?? "loading…"}
+                    readOnly
+                    className="w-full text-sm px-3 py-1.5 pr-9 rounded-md border border-border bg-background text-foreground outline-none focus:ring-2 focus:ring-ring font-mono"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowIpcToken((v) => !v)}
+                    disabled={!ipcToken}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors disabled:opacity-40"
+                  >
+                    {showIpcToken ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+                  </button>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-8 text-xs gap-1 shrink-0"
+                  onClick={() => void copyIpcToken()}
+                  disabled={!ipcToken}
+                >
+                  {ipcCopied ? <><Check className="size-3" /> Copied</> : <><Copy className="size-3" /> Copy</>}
+                </Button>
+              </div>
+            </Field>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ─── Model Roles (WP6.2a) ─────────────────────────────────────────────────────
+//
+// `primary` (the main chat model) is deliberately NOT offered here — it has
+// its own selector above and duplicating it would just invite the two to
+// drift apart. Only the background/specialized roles are pinnable.
+
+const PINNABLE_ROLES: Array<{ role: Exclude<ModelRole, "primary" | "embed">; label: string; hint: string }> = [
+  {
+    role: "digest",
+    label: "Digest",
+    hint: "Summarizes a finished session into durable memories in the background. Kept small and off the main model so it stays cheap.",
+  },
+  {
+    role: "vision",
+    label: "Vision",
+    hint: "Handles image inputs (e.g. screenshots) — a follow-up feature consumes this. Needs a model that actually supports vision, not just any model.",
+  },
+];
+
+function describeResolution(role: ModelRole): { model: string | null; text: string } {
+  const { model, source } = resolveRoleWithReason(role);
+  if (!model) {
+    return {
+      model: null,
+      text: role === "vision"
+        ? "No vision model installed — pull llava or moondream to enable image tools."
+        : "No model resolved.",
+    };
+  }
+  const prefix = source === "pinned" ? "Pinned" : source === "fallback" ? "Auto (fallback to main model)" : "Auto";
+  return { model, text: `${prefix} → ${model}` };
+}
+
+function ModelRolesSection() {
+  const { modelRoles, setModelRole } = useSettingsStore();
+  const { availableModels } = useChatStore();
+  const { embedModel, setEmbedModel } = useMemoryStore();
+
+  return (
+    <Card>
+      <CardContent className="p-4 space-y-4">
+        <p className="text-xs text-muted-foreground">
+          By default LocalMind runs all background work on your selected chat model. Pin a smaller or
+          specialized model per role below to keep that work cheap, or leave it on "Auto" to let LocalMind choose.
+        </p>
+
+        {PINNABLE_ROLES.map(({ role, label, hint }) => {
+          const { model, text } = describeResolution(role);
+          return (
+            <Field key={role} label={label} hint={hint}>
+              <select
+                value={modelRoles[role] ?? ""}
+                onChange={(e) => setModelRole(role, e.target.value || null)}
+                className="w-full text-sm px-3 py-1.5 rounded-md border border-border bg-background text-foreground outline-none focus:ring-2 focus:ring-ring"
+              >
+                <option value="">Auto</option>
+                {availableModels.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+              <p className={cn("text-[11px]", model ? "text-muted-foreground" : "text-amber-600")}>{text}</p>
+            </Field>
+          );
+        })}
+
+        {/* Embed is shown for visibility only — it's not a second pin. The
+            model actually used for embeddings is owned by src/store/memory.ts
+            `embedModel` (Memory settings' own selector); this select writes
+            straight through to that same value so there's exactly one source
+            of truth. */}
+        <Field
+          label="Embed"
+          hint="Turns text into vectors for memory search. This is the same setting as the Embed Model field in Memory — shown here for a complete picture of what runs what."
+        >
+          <select
+            value={embedModel}
+            onChange={(e) => setEmbedModel(e.target.value || "nomic-embed-text")}
+            className="w-full text-sm px-3 py-1.5 rounded-md border border-border bg-background text-foreground outline-none focus:ring-2 focus:ring-ring"
+          >
+            <option value="nomic-embed-text">Auto (nomic-embed-text)</option>
+            {availableModels
+              .filter((m) => m !== "nomic-embed-text")
+              .map((m) => (
+                <option key={m} value={m}>{m}</option>
+              ))}
+          </select>
+          <p className="text-[11px] text-muted-foreground">Auto → {embedModel}</p>
+        </Field>
       </CardContent>
     </Card>
   );
@@ -741,6 +914,13 @@ export function AppSettings() {
                 <ModelSelector value={selectedModel} onChange={setSelectedModel} />
               </CardContent>
             </Card>
+          </Section>
+
+          <Separator />
+
+          {/* ── Model Roles (WP6.2a) ── */}
+          <Section icon={<Layers className="size-4 text-muted-foreground" />} title="Model Roles">
+            <ModelRolesSection />
           </Section>
 
           <Separator />

@@ -81,40 +81,121 @@ export async function deleteModel(name: string): Promise<void> {
   if (!res.ok) throw new Error(`Delete failed: ${res.status}`);
 }
 
+/**
+ * How long a streaming request may produce NOTHING before we declare the
+ * server wedged.
+ *
+ * Ollama can enter a zombie state: the process is alive, the port accepts
+ * connections, `/api/ps` still lists the model in VRAM — but inference never
+ * completes and the HTTP request simply never returns. Observed directly:
+ * `say hi` to an already-loaded 7B returned nothing in 45s (HTTP 000). With no
+ * client-side timeout, a caller waits forever. The consequences cascade: an
+ * unattended task sits in "running" indefinitely, and because the request
+ * never settles, `finally { release() }` never runs and the single-flight
+ * generation gate is held forever — silently stopping the scheduler and task
+ * queue too.
+ *
+ * 180s is deliberately generous: it must not fire during a legitimate cold
+ * model load, which can take a minute or more on CPU. The goal isn't a tight
+ * bound, it's converting "hangs until the app is restarted" into "fails with
+ * an actionable message."
+ */
+export const STREAM_STALL_TIMEOUT_MS = 180_000;
+
+/**
+ * Wraps an optional caller signal with an inactivity watchdog. Call `bump()`
+ * whenever progress is made (headers received, a chunk read); if `ms` elapses
+ * with no bump, the returned signal aborts.
+ *
+ * Distinguishes its own timeout from a caller-initiated abort via
+ * `isStalled()`, so a user pressing Stop doesn't get reported as a server
+ * hang.
+ */
+export function createStallWatchdog(signal: AbortSignal | undefined, ms: number) {
+  const controller = new AbortController();
+  let stalled = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const onOuterAbort = () => controller.abort();
+  signal?.addEventListener("abort", onOuterAbort);
+  if (signal?.aborted) controller.abort();
+
+  const bump = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      stalled = true;
+      controller.abort();
+    }, ms);
+  };
+  bump();
+
+  return {
+    signal: controller.signal,
+    bump,
+    isStalled: () => stalled,
+    dispose: () => {
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener("abort", onOuterAbort);
+    },
+  };
+}
+
+/** Error thrown when a stream produced nothing for STREAM_STALL_TIMEOUT_MS. */
+export function stallError(where: string): Error {
+  return new Error(
+    `${where} stopped responding (no data for ${Math.round(STREAM_STALL_TIMEOUT_MS / 1000)}s). ` +
+      "Ollama can wedge with the port still open and the model still loaded — " +
+      "restarting Ollama usually clears it.",
+  );
+}
+
 export async function* streamChat(
   model: string,
   messages: ChatMessage[],
   signal?: AbortSignal
 ): AsyncGenerator<string> {
-  const res = await fetch(`${getOllamaBaseUrl()}/api/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, messages, stream: true }),
-    signal,
-  });
+  const watchdog = createStallWatchdog(signal, STREAM_STALL_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${getOllamaBaseUrl()}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, messages, stream: true }),
+      signal: watchdog.signal,
+    });
+    watchdog.bump();
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(body ? `Ollama ${res.status}: ${body.slice(0, 300)}` : `Ollama returned ${res.status}`);
-  }
-  if (!res.body) throw new Error("No response body from Ollama");
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(body ? `Ollama ${res.status}: ${body.slice(0, 300)}` : `Ollama returned ${res.status}`);
+    }
+    if (!res.body) throw new Error("No response body from Ollama");
 
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      watchdog.bump(); // progress — restart the inactivity clock
 
-    const lines = decoder.decode(value, { stream: true }).split("\n").filter(Boolean);
-    for (const line of lines) {
-      try {
-        const json = JSON.parse(line);
-        if (json.message?.content) yield json.message.content;
-        if (json.done) return;
-      } catch {
-        // skip malformed lines
+      const lines = decoder.decode(value, { stream: true }).split("\n").filter(Boolean);
+      for (const line of lines) {
+        try {
+          const json = JSON.parse(line);
+          if (json.message?.content) yield json.message.content;
+          if (json.done) return;
+        } catch {
+          // skip malformed lines
+        }
       }
     }
+  } catch (err) {
+    // Only translate OUR abort into a stall error — a caller-initiated abort
+    // (user pressed Stop) must keep propagating as an abort, not be
+    // misreported as a wedged server.
+    if (watchdog.isStalled()) throw stallError("Ollama");
+    throw err;
+  } finally {
+    watchdog.dispose();
   }
 }

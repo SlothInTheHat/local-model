@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { AlertCircle, SlidersHorizontal, Volume2, VolumeX, Lightbulb, FolderTree, Maximize2, Minimize2 } from "lucide-react";
 import { toast, Toaster } from "sonner";
+import { emit, listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
 import { recommendModel } from "./lib/modelRecommender";
 import { listModels, pullModel } from "./lib/ollama";
 import type { ChatMessage } from "./lib/ollama";
@@ -22,11 +25,13 @@ import { useAgentStore } from "./store/agent";
 import { useWorkspacesStore } from "./store/workspaces";
 import { useAppViewStore } from "./store/appView";
 import { useModelSelectionStore } from "./store/modelSelection";
-import { startTaskRunner } from "./lib/taskRunner";
+import { useSessionResultsStore } from "./store/sessionResults";
+import { startTaskRunner, SAFE_QUEUE_ALLOWLIST } from "./lib/taskRunner";
 import { initScheduler } from "./lib/scheduler";
 import { initMcpAutoConnect } from "./lib/mcpAutoConnect";
 import { initTrayIntegration } from "./lib/trayIntegration";
 import { syncConversationsToFts } from "./lib/sessionSearch";
+import { runHeadlessTask } from "./lib/headlessRunner";
 import { QueuedTaskBanner } from "./components/QueuedTaskBanner";
 import { Nucleus } from "./components/Nucleus";
 import { ChatSidePanel } from "./components/ChatSidePanel";
@@ -40,7 +45,9 @@ import { SystemPromptDialog } from "./components/SystemPromptDialog";
 import { FileTree } from "./components/FileTree";
 import { FilePreviewPanel } from "./components/FilePreviewPanel";
 import { lazy, Suspense } from "react";
-import { VIEW_WIDTH } from "./types/app";
+import { VIEW_WIDTH, APP_VIEWS } from "./types/app";
+import type { AppView } from "./types/app";
+import { useTaskQueueStore } from "./store/taskQueue";
 
 const CodeEditor = lazy(() =>
   import("./components/CodeEditor").then((m) => ({ default: m.CodeEditor }))
@@ -81,6 +88,137 @@ const MemoryView = lazy(() =>
 const AgentLogs = lazy(() =>
   import("./components/AgentLogs").then((m) => ({ default: m.AgentLogs }))
 );
+
+// Quick-invoke widget runs get a slightly wider allowlist than the task queue
+// / scheduler's SAFE_QUEUE_ALLOWLIST. Those fire when the user is genuinely
+// absent, so they keep the narrower, purely-file/read-oriented set. Quick
+// invoke, by contrast, is fired by a user sitting at the keyboard *right now*
+// — and its single most common use is asking about what's currently on
+// screen ("what's on my screen", "summarize this window"). Auto-denying
+// take_screenshot (as SAFE_QUEUE_ALLOWLIST does) means the model asks for a
+// screenshot, gets refused, and answers blind, which is exactly the bug this
+// fixes. read_clipboard and list_windows are the same story — read-only
+// observation tools a present user would approve instantly anyway.
+// set_clipboard, focus_window, and open_application are deliberately NOT
+// included here: those ACT on the system rather than observe it, so they stay
+// behind an explicit approval even for quick invoke. Placed at module scope
+// (not inside the component) so it isn't rebuilt on every render.
+const QUICK_INVOKE_ALLOWLIST = [...SAFE_QUEUE_ALLOWLIST, "take_screenshot", "read_clipboard", "list_windows"];
+
+// ─── WP6.4a: IPC task result correlation ───────────────────────────────────
+//
+// The Rust IPC listener (src-tauri/src/ipc.rs) mints an id per `POST /task`
+// and returns it to the external caller so it can poll `GET /task/{id}`. The
+// task queue's own `useTaskQueueStore.enqueue()` mints a SEPARATE id when the
+// `ipc-task` listener below pushes the task in — the two ids are unrelated
+// strings, minted by different code in different processes. This map bridges
+// them: queue-store task id -> the IPC caller's id, so that once the queue
+// runner transitions the task to running/done/error we know which id to
+// report the outcome back under via `ipc_report_task_result`.
+//
+// SUPERSEDED: this was a module-scope Map<queueTaskId, ipcId>. Module scope
+// survives a re-render, but NOT a webview reload — and the task queue is
+// persisted, so it does survive one. A reload (Vite re-optimizing deps after
+// an npm install, a crash, a manual refresh) therefore orphaned every
+// in-flight external task: the task ran to completion while its submitter
+// polled "queued" forever, which is exactly the symptom that took hours to
+// pin down. The id now lives on the persisted task itself as
+// `QueuedTask.externalId`, so the two can't drift apart.
+
+// Tasks we've already sent a "running" report for — a task can stay in
+// "running" status across many unrelated store updates (e.g. another queued
+// task changing state), and without this we'd re-invoke ipc_report_task_result
+// on every one of them instead of once.
+const ipcReportedRunning = new Set<string>();
+
+// Idempotence guard, same pattern as taskRunner.ts's `started` flag: a second
+// call to startIpcResultReporter() (e.g. a React effect re-invocation) must
+// not register a duplicate store subscription.
+let ipcResultReporterStarted = false;
+
+/**
+ * Watches the task queue for tasks carrying an `externalId` (see above)
+ * to an externally-submitted IPC task, and reports their status back to Rust
+ * via the ipc_report_task_result command so a caller polling
+ * `GET /task/{id}` can see "running" while it's in flight and "done"/"error"
+ * with a summary once it finishes.
+ *
+ * Subscribes to useTaskQueueStore at module scope, outside React render —
+ * mirrors taskRunner.ts's startTaskRunner()/useTaskQueueStore.subscribe
+ * pattern exactly, rather than a component-scoped effect, so it isn't tied to
+ * any particular component's mount lifecycle.
+ *
+ * Every invoke() call is wrapped in try/catch (via .catch(), logged not
+ * thrown) — same guard as the other Tauri-boundary calls in this file
+ * (showResultWidget, handleQuickInvokeChat's window-surfacing calls): an
+ * unguarded rejection here would reach main.tsx's global unhandledrejection
+ * handler and replace #root with an error screen, i.e. a missing capability
+ * permission or a stale/evicted task id would take down the whole UI instead
+ * of just failing to report one outcome.
+ */
+function startIpcResultReporter(): void {
+  if (ipcResultReporterStarted) return;
+  ipcResultReporterStarted = true;
+
+  useTaskQueueStore.subscribe((state, prev) => {
+    // A task DELETED before it finished (the X button in QueuedTaskBanner)
+    // would otherwise leave its external submitter polling "running" forever:
+    // the task just vanishes from the array, so the status loop below never
+    // sees a terminal state to report. Detect the disappearance and close the
+    // loop honestly as a cancellation.
+    if (prev && prev.tasks !== state.tasks) {
+      const stillPresent = new Set(state.tasks.map((t) => t.id));
+      for (const gone of prev.tasks) {
+        if (!gone.externalId) continue;
+        if (stillPresent.has(gone.id)) continue;
+        if (gone.status === "done" || gone.status === "error") continue; // already reported
+        void invoke("ipc_report_task_result", {
+          id: gone.externalId,
+          status: "error",
+          summary: "Cancelled — the task was removed from the queue in LocalMind before it finished.",
+        }).catch((err) => {
+          console.error("[ipc] ipc_report_task_result(cancelled) failed:", err);
+        });
+        ipcReportedRunning.delete(gone.id);
+      }
+    }
+
+    for (const task of state.tasks) {
+      const ipcId = task.externalId;
+      if (!ipcId) continue; // not an externally-submitted task
+
+      if (task.status === "running") {
+        if (!ipcReportedRunning.has(task.id)) {
+          ipcReportedRunning.add(task.id);
+          void invoke("ipc_report_task_result", { id: ipcId, status: "running", summary: null }).catch((err) => {
+            console.error("[ipc] ipc_report_task_result(running) failed:", err);
+          });
+        }
+        continue;
+      }
+
+      if (task.status === "done" || task.status === "error") {
+        // Prefer `fullText` (the agent's real answer, capped at 8000 chars)
+        // over `summary`, which is hard-capped at 500 and exists only to label
+        // a Logs row — sending it to a chat client truncates answers
+        // mid-sentence. `summary` remains the fallback for records persisted
+        // before fullText existed.
+        const result = task.resultId
+          ? useSessionResultsStore.getState().results.find((r) => r.id === task.resultId)
+          : undefined;
+        const summary = result?.fullText ?? result?.summary ?? "(no result recorded)";
+        void invoke("ipc_report_task_result", { id: ipcId, status: task.status, summary }).catch((err) => {
+          console.error("[ipc] ipc_report_task_result(outcome) failed:", err);
+        });
+        // `externalId` stays on the task (it's part of the persisted record,
+        // and re-reporting a terminal outcome is harmless — Rust just
+        // overwrites the same value). Only the in-memory dedupe set needs
+        // clearing so it can't grow unbounded.
+        ipcReportedRunning.delete(task.id);
+      }
+    }
+  });
+}
 
 export default function App() {
   const {
@@ -233,6 +371,12 @@ export default function App() {
   // Once the user clicks "Approve All", remaining approval-required calls for
   // the rest of this task are auto-approved without prompting again.
   const autoApproveRemainingRef = useRef(false);
+  // Always-current pointer to handleSend, so the mount-once quick-invoke
+  // listener below (WP5.3) never calls a stale closure — handleSend reads
+  // several pieces of component state (selectedModel, agentMode, dirHandle,
+  // etc.) directly rather than via store getState(), so the ref must be
+  // refreshed on every render rather than captured once.
+  const handleSendRef = useRef<typeof handleSend | null>(null);
 
   const activeConv = conversations.find((c) => c.id === activeId) ?? null;
 
@@ -316,12 +460,36 @@ export default function App() {
     if (!same) setModels(merged);
   }, [providerConfigs]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Keep a VALID model selected whenever the model list changes.
+  //
+  // Selection used to be set in exactly one place — initOllama, which runs
+  // once on mount — so any path that left `selectedModel` empty or pointing at
+  // a model that no longer exists stranded the app with no model and no way to
+  // recover but a restart (the Nucleus island simply renders blank). That
+  // happens more than you'd think: a provider gets disabled, a model is
+  // deleted from Ollama, the persisted selection predates a model list that no
+  // longer contains it, or (in dev) an HMR reload re-creates the store after
+  // initOllama has already run.
+  //
+  // Runs on every availableModels change and only acts when the current pick
+  // is missing or invalid, so it never fights an explicit user choice.
+  useEffect(() => {
+    if (availableModels.length === 0) return;
+    if (selectedModel && availableModels.includes(selectedModel)) return;
+    setSelectedModel(availableModels[0]);
+  }, [availableModels, selectedModel]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Boot the global task-queue runner once — it drains pending tasks (queued
   // via send_task_to_tab) through the headless agent runtime unattended, and
   // watches for workspace-open so tasks queued before a workspace existed
   // start automatically once one is available.
   useEffect(() => {
     startTaskRunner();
+    // WP6.4a: reports IPC-submitted tasks' running/done/error status back to
+    // Rust (ipc_report_task_result) so an external caller polling
+    // GET /task/{id} can see the outcome — see startIpcResultReporter's doc
+    // comment above. Idempotent, like startTaskRunner.
+    startIpcResultReporter();
     // Background scheduler (fires job-due events → headless runs), MCP
     // auto-connect (reconnect enabled servers on launch), and the tray's
     // close-to-tray setting sync. All idempotent.
@@ -359,6 +527,229 @@ export default function App() {
       }
     })();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ─── Quick-invoke overlay (WP5.3) + result widget (WP5.4) ─────────────────
+  //
+  // The overlay webview (src/overlay/QuickInvoke.tsx) is a dumb input box —
+  // it only emits a `quick-invoke` event with { prompt, mode } and never runs
+  // any agent logic itself. This is where the actual work happens: "chat"
+  // mode surfaces the main window and sends the prompt through the normal
+  // handleSend path (via handleSendRef so we never call a stale closure);
+  // "widget" mode fires a headless run via runHeadlessTask and reports
+  // progress/outcome through the `quick-result` event to the result widget
+  // (src/result/ResultWidget.tsx) instead — the main window is never shown.
+  // Guarded by isTauriEnv() like the rest of the file's Tauri-only effects, so
+  // browser dev mode never tries to subscribe.
+  useEffect(() => {
+    if (!isTauriEnv()) return;
+    const unlistenPromise = listen<{ prompt: string; mode: "chat" | "widget" }>(
+      "quick-invoke",
+      (event) => {
+        const { prompt, mode } = event.payload;
+        if (mode === "chat") {
+          void handleQuickInvokeChat(prompt);
+        } else {
+          void handleQuickInvokeWidget(prompt);
+        }
+      }
+    );
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ─── Local IPC listener (WP5.4, result retrieval added WP6.4a) ────────────
+  //
+  // src-tauri/src/ipc.rs runs a loopback-only HTTP listener (127.0.0.1:41777,
+  // bearer-token gated) so other local programs — the primary planned
+  // consumer is the Python phone-agent (Telegram bridge) — can hand LocalMind
+  // a task. The Rust side only validates the token/body and emits this
+  // `ipc-task` event; it never executes anything itself. This is the ONLY
+  // place that event is consumed, and all it does is push the task into the
+  // existing task queue via the same `enqueue()` the send_task_to_tab tool
+  // uses (see src/store/taskQueue.ts) — so an IPC-submitted task is subject
+  // to exactly the same task-runner concurrency limit, SAFE_QUEUE_ALLOWLIST,
+  // and workspace confinement as any other queued task (taskRunner.ts).
+  // Reads live state via .getState() rather than closured component state,
+  // same stale-closure care as the quick-invoke listener above. Unlike
+  // quick-invoke, this DOES toast: the main window is the right place to
+  // surface it, and a task silently appearing in the queue from an external
+  // program is worse than a notification.
+  //
+  // WP6.4a: the event payload now also carries `id` — the id Rust generated
+  // and already returned to the external caller in the `POST /task` HTTP
+  // response, for later polling via `GET /task/{id}`. It's stored ON the
+  // queued task as `externalId` (persisted with it, so a webview reload can't
+  // orphan an in-flight task) and startIpcResultReporter reports the eventual
+  // outcome back under it.
+  useEffect(() => {
+    if (!isTauriEnv()) return;
+    const unlistenPromise = listen<{ id: string; task: string; targetView?: string }>(
+      "ipc-task",
+      (event) => {
+        const { id, task, targetView } = event.payload;
+        // Validate against the real AppView list here (the Rust side passes
+        // through whatever the caller sent, or "chat", without validating —
+        // src/types/app.ts is the single source of truth for AppView).
+        const view: AppView = APP_VIEWS.includes(targetView as AppView)
+          ? (targetView as AppView)
+          : "chat";
+        useTaskQueueStore.getState().enqueue(view, task, view, id);
+        const label = task.slice(0, 60) + (task.length > 60 ? "…" : "");
+        toast.info(`Task received from an external program: "${label}"`);
+
+        // taskRunner.processNextPending() silently leaves a task pending when
+        // no workspace is open (it can't register a confinement root without
+        // one) and waits for the workspacePath subscription to retrigger. In
+        // the app that's fine — the queue banner shows it. Over IPC it's a
+        // black hole: the caller gets 202, then polls "queued" forever with no
+        // way to learn why. Report the reason so a remote client can say
+        // something actionable instead of hanging.
+        if (!useAgentStore.getState().workspacePath) {
+          void invoke("ipc_report_task_result", {
+            id,
+            status: "queued",
+            summary:
+              "Waiting — no workspace folder is open in LocalMind, so queued tasks can't start. Open a folder in the app; this task will run automatically once you do.",
+          }).catch((err) => {
+            console.error("[ipc] no-workspace notice failed:", err);
+          });
+        }
+      }
+    );
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function handleQuickInvokeChat(prompt: string): Promise<void> {
+    // Surfacing the window is best-effort and must NEVER block the send. These
+    // three calls each need their own capability permission in
+    // capabilities/default.json (core:window:allow-show / allow-unminimize /
+    // allow-set-focus — core:default does NOT include them), and a missing one
+    // rejects. Left unguarded, that rejection reaches main.tsx's global
+    // unhandledrejection handler, which replaces #root with a red error screen
+    // — i.e. a permissions typo takes down the whole app instead of just
+    // failing to raise the window. Swallow it and still deliver the prompt.
+    try {
+      const win = getCurrentWindow();
+      await win.show();
+      await win.unminimize();
+      await win.setFocus();
+    } catch (err) {
+      console.error("[quick-invoke] could not surface the main window:", err);
+    }
+    setView("chat");
+    // forceNewConversation=true: quick-invoke always starts a fresh
+    // conversation rather than appending to whatever chat happens to be
+    // active. handleSendRef.current is always the latest handleSend closure
+    // (refreshed every render, see the assignment above), so this reads
+    // current selectedModel/agentMode/etc. even though this listener itself
+    // was registered once on mount.
+    void handleSendRef.current?.(prompt, false, true);
+  }
+
+  // Best-effort wrapper around invoke("show_result_widget"): this crosses the
+  // Rust boundary (a missing capability permission would reject), and left
+  // unguarded a rejection here would hit main.tsx's global unhandledrejection
+  // handler and wipe #root — same hazard as the window-surfacing calls in
+  // handleQuickInvokeChat above. Swallow and log instead.
+  //
+  // `compact` selects which of the two sizes Rust resizes/re-anchors the
+  // window to: true while a run is in flight (small loading pill, no prompt
+  // text, no counter — nothing worth a big empty card), false for the final
+  // done/error card. Always call this BEFORE emitting the matching
+  // `quick-result` payload so the window is already the right size (and
+  // re-anchored bottom-right) by the time the new content would render.
+  async function showResultWidget(compact: boolean): Promise<void> {
+    try {
+      await invoke("show_result_widget", { compact });
+    } catch (err) {
+      console.error("[quick-invoke] show_result_widget failed:", err);
+    }
+  }
+
+  // Fire a `quick-result` event for the result widget to render. Wrapped the
+  // same way the overlay wraps its `quick-invoke` emit — logged, not thrown,
+  // so a transient IPC failure can never crash the caller.
+  function emitQuickResult(payload: { status: "running" | "done" | "error"; prompt: string; text?: string }): void {
+    void emit("quick-result", payload).catch((err) =>
+      console.error("[quick-invoke] quick-result emit failed:", err)
+    );
+  }
+
+  async function handleQuickInvokeWidget(prompt: string): Promise<void> {
+    // Read live store state rather than this component's (possibly stale,
+    // mount-time) closured values — mirrors the exact pattern taskRunner.ts /
+    // scheduler.ts use for their headless runs.
+    const workspacePath = useAgentStore.getState().workspacePath;
+    if (!workspacePath) {
+      // This is a final error, not a running state, so it goes straight to
+      // the expanded card rather than the compact pill. Reports through the
+      // widget, not a toast — the main window is never surfaced for this
+      // mode, so a toast would go unseen.
+      await showResultWidget(false);
+      emitQuickResult({
+        status: "error",
+        prompt,
+        text: "Quick invoke needs a workspace — open a workspace folder first, then try again.",
+      });
+      return;
+    }
+    const modelRef = useModelSelectionStore.getState().selectedModel;
+    const hardware = useModelStore.getState().hardware;
+    const numCtxOverride = useSettingsStore.getState().numCtxOverride;
+
+    await showResultWidget(true);
+    emitQuickResult({ status: "running", prompt });
+
+    try {
+      const { record, transcript } = await runHeadlessTask({
+        workspacePath,
+        modelRef,
+        task: prompt,
+        hardware,
+        numCtxOverride,
+        currentView: "chat",
+        origin: "quick-invoke",
+        agentBuildMode: true,
+        // SAFE_QUEUE_ALLOWLIST (task queue, WP2.1) plus the read-only
+        // screen-observation tools — see QUICK_INVOKE_ALLOWLIST's definition
+        // above for why. Still never run_command/install_deps/git_add/
+        // git_commit, and never the system-acting tools (set_clipboard,
+        // focus_window, open_application) without a human present.
+        toolAllowlist: QUICK_INVOKE_ALLOWLIST,
+        // Deliberately FALSE, unlike taskRunner/scheduler. Those fire tasks
+        // the user authored specifically to change something, so a run that
+        // mutates nothing is a real failure (headlessRunner forces
+        // outcome:"error" when expectSideEffects && !hadSideEffects). A
+        // quick-invoke prompt is arbitrary free text typed a second ago —
+        // "what's in my README", "how big is the build" — and answering it
+        // without touching a file is a correct outcome, not a failure.
+        expectSideEffects: false,
+      });
+      // The result widget is the only surface for this mode now — no OS
+      // notification, no toast (WP5.4). Grow to the full card before
+      // delivering the content that needs the room to show it in.
+      await showResultWidget(false);
+      // `transcript`, NOT `record.summary` — summary is hard-capped at 500
+      // chars by headlessRunner (it exists to label a row in the Logs tab),
+      // which chopped real answers off mid-sentence in the widget. The widget
+      // is the ONLY place this text is ever shown for a quick invoke, so it
+      // gets the full answer; its body already scrolls. Fall back to summary
+      // if the transcript came back empty.
+      const answer = transcript.trim() || record.summary;
+      if (record.outcome === "error") {
+        emitQuickResult({ status: "error", prompt, text: answer });
+      } else {
+        emitQuickResult({ status: "done", prompt, text: answer });
+      }
+    } catch (err) {
+      const message = (err as Error)?.message ?? String(err);
+      await showResultWidget(false);
+      emitQuickResult({ status: "error", prompt, text: message });
+    }
+  }
 
   async function initOllama() {
     const providers = useProvidersStore.getState().providers;
@@ -401,7 +792,16 @@ export default function App() {
     const ollamaNames = ollamaModels.map((m) => m.name);
     const all = [...ollamaNames, ...providerModels];
     setModels(all);
-    if (all.length > 0) setSelectedModel(all[0]);
+    // Keep the restored choice if that model still exists; only fall back to
+    // the first entry when there's nothing valid to keep. Overwriting
+    // unconditionally (the previous behavior) meant an explicit pick was
+    // silently replaced on every launch — and since this store is the
+    // `primary` model role, that quietly changed which model ran every agent
+    // task and scheduled job.
+    if (all.length > 0) {
+      const restored = useModelSelectionStore.getState().selectedModel;
+      if (!restored || !all.includes(restored)) setSelectedModel(all[0]);
+    }
     setOllamaError(null);
 
     // Probe real tool/vision capabilities from Ollama in the background —
@@ -458,7 +858,7 @@ export default function App() {
 
   // ─── Normal send (non-agent) ──────────────────────────────────────────────
 
-  async function handleSend(text: string, forceAgentMode = false) {
+  async function handleSend(text: string, forceAgentMode = false, forceNewConversation = false) {
     if (!selectedModel) return;
 
     // Abort any still-in-flight session before starting a new one. Covers the
@@ -485,7 +885,10 @@ export default function App() {
       }
     }
 
-    let convId = activeId;
+    // forceNewConversation (quick-invoke "open in chat", see the effect below)
+    // always starts a fresh conversation instead of appending to whatever's
+    // currently active.
+    let convId = forceNewConversation ? null : activeId;
     if (!convId) convId = newConversation(selectedModel);
     activeConvIdRef.current = convId;
 
@@ -567,6 +970,10 @@ export default function App() {
       await runNormalChat(convId, [{ role: "system", content: identity }, ...history]);
     }
   }
+
+  // Refresh on every render (not inside an effect) so it's always the latest
+  // closure by the time the quick-invoke listener (mounted once, below) fires.
+  handleSendRef.current = handleSend;
 
   // ─── Normal (non-agent) streaming ────────────────────────────────────────
 

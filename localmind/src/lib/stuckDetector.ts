@@ -31,6 +31,25 @@ export function errorRecoveryHint(output: string): string | null {
   return null;
 }
 
+/**
+ * Tools whose entire purpose is to re-observe external state that changes on
+ * its own — the screen, the clipboard, the window list, the clock. Calling one
+ * twice with identical arguments is NOT a loop: the answer legitimately
+ * differs between calls because the user switched windows, scrolled, or copied
+ * something new. The consecutive-duplicate guard (rule 4) treats identical
+ * args as proof of a stuck model, which is exactly wrong here — it blocked a
+ * legitimate "screenshot again, the first OCR was too faint" retry.
+ *
+ * They're exempt from rule 4 only. TOOL_CALL_LIMITS still caps them, so a
+ * genuinely stuck model can't sit there screenshotting forever.
+ */
+const OBSERVATION_TOOLS = new Set([
+  "take_screenshot",
+  "read_clipboard",
+  "list_windows",
+  "get_current_datetime",
+]);
+
 const REPEATABLE_TOOLS = new Set(["run_command", "web_search", "web_fetch", "install_deps", "schedule_task"]);
 const READ_ONLY_TOOLS = new Set(["read_file", "list_directory", "grep_files", "find_files"]);
 
@@ -48,6 +67,14 @@ export class StuckDetector {
     update_project_memory: 10,
     save_global_memory: 10,
     save_skill: 1,
+    // Observation tools (see OBSERVATION_TOOLS) are exempt from the
+    // consecutive-duplicate guard, so these session caps are the only thing
+    // standing between a confused model and an infinite re-observation loop.
+    // Set high enough for legitimate "look again" retries, low enough to stop
+    // a spiral.
+    take_screenshot: 4,
+    read_clipboard: 5,
+    list_windows: 5,
   };
   static readonly MANAGEMENT_TOOLS = new Set([
     "todo_write", "update_project_memory", "save_global_memory", "list_skills", "get_system_info",
@@ -104,7 +131,10 @@ export class StuckDetector {
       this.lastFingerprint = fingerprint;
       this.lastFingerprintCount = 1;
     }
-    if (this.lastFingerprintCount >= StuckDetector.DUPLICATE_LIMIT) {
+    if (
+      !OBSERVATION_TOOLS.has(call.name) &&
+      this.lastFingerprintCount >= StuckDetector.DUPLICATE_LIMIT
+    ) {
       this.lastFingerprint = "";
       this.lastFingerprintCount = 0;
       return `[BLOCKED — LOOP] You called ${call.name} with identical arguments ${StuckDetector.DUPLICATE_LIMIT} times in a row. This call was NOT executed. Try something different — re-read the relevant file, or move to the next todo item. If you're blocked because a capability is missing, use register_tool (a shell one-liner) or propose_feature (an app change) instead of retrying.`;

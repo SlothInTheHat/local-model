@@ -253,6 +253,11 @@ export async function runHeadlessTask(opts: HeadlessTaskOpts): Promise<HeadlessT
     finishedAt,
     outcome,
     summary,
+    // Keep the real answer on the record, not just the 500-char label. Callers
+    // that report a result to a human (the IPC/Telegram relay, the quick-invoke
+    // widget) need this; without it the transcript died here and only survived
+    // inside the FTS index, which is searchable but not addressable by id.
+    fullText: transcript.trim().slice(0, 8000) || undefined,
     steps,
     roundsUsed,
     hadSideEffects,

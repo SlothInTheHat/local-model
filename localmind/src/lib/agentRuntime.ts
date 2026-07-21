@@ -929,7 +929,7 @@ export async function runAgentSession(
       !wasAborted &&
       toolCallCount >= 3
     ) {
-      await distillAndSaveMemories(state.taskQuery, history, config.modelRef, config.signal);
+      await distillAndSaveMemories(state.taskQuery, history, config.signal);
     }
   } catch {
     // ignore — memory write-back is non-essential

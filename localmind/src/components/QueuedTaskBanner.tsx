@@ -39,6 +39,7 @@ function StatusIcon({ status }: { status: QueuedTask["status"] }) {
 
 export function QueuedTaskBanner({ view, onStart }: Props) {
   const allTasks = useTaskQueueStore((s) => s.tasks);
+  const deferReason = useTaskQueueStore((s) => s.deferReason);
   const setStatus = useTaskQueueStore((s) => s.setStatus);
   const remove = useTaskQueueStore((s) => s.remove);
   const results = useSessionResultsStore((s) => s.results);
@@ -75,6 +76,16 @@ export function QueuedTaskBanner({ view, onStart }: Props) {
                 Queued from {t.sourceView} · {STATUS_LABEL[t.status]}
               </p>
               <p className="text-sm text-foreground truncate">{t.task}</p>
+              {/* A pending task used to sit here indefinitely with no hint as
+                  to why. The runner now publishes the reason it declined to
+                  start (no workspace / model busy); if it's null while a task
+                  is still pending, the runner isn't being reached at all,
+                  which is itself the most useful thing to say. */}
+              {t.status === "pending" && (
+                <p className="text-[11px] text-muted-foreground mt-0.5">
+                  {deferReason ?? "Runner hasn't reported in — press Start to run it here instead."}
+                </p>
+              )}
             </div>
             {t.status === "pending" && (
               <Button

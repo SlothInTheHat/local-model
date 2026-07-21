@@ -1,8 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { Brain, ChevronDown, ChevronRight } from "lucide-react";
 import { cn } from "./ui/utils";
+import { Markdown } from "./Markdown";
 import type { ChatMessage } from "../lib/ollama";
 
 interface Props {
@@ -277,9 +276,7 @@ const MessageRow = memo(function MessageRow({
             </div>
           ) : (
             <>
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {rendered || " "}
-              </ReactMarkdown>
+              <Markdown>{rendered || " "}</Markdown>
               {isLast && isStreaming && (
                 <span className="inline-block w-0.5 h-4 bg-foreground/40 animate-pulse ml-0.5 align-middle" />
               )}

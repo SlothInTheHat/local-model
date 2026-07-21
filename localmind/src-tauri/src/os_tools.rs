@@ -133,6 +133,71 @@ pub fn take_screenshot() -> Result<ScreenshotResult, String> {
     }
 }
 
+/// Read a PNG produced by `take_screenshot`, downscale it if either dimension
+/// exceeds `max_dim` (preserving aspect ratio), and return it as standard
+/// base64 (no `data:` URI prefix) — the format the frontend's existing
+/// image-attachment path (`src/lib/imageUtils.ts` `fileToBase64`) already
+/// feeds to Ollama's `images` field. Used by WP6.2b's screenshot vision
+/// sub-call so a 4K capture doesn't cross the IPC boundary and then the
+/// network as several raw megabytes.
+///
+/// Platform-independent (pure `image`-crate work, no WinRT/GDI), so unlike
+/// the capture/OCR commands above this isn't gated behind
+/// `target_os = "windows"`.
+///
+/// SECURITY: this command hands arbitrary file bytes back to the frontend on
+/// request, so it must not become a general-purpose file reader. It is
+/// deliberately confined to exactly the files `take_screenshot` itself
+/// produces: canonicalize `path`, require its parent directory to be
+/// `std::env::temp_dir()` (no escaping via `..` or symlinks), and require the
+/// filename to match `localmind-screenshot-<digits>.png` — the exact pattern
+/// `windows_impl::take_screenshot` writes above. Any other path is refused.
+#[tauri::command]
+pub fn read_image_base64(path: String, max_dim: u32) -> Result<String, String> {
+    let requested = std::path::Path::new(&path);
+    let canonical = dunce::canonicalize(requested)
+        .map_err(|e| format!("Cannot access '{path}': {e}"))?;
+
+    let temp_dir = dunce::canonicalize(std::env::temp_dir())
+        .map_err(|e| format!("Cannot resolve temp dir: {e}"))?;
+
+    if canonical.parent() != Some(temp_dir.as_path()) {
+        return Err(
+            "Refusing to read a file outside the screenshot temp directory".to_string(),
+        );
+    }
+
+    let filename = canonical
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| "Invalid file name".to_string())?;
+
+    let matches_screenshot_pattern = filename
+        .strip_prefix("localmind-screenshot-")
+        .and_then(|rest| rest.strip_suffix(".png"))
+        .is_some_and(|stem| !stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit()));
+
+    if !matches_screenshot_pattern {
+        return Err(format!(
+            "Refusing to read '{filename}' — only this app's own screenshot temp files (localmind-screenshot-<id>.png) are allowed"
+        ));
+    }
+
+    let img = image::open(&canonical).map_err(|e| format!("Failed to open image: {e}"))?;
+    let resized = if img.width() > max_dim || img.height() > max_dim {
+        img.resize(max_dim, max_dim, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+
+    let mut bytes: Vec<u8> = Vec::new();
+    resized
+        .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .map_err(|e| format!("Failed to encode PNG: {e}"))?;
+
+    Ok(crate::base64_encode(&bytes))
+}
+
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::{ScreenshotResult, WindowInfo};

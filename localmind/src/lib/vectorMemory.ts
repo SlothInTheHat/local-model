@@ -2,7 +2,7 @@ import type { ChatMessage } from "./ollama";
 import type { MemoryEntry } from "../store/memory";
 import { useMemoryStore, touchMemories } from "../store/memory";
 import { getOllamaBaseUrl } from "./ollama";
-import { streamChatForModel } from "./chatProvider";
+import { digest } from "./modelRoles";
 
 export async function embedText(text: string, model: string): Promise<number[]> {
   const res = await fetch(`${getOllamaBaseUrl()}/api/embed`, {
@@ -143,8 +143,13 @@ export function formatMemoriesForContext(
 /** A fact scores at or above this cosine similarity to something already
  *  stored is treated as a near-duplicate and skipped (dedup). */
 const DEDUP_COSINE_THRESHOLD = 0.92;
-/** Hard cap on the digest response so a rambling model can't stall the round. */
-const DIGEST_MAX_CHARS = 2000;
+// DIGEST_MAX_CHARS moved to src/lib/modelRoles.ts alongside the `digest()`
+// seam that enforces it. It briefly lived here and was imported by modelRoles,
+// which made vectorMemory <-> modelRoles a genuine import cycle. That happened
+// to work (both uses were inside function bodies), but this codebase has
+// already been bitten once by a cycle's temporal dead zone — see the
+// "Cannot access 'TOOL_DEFINITIONS' before initialization" note in
+// headlessRunner.ts. Not worth keeping a live cycle for one constant.
 
 /** Pull the largest [...] block out of possibly-fenced model output and parse
  *  it defensively (crib of agentRuntime's parseSkillJson, adapted for an array
@@ -177,7 +182,6 @@ function parseFactsJson(raw: string): string[] {
 export async function distillAndSaveMemories(
   taskQuery: string,
   finalHistory: ChatMessage[],
-  modelRef: string,
   signal: AbortSignal,
 ): Promise<void> {
   const toolSummaries = finalHistory
@@ -195,22 +199,12 @@ export async function distillAndSaveMemories(
     'Respond with ONLY a JSON array of up to 3 short strings, e.g. ["fact one", "fact two"]. If nothing durable came out of this session, respond with [].',
   ].filter(Boolean).join("\n");
 
-  let out = "";
-  try {
-    for await (const chunk of streamChatForModel(
-      modelRef,
-      [
-        { role: "system", content: "You extract durable, cross-session facts. Respond with only a JSON array, no prose or fences." },
-        { role: "user", content: prompt },
-      ],
-      signal,
-    )) {
-      out += chunk;
-      if (out.length > DIGEST_MAX_CHARS) break;
-    }
-  } catch {
-    return; // digest call failed (model/network) — degrade silently
-  }
+  const out = await digest(
+    "You extract durable, cross-session facts. Respond with only a JSON array, no prose or fences.",
+    prompt,
+    signal,
+  );
+  if (out == null) return; // digest call failed (no digest model / model / network) — degrade silently
 
   const facts = parseFactsJson(out);
   for (const fact of facts) {

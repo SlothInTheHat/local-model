@@ -230,10 +230,13 @@ use db::{
 };
 
 mod tray;
-use tray::set_close_to_tray;
+use tray::{set_close_to_tray, show_result_widget};
 
 mod os_tools;
-use os_tools::{open_application, list_windows, focus_window, take_screenshot};
+use os_tools::{open_application, list_windows, focus_window, take_screenshot, read_image_base64};
+
+mod ipc;
+use ipc::{get_ipc_token, ipc_report_task_result};
 
 // ─── Generic HTTP fetch (used by the frontend for requests that would hit CORS
 // in the packaged webview, e.g. web search against DuckDuckGo) ────────────────
@@ -389,7 +392,11 @@ fn fs_read_file_base64(path: String) -> Result<String, String> {
     Ok(base64_encode(&bytes))
 }
 
-fn base64_encode(data: &[u8]) -> String {
+/// `pub(crate)` (not private) so `os_tools::read_image_base64` (WP6.2b) can
+/// reuse it instead of pulling in a whole crate for one encode call — this
+/// project already has zero base64 dependency and this hand-rolled encoder
+/// has been fine for `fs_read_file_base64` above.
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
     for chunk in data.chunks(3) {
@@ -1118,10 +1125,14 @@ pub fn run() {
             session_search,
             http_fetch,
             set_close_to_tray,
+            show_result_widget,
             open_application,
             list_windows,
             focus_window,
             take_screenshot,
+            read_image_base64,
+            get_ipc_token,
+            ipc_report_task_result,
         ])
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -1131,13 +1142,19 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
-                    // Any registered shortcut lands here; we only register one
-                    // (Ctrl+Shift+Space) so no need to match on `_shortcut`.
-                    // Fire on key-down only — HotKeyState::Released would
-                    // otherwise toggle the window twice per press.
-                    if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                .with_handler(|app, shortcut, event| {
+                    use tauri_plugin_global_shortcut::{Code, Modifiers, ShortcutState};
+                    // Fire on key-down only — ShortcutState::Released would
+                    // otherwise toggle twice per press.
+                    if event.state() != ShortcutState::Pressed {
+                        return;
+                    }
+                    // Two shortcuts are registered now (main window toggle +
+                    // WP5.3 overlay toggle), so dispatch on which one fired.
+                    if shortcut.matches(Modifiers::CONTROL | Modifiers::SHIFT, Code::Space) {
                         tray::toggle_main_window(app);
+                    } else if shortcut.matches(Modifiers::CONTROL | Modifiers::SHIFT, Code::KeyK) {
+                        tray::toggle_overlay(app);
                     }
                 })
                 .build(),
@@ -1159,6 +1176,13 @@ pub fn run() {
                 eprintln!("[tray] failed to initialize system tray: {e}");
             }
 
+            // WP5.4: loopback-only local IPC listener so other local programs
+            // (e.g. the phone-agent Telegram bridge) can hand LocalMind a
+            // task. Runs on its own thread and only ever enqueues into the
+            // existing task queue via an `ipc-task` event — see ipc.rs for
+            // the full safety writeup. Bind failures are logged, not fatal.
+            ipc::start(app.handle().clone());
+
             // WP5.1: global hotkey (Ctrl+Shift+Space) to show/hide the main
             // window from anywhere in the OS. Registration can fail if
             // another app already owns the combo — log and keep going rather
@@ -1169,6 +1193,18 @@ pub fn run() {
                 let hotkey = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
                 if let Err(e) = app.global_shortcut().register(hotkey) {
                     eprintln!("[hotkey] could not register Ctrl+Shift+Space (likely owned by another app): {e}");
+                }
+            }
+
+            // WP5.3: global hotkey (Ctrl+Shift+K) to show/hide the quick-invoke
+            // overlay from anywhere in the OS. Same "log and keep going" policy
+            // as above — another app may already own this combo, and that must
+            // not be fatal to startup.
+            {
+                use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
+                let overlay_hotkey = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyK);
+                if let Err(e) = app.global_shortcut().register(overlay_hotkey) {
+                    eprintln!("[hotkey] could not register Ctrl+Shift+K (likely owned by another app): {e}");
                 }
             }
 

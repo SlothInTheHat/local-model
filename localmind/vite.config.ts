@@ -1,9 +1,15 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { resolve } from "path";
+import { fileURLToPath } from "url";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
+
+// vite.config.ts is ESM, so __dirname isn't defined — derive it from
+// import.meta.url instead.
+const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
@@ -14,6 +20,15 @@ export default defineConfig(async () => ({
   // 1. prevent Vite from obscuring rust errors
   build: {
     rollupOptions: {
+      // Multi-page build (WP5.3, extended for the result widget): the overlay
+      // and result windows each load their own HTML entry so their bundles
+      // never pull in main.tsx/App.tsx (and, by extension, the
+      // stores/scheduler/taskRunner side effects those import).
+      input: {
+        main: resolve(__dirname, "index.html"),
+        overlay: resolve(__dirname, "overlay.html"),
+        result: resolve(__dirname, "result.html"),
+      },
       output: {
         manualChunks: {
           "vendor-radix": [

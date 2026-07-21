@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition, Position};
 use tauri_plugin_autostart::ManagerExt;
 
 const SHOW_ID: &str = "show";
@@ -61,6 +61,86 @@ pub fn toggle_main_window(app: &AppHandle) {
         let _ = win.unminimize();
         let _ = win.set_focus();
     }
+}
+
+/// Toggle the quick-invoke overlay's visibility — bound to the global hotkey
+/// (Ctrl+Shift+K), mirroring `toggle_main_window` above. The overlay has no
+/// minimize state (it's a small always-on-top, non-taskbar window), so unlike
+/// the main window there's no `unminimize()` call needed.
+pub fn toggle_overlay(app: &AppHandle) {
+    let Some(win) = app.get_webview_window("overlay") else { return };
+    if win.is_visible().unwrap_or(false) {
+        let _ = win.hide();
+    } else {
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
+
+/// Inset, in logical pixels, between the result widget and the right/bottom
+/// edges of the monitor's work area. Scaled by the monitor's scale_factor
+/// before use since window positions/sizes are all in physical pixels.
+const RESULT_WIDGET_INSET_LOGICAL_PX: f64 = 24.0;
+
+/// Logical size of the compact loading pill shown while a quick-invoke run is
+/// in flight — small and content-free on purpose (see ResultWidget.tsx).
+const RESULT_WIDGET_COMPACT_SIZE: LogicalSize<f64> = LogicalSize::new(168.0, 60.0);
+
+/// Logical size of the full result card (prompt header, body, close button).
+const RESULT_WIDGET_FULL_SIZE: LogicalSize<f64> = LogicalSize::new(420.0, 320.0);
+
+/// Show the quick-invoke result widget (WP5.4), resizing it to the compact
+/// loading pill or the full result card and re-anchoring it to the
+/// bottom-right corner of whichever monitor it would currently appear on,
+/// without ever stealing focus — the entire point of the widget is that the
+/// user stays in whatever app they were using.
+///
+/// Exposed as a Tauri command (`invoke("show_result_widget", { compact })`)
+/// so App.tsx can call it right before emitting the matching `quick-result`
+/// event — `compact: true` for the "running" pill, `compact: false` for the
+/// "done"/"error" card. Tauri's `#[tauri::command]` extractor only implements
+/// `CommandArg` for an owned `AppHandle`, not `&AppHandle` (see
+/// `tauri::app::CommandArg` impl for `AppHandle<R>`), so the command itself
+/// takes `AppHandle` by value; all the positioning logic below only ever
+/// borrows it.
+///
+/// The window is positioned by its top-left corner, so growing/shrinking it
+/// without re-anchoring would push it off its bottom-right dock — hence
+/// set_size is called FIRST, then outer_size() is re-read (never trust the
+/// pre-resize size for the position math), then set_position.
+///
+/// Positioning failure (no monitor resolvable) is not fatal: per-spec, we fall
+/// back to just showing the window wherever it last was rather than erroring
+/// out and leaving it hidden.
+#[tauri::command]
+pub fn show_result_widget(app: AppHandle, compact: bool) {
+    let Some(win) = app.get_webview_window("result") else { return };
+
+    let target_size = if compact { RESULT_WIDGET_COMPACT_SIZE } else { RESULT_WIDGET_FULL_SIZE };
+    let _ = win.set_size(target_size);
+
+    let monitor = win
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| win.primary_monitor().ok().flatten());
+
+    if let (Some(monitor), Ok(size)) = (monitor, win.outer_size()) {
+        // work_area() already excludes the taskbar and is expressed in the
+        // same physical-pixel coordinate space as monitor.position() (i.e. it
+        // accounts for multi-monitor origins that aren't (0, 0)).
+        let work_area = monitor.work_area();
+        let inset = (RESULT_WIDGET_INSET_LOGICAL_PX * monitor.scale_factor()).round() as i32;
+
+        let x = work_area.position.x + work_area.size.width as i32 - size.width as i32 - inset;
+        let y = work_area.position.y + work_area.size.height as i32 - size.height as i32 - inset;
+
+        let _ = win.set_position(Position::Physical(PhysicalPosition { x, y }));
+    }
+
+    // Never call set_focus() here — stealing focus is exactly what this
+    // widget exists to avoid.
+    let _ = win.show();
 }
 
 /// Build the tray icon + right-click menu and wire up close-to-tray window

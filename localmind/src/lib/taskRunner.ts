@@ -7,7 +7,7 @@ import { useModelStore } from "../store/models";
 import { useSettingsStore } from "../store/settings";
 import { runHeadlessTask } from "./headlessRunner";
 import { notifyOs } from "./osNotify";
-import { isGenerationBusy } from "./generationGate";
+import { isGenerationBusy, generationGateState } from "./generationGate";
 
 /**
  * Tools auto-approved for unattended task-queue runs.
@@ -51,6 +51,25 @@ export const SAFE_QUEUE_ALLOWLIST: string[] = [
 
 /** Module-level concurrency-1 guard — only one task runs at a time. */
 let isRunning = false;
+/** When the in-flight run started, so a leaked `isRunning` is reportable
+ *  rather than an invisible permanent block. Null whenever idle. */
+let runStartedAt: number | null = null;
+
+/**
+ * Publish why the runner declined to start a task — but ONLY when the message
+ * actually changed.
+ *
+ * Belt-and-braces against the feedback loop described on the store
+ * subscription in startTaskRunner: writing to the store from inside the code
+ * path that the store's own subscription triggers is inherently circular, so
+ * even with the subscription now filtering on `tasks`, this refuses to emit a
+ * redundant update.
+ */
+function publishDeferReason(reason: string | null): void {
+  const store = useTaskQueueStore.getState();
+  if (store.deferReason === reason) return;
+  store.setDeferReason(reason);
+}
 /** Idempotence guard so startTaskRunner() can be called more than once safely
  * (e.g. React effect re-invocation) without registering duplicate subscriptions. */
 let started = false;
@@ -73,13 +92,46 @@ function oldestPending(): QueuedTask | undefined {
  * drains from a single external trigger.
  */
 export async function processNextPending(): Promise<void> {
-  if (isRunning) return; // concurrency 1 — a run is already in flight
+  if (isRunning) {
+    // THE bail-out that hid the "stuck queue" for hours. `isRunning` is
+    // cleared in a `finally`, so it can only stay set if the in-flight run
+    // never settles — which happens when a fetch hangs (a wedged Ollama that
+    // accepts connections but never responds). Removing the task from the
+    // queue via the banner's X does NOT abort the run, so the flag survives
+    // that too, and every subsequent task is skipped in complete silence.
+    //
+    // Deliberately NOT auto-cleared here: force-resetting it while a run is
+    // genuinely in flight would let two generations run at once, which is the
+    // VRAM thrash the concurrency-1 guard exists to prevent. Instead, report
+    // it with elapsed time so a leak is obvious, and rely on the stream stall
+    // watchdog (see STREAM_STALL_TIMEOUT_MS in ollama.ts) to make a hung
+    // request fail within ~3 minutes so the `finally` actually runs.
+    const heldMs = runStartedAt === null ? null : Date.now() - runStartedAt;
+    const heldMin = heldMs === null ? null : Math.round(heldMs / 60_000);
+    console.info(
+      `[taskRunner] deferring: a run is already in flight` +
+        (heldMs !== null ? ` (started ${Math.round(heldMs / 1000)}s ago)` : ""),
+    );
+    publishDeferReason(
+      heldMin !== null && heldMin >= 5
+        ? `A previous task has been running for ${heldMin} minutes and may be wedged — restart the app if it never finishes.`
+        : "Another task is running — this one starts when that finishes.",
+    );
+    return;
+  }
 
   const task = oldestPending();
   if (!task) return; // nothing to do
 
   const workspacePath = useAgentStore.getState().workspacePath;
   if (!workspacePath) {
+    // Both bail-outs in this function used to return in total silence, which
+    // makes "my queued task never ran" unanswerable without a debugger — a
+    // task POSTed over IPC sat at "queued" for 10+ minutes and neither the
+    // user nor the orchestrator could tell which branch was responsible.
+    // These logs cost nothing and turn that into a one-line answer.
+    console.info("[taskRunner] deferring: no workspace open. Task:", task.id);
+    publishDeferReason("No workspace folder is open — open one and this task will start automatically.");
     // Can't register a confinement root without a workspace. Leave the task
     // pending (no error, no spam) — startTaskRunner's workspacePath
     // subscription re-triggers this once a workspace opens.
@@ -91,6 +143,19 @@ export async function processNextPending(): Promise<void> {
   // re-poll in 15s so the queue resumes once the model frees up, instead of
   // starting a second generation into an already-loaded 16GB card.
   if (isGenerationBusy()) {
+    const gate = generationGateState();
+    console.info(
+      `[taskRunner] deferring: ${gate.active} generation(s) in flight` +
+        (gate.oldestHeldMs !== null ? `, oldest held ${Math.round(gate.oldestHeldMs / 1000)}s` : "") +
+        `. Re-polling in 15s. Task: ${task.id}`,
+    );
+    publishDeferReason(
+      `Waiting for the model — ${gate.active} generation${gate.active === 1 ? "" : "s"} in flight` +
+        (gate.oldestHeldMs !== null && gate.oldestHeldMs > 60_000
+          ? ` (oldest running ${Math.round(gate.oldestHeldMs / 60_000)}m — if nothing is actually generating, this is a stuck gate; restart clears it)`
+          : "") +
+        ". Retrying every 15s.",
+    );
     if (!busyPollScheduled) {
       busyPollScheduled = true;
       setTimeout(() => {
@@ -102,7 +167,9 @@ export async function processNextPending(): Promise<void> {
   }
 
   isRunning = true;
+  runStartedAt = Date.now();
   const { setStatus, setResult } = useTaskQueueStore.getState();
+  publishDeferReason(null); // actually starting — clear any stale explanation
   setStatus(task.id, "running");
 
   try {
@@ -159,6 +226,7 @@ export async function processNextPending(): Promise<void> {
     toast.error(`Task failed: ${label}`, { description: message });
   } finally {
     isRunning = false;
+    runStartedAt = null;
   }
 
   // Keep draining — pick up whatever's next (or no-op if the queue is empty).
@@ -184,7 +252,14 @@ export function startTaskRunner(): void {
   // previous session with a workspace already open).
   void processNextPending();
 
-  useTaskQueueStore.subscribe(() => {
+  useTaskQueueStore.subscribe((state, prev) => {
+    // React to TASK changes only. This used to fire on any store update, which
+    // became an infinite loop the moment processNextPending started writing
+    // `deferReason` back into this same store: subscribe → processNextPending
+    // → setDeferReason → subscribe → … → "Maximum call stack size exceeded"
+    // at boot, with the app refusing to start. Anything the runner itself
+    // writes here must never be able to re-trigger the runner.
+    if (state.tasks === prev.tasks) return;
     void processNextPending();
   });
 

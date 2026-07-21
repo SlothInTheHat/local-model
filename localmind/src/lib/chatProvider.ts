@@ -72,6 +72,42 @@ async function describeProviderError(res: Response): Promise<string> {
 
 // ─── OpenAI-compatible streaming chat ────────────────────────────────────────
 
+/**
+ * Convert one ChatMessage into an OpenAI-compatible message body.
+ *
+ * The two APIs disagree about images in exactly the way most likely to fail
+ * silently:
+ *   - Ollama  → a sibling `images: string[]` field of RAW base64
+ *   - OpenAI  → the image lives INSIDE `content` as a parts array, and the
+ *               url must be a `data:` URI
+ *
+ * Before this existed, the OpenAI path mapped `{role, content}` and dropped
+ * `images` on the floor — so pointing the `vision` role at an OpenRouter model
+ * sent the prompt with NO image and the model answered from imagination. It
+ * looked like a bad model rather than a missing field, which is the worst
+ * kind of bug to debug.
+ *
+ * Messages without images keep the plain-string `content` shape, so nothing
+ * about existing text-only calls changes.
+ */
+function toOpenAIMessage(m: ChatMessage): Record<string, unknown> {
+  if (!m.images || m.images.length === 0) {
+    return { role: m.role, content: m.content };
+  }
+  return {
+    role: m.role,
+    content: [
+      ...(m.content ? [{ type: "text", text: m.content }] : []),
+      ...m.images.map((b64) => ({
+        // Tolerate a value that already carries a data: prefix — callers
+        // shouldn't have to know which convention this layer wants.
+        type: "image_url",
+        image_url: { url: b64.startsWith("data:") ? b64 : `data:image/png;base64,${b64}` },
+      })),
+    ],
+  };
+}
+
 export async function* streamChatOpenAI(
   baseUrl: string,
   apiKey: string,
@@ -91,7 +127,7 @@ export async function* streamChatOpenAI(
     headers,
     body: JSON.stringify({
       model,
-      messages: messages.map((m) => ({ role: m.role, content: m.content })),
+      messages: messages.map(toOpenAIMessage),
       stream: true,
     }),
     signal,
@@ -173,7 +209,9 @@ export async function* runAgentTurnOpenAI(
       // OpenAI requires tool_call_id; use a placeholder
       return { role: "tool" as const, content: m.content, tool_call_id: "call_0" };
     }
-    return { role: m.role, content: m.content };
+    // Same image conversion as the plain-chat path — otherwise attaching an
+    // image in agent mode with a provider model silently sends text only.
+    return toOpenAIMessage(m);
   });
 
   let res: Response;

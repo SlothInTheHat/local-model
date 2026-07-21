@@ -21,6 +21,8 @@ import { useModelStore } from "../store/models";
 import { buildJobSpec, computeInitialNextRun, describeSchedule, normalizeSchedule, parseJobSpec } from "./scheduler";
 import { searchSessions } from "./sessionSearch";
 import { isTauriEnv } from "./fileSystem";
+import { resolveRole } from "./modelRoles";
+import { streamChatForModel } from "./chatProvider";
 
 // ─── Tauri invoke shim ───────────────────────────────────────────────────────
 
@@ -435,10 +437,15 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
   },
   {
     name: "take_screenshot",
-    description: "Capture the primary monitor, save it as a PNG, and OCR the screen text. Returns the saved file path and the recognized text (no image is sent to the model).",
+    description: "Capture the primary monitor and analyze what's on screen. Runs a vision model over the capture (when one is installed) plus OCR, and returns a description, the recognized text, and the saved file path.",
     parameters: {
       type: "object",
-      properties: {},
+      properties: {
+        question: {
+          type: "string",
+          description: "What you want to know about the screen. Be specific — this is passed to a vision model that looks at the actual pixels.",
+        },
+      },
       required: [],
     },
     group: "state",
@@ -2188,15 +2195,73 @@ export async function executeTool(
         const result = await tauriInvoke<{ path: string; ocr_text: string; ocr_available: boolean }>(
           "take_screenshot"
         );
-        const maxLen = 4000;
-        const truncated = result.ocr_text.length > maxLen;
-        const text = truncated
-          ? `${result.ocr_text.slice(0, maxLen)}\n\n…(OCR text truncated, ${result.ocr_text.length} chars total)`
+        const question = argStr(call.args["question"]);
+
+        const ocrMaxLen = 4000;
+        const ocrTruncated = result.ocr_text.length > ocrMaxLen;
+        const ocrText = ocrTruncated
+          ? `${result.ocr_text.slice(0, ocrMaxLen)}\n\n…(OCR text truncated, ${result.ocr_text.length} chars total)`
           : result.ocr_text;
+
+        // WP6.2b — vision sub-call. The primary model never sees the image;
+        // this tool looks at the pixels itself (via the `vision` role) and
+        // hands back text, so it works with any primary model and requires
+        // no change to the text-only agent-loop tool-result protocol.
+        const visionModel = resolveRole("vision");
+        let visionSection: string;
+
+        if (!visionModel) {
+          visionSection =
+            "(No vision model installed — this answer is based on OCR text only, which is unreliable for math, diagrams, and dense UI. Install one with: ollama pull llava)";
+        } else {
+          try {
+            // maxDim tradeoff: higher = better small-glyph/digit accuracy for
+            // math screenshots (the driving use case) at the cost of more
+            // input tokens and latency per vision call. Bumped from 1568 to
+            // 2048 after a user report of the vision model misreading numbers.
+            const imageB64 = await tauriInvoke<string>("read_image_base64", {
+              path: result.path,
+              maxDim: 2048,
+            });
+            const basePrompt = question
+              ? question
+              : "Describe everything visible on this screen in detail, including all text, equations, code, and UI elements. Transcribe text exactly.";
+            const prompt = `${basePrompt} Transcribe any mathematics, code, or numbers exactly as written.`;
+
+            const visionMaxLen = 4000;
+            let visionText = "";
+            for await (const chunk of streamChatForModel(visionModel, [
+              { role: "user", content: prompt, images: [imageB64] },
+            ])) {
+              visionText += chunk;
+              if (visionText.length > visionMaxLen) break;
+            }
+            // An empty response is a real, observed failure mode here (a
+            // model can stream zero tokens and "succeed"), and rendering it
+            // as a blank description would read as "the screen is empty"
+            // rather than "the vision call produced nothing".
+            const trimmedVision = visionText.trim();
+            visionSection = trimmedVision
+              ? `[Screen description — from vision model ${visionModel}]\n${trimmedVision}`
+              : `(Vision model ${visionModel} returned an empty response — falling back to OCR text only, which is unreliable for math, diagrams, and dense UI.)`;
+          } catch (err) {
+            // Never let a vision-model hiccup (not loaded, OOM, network) fail
+            // the whole tool — degrade to OCR-only plus a note naming why.
+            const reason = err instanceof Error ? err.message : String(err);
+            visionSection = `(Vision model call failed — falling back to OCR text only, which is unreliable for math, diagrams, and dense UI. Reason: ${reason})`;
+          }
+        }
+
+        const sections = [visionSection];
+        if (result.ocr_available) {
+          sections.push(`[OCR text — exact strings, may be garbled]\n${ocrText}`);
+        }
+        sections.push(`[Screenshot saved to: ${result.path}]`);
+
         return {
           toolCallId: call.id,
           name: call.name,
-          output: `Saved screenshot to: ${result.path}\n\n${text}`,
+          output: sections.join("\n\n"),
         };
       }
 

@@ -6,6 +6,9 @@
   "permissions": [
     "core:default",
     "opener:default",
+    "core:window:allow-show",
+    "core:window:allow-unminimize",
+    "core:window:allow-set-focus",
     "autostart:default",
     "notification:default",
     "clipboard-manager:allow-read-text",
