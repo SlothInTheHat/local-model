@@ -20,6 +20,16 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition, Position};
 use tauri_plugin_autostart::ManagerExt;
 
+// WP7.1 rework: the quick-invoke overlay used to hand off drawing to a
+// separate fullscreen `annotate` window (show_annotate_overlay /
+// finish_annotate, which lived here). That window is gone — drawing now
+// happens directly on the `overlay` window itself (see
+// src/overlay/QuickInvoke.tsx's file-level comment for why: two windows
+// meant one focus, so you could never dictate into one while drawing in the
+// other). toggle_overlay below absorbs show_annotate_overlay's full-monitor
+// sizing logic since the overlay itself now needs to cover the whole screen
+// whenever it's shown.
+
 const SHOW_ID: &str = "show";
 const AUTOSTART_ID: &str = "autostart_toggle";
 const QUIT_ID: &str = "quit";
@@ -67,11 +77,37 @@ pub fn toggle_main_window(app: &AppHandle) {
 /// (Ctrl+Shift+K), mirroring `toggle_main_window` above. The overlay has no
 /// minimize state (it's a small always-on-top, non-taskbar window), so unlike
 /// the main window there's no `unminimize()` call needed.
+///
+/// WP7.1 rework: the overlay is now a FULLSCREEN HUD (prompt card + a
+/// full-screen drawing canvas behind it), not the small 620x200 box it used
+/// to be — drawing was moved into this window instead of a separate
+/// `annotate` window (see QuickInvoke.tsx's file-level comment). So the SHOW
+/// branch here now does what `show_annotate_overlay` used to do: size and
+/// position the window to the FULL monitor bounds (`monitor.size()` /
+/// `monitor.position()`, NOT `work_area()` — the user may want to circle
+/// something that's partially under the taskbar, and a gap between the
+/// canvas and the screen edge would be a dead zone they can't draw into)
+/// before showing it. This must happen every time, not just once at window
+/// creation: the window is configured with a small placeholder size (see
+/// tauri.conf.json) so it exists cheaply at launch, and the user could also
+/// invoke it on a different monitor (with different bounds) than last time.
 pub fn toggle_overlay(app: &AppHandle) {
     let Some(win) = app.get_webview_window("overlay") else { return };
     if win.is_visible().unwrap_or(false) {
         let _ = win.hide();
     } else {
+        let monitor = win
+            .current_monitor()
+            .ok()
+            .flatten()
+            .or_else(|| win.primary_monitor().ok().flatten());
+
+        if let Some(monitor) = monitor {
+            // Full monitor bounds, not work_area() — see doc comment above.
+            let _ = win.set_size(monitor.size().to_owned());
+            let _ = win.set_position(Position::Physical(*monitor.position()));
+        }
+
         let _ = win.show();
         let _ = win.set_focus();
     }
@@ -86,8 +122,11 @@ const RESULT_WIDGET_INSET_LOGICAL_PX: f64 = 24.0;
 /// in flight — small and content-free on purpose (see ResultWidget.tsx).
 const RESULT_WIDGET_COMPACT_SIZE: LogicalSize<f64> = LogicalSize::new(168.0, 60.0);
 
-/// Logical size of the full result card (prompt header, body, close button).
-const RESULT_WIDGET_FULL_SIZE: LogicalSize<f64> = LogicalSize::new(420.0, 320.0);
+/// Logical size of the full result card (prompt header, body, close button,
+/// plus the WP7.3 follow-up input row pinned to the bottom of the card — the
+/// extra 60px is that row's height so it doesn't eat into the scrollable
+/// answer body).
+const RESULT_WIDGET_FULL_SIZE: LogicalSize<f64> = LogicalSize::new(420.0, 380.0);
 
 /// Show the quick-invoke result widget (WP5.4), resizing it to the compact
 /// loading pill or the full result card and re-anchoring it to the

@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { useEffect, useRef, useState } from "react";
+import { listen, emit } from "@tauri-apps/api/event";
+import { getCurrentWindow, LogicalPosition } from "@tauri-apps/api/window";
 import { Markdown } from "../components/Markdown";
 
 // NOTE: no `cn()` import, despite it being the house style — every className
@@ -43,29 +43,97 @@ function hide(): void {
     .catch((err) => console.error("[quick-result] hide failed:", err));
 }
 
+// ─── Follow-up handoff (WP7.3) ──────────────────────────────────────────────
+//
+// This widget stays dumb: it never runs the follow-up itself. It just emits
+// `quick-followup` with the original Q&A plus whatever the user typed (empty
+// string for the "Open in chat →" case) and hands off to App.tsx (the main
+// window), which surfaces itself, seeds a new conversation with `prompt` +
+// `answer` as history, and — if `followUp` is non-empty — sends it through
+// the normal chat pipeline. Mirrors the read-only-widget/does-the-real-work
+// split the module header comment already describes for `quick-invoke`.
+function emitQuickFollowup(prompt: string, answer: string, followUp: string): void {
+  // Own try/catch (via .catch, since emit() is a Promise) rather than letting
+  // a rejection propagate — an unhandled rejection in this isolated webview
+  // wipes #root via the global handler in main.tsx (see that file), so a
+  // permissions hiccup here must never do more than fail to notify the main
+  // window.
+  emit("quick-followup", { prompt, answer, followUp }).catch((err) =>
+    console.error("[quick-followup] emit failed:", err)
+  );
+}
+
 export function ResultWidget() {
   const [payload, setPayload] = useState<QuickResultPayload | null>(null);
+  // Uncontrolled follow-up input — read via ref rather than component state
+  // so typing a follow-up doesn't cause a re-render per keystroke, and so the
+  // Escape handler (registered once, below) can check "is there typed text?"
+  // without needing to be re-subscribed on every keystroke.
+  const followUpInputRef = useRef<HTMLInputElement>(null);
+
+  // Dragging the widget. Store the grab position and the window's position at
+  // grab-time so subsequent move events can compute the delta and reposition
+  // the window without reading back (which would be async).
+  const dragRef = useRef<{
+    startX: number;
+    startY: number;
+    windowX: number;
+    windowY: number;
+  } | null>(null);
 
   // Registered once on mount; nothing here depends on component state, so the
   // listener is stable for the lifetime of this webview.
   useEffect(() => {
     const unlistenPromise = listen<QuickResultPayload>("quick-result", (event) => {
       setPayload(event.payload);
+      // A fresh result (new `running`, or a new `done`/`error` after the
+      // previous one) means any text left over from a prior answer's
+      // follow-up box is stale — clear it so the next card starts blank.
+      if (followUpInputRef.current) followUpInputRef.current.value = "";
     });
     return () => {
       void unlistenPromise.then((unlisten) => unlisten());
     };
   }, []);
 
-  // Escape dismisses. Deliberately no onFocusChanged/hide-on-blur here (unlike
-  // the overlay) — the whole reason this is a separate window is that it must
-  // keep showing while the user works in another app.
+  // Escape: if the user has typed a follow-up, clear just that (a stray
+  // Escape while composing shouldn't nuke the whole widget and lose what was
+  // typed — that's the annoyance this is guarding against). Only hides the
+  // widget once the box is already empty, matching the pre-WP7.3 behavior.
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent): void {
-      if (e.key === "Escape") hide();
+      if (e.key !== "Escape") return;
+      const input = followUpInputRef.current;
+      if (input && input.value.length > 0) {
+        input.value = "";
+        return;
+      }
+      hide();
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  // Dragging the widget. Grab on mousedown at the header, track moves, and
+  // reposition the window. Clean up on mouseup.
+  useEffect(() => {
+    function onMouseMove(e: MouseEvent): void {
+      if (!dragRef.current) return;
+      const deltaX = e.clientX - dragRef.current.startX;
+      const deltaY = e.clientY - dragRef.current.startY;
+      const newX = dragRef.current.windowX + deltaX;
+      const newY = dragRef.current.windowY + deltaY;
+      void getCurrentWindow().setPosition(new LogicalPosition(newX, newY));
+    }
+    function onMouseUp(): void {
+      dragRef.current = null;
+    }
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+    return () => {
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", onMouseUp);
+    };
   }, []);
 
   // Nothing has arrived yet — stay blank. The window itself is only ever made
@@ -111,16 +179,50 @@ export function ResultWidget() {
       <div
         className="flex flex-col w-full h-full overflow-hidden"
         style={{
-          borderRadius: "26px",
+          borderRadius: "20px",
           background: "var(--card)",
-          border: "1px solid rgba(0,0,0,0.09)",
-          boxShadow: "0 8px 60px rgba(0,0,0,0.1), 0 2px 8px rgba(0,0,0,0.05)",
+          border: "1px solid rgba(0,0,0,0.05)",
+          boxShadow:
+            "0 20px 40px rgba(0,0,0,0.08), 0 2px 4px rgba(0,0,0,0.04), inset 0 1px 0 rgba(255,255,255,0.1)",
         }}
       >
-        <div className="flex items-center gap-2 px-4 pt-3 pb-2 shrink-0">
+        <div
+          className="flex items-center gap-2 px-4 pt-3 pb-2 shrink-0"
+          style={{ cursor: dragRef.current ? "grabbing" : "grab" }}
+          onMouseDown={async (e) => {
+            const target = e.target as HTMLElement;
+            if (target.tagName === "BUTTON") return;
+            if (dragRef.current) return;
+            const win = getCurrentWindow();
+            try {
+              const pos = await win.outerPosition();
+              dragRef.current = {
+                startX: e.clientX,
+                startY: e.clientY,
+                windowX: pos.x,
+                windowY: pos.y,
+              };
+            } catch {
+              // window position API unavailable; dragging silently fails
+            }
+          }}
+        >
           <div className="flex-1 min-w-0 truncate text-[11px] text-muted-foreground font-sans">
             {payload.prompt}
           </div>
+          <button
+            type="button"
+            onClick={() => {
+              // "Open in chat" hands the conversation over as-is — followUp
+              // is deliberately "" so App.tsx seeds the new conversation and
+              // stops there (no follow-up message to send).
+              emitQuickFollowup(payload.prompt, payload.text, "");
+              hide();
+            }}
+            className="shrink-0 text-[11px] text-muted-foreground hover:text-foreground font-sans whitespace-nowrap"
+          >
+            Open in chat →
+          </button>
           <button
             type="button"
             onClick={hide}
@@ -156,6 +258,44 @@ export function ResultWidget() {
           >
             <Markdown>{payload.text}</Markdown>
           </div>
+        </div>
+        {/* shrink-0: pinned to the bottom of the card regardless of how long
+            the answer above is — the body's own flex-1/min-h-0/overflow-y-auto
+            is what scrolls, so a long answer can never push this row off the
+            bottom of the (fixed-size) window. */}
+        <div className="shrink-0 px-4 pb-3 pt-1">
+          <input
+            ref={followUpInputRef}
+            type="text"
+            placeholder="Ask a follow-up…"
+            autoComplete="off"
+            spellCheck={false}
+            onPointerDown={() => {
+              // The result window is created with focus:false and is
+              // always-on-top/skipTaskbar — it never picks up keyboard focus
+              // just by being visible or by receiving a click from the OS's
+              // point of view. Force it explicitly so the very first
+              // keystroke after clicking actually lands in this input rather
+              // than at whatever app the user's focus was last in.
+              // core:window:allow-set-focus is already granted in
+              // capabilities/result.json.
+              getCurrentWindow()
+                .setFocus()
+                .catch((err) => console.error("[quick-followup] setFocus failed:", err));
+            }}
+            onKeyDown={(e) => {
+              if (e.key !== "Enter") return;
+              const value = e.currentTarget.value.trim();
+              if (!value) return;
+              emitQuickFollowup(payload.prompt, payload.text, value);
+              hide();
+            }}
+            className="w-full text-[12px] font-sans px-3 py-2 rounded-full outline-none text-foreground placeholder:text-muted-foreground"
+            style={{
+              background: "var(--muted)",
+              border: "1px solid rgba(0,0,0,0.08)",
+            }}
+          />
         </div>
       </div>
     </div>

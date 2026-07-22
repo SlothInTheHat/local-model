@@ -22,6 +22,13 @@ interface Settings {
    * Settings, to avoid two sources of truth for the main model.
    */
   modelRoles: Partial<Record<ModelRole, string>>;
+  /**
+   * faster-whisper model size used for local offline dictation (WP6.3, mic
+   * button in ChatInput) and video transcription. Bigger = more accurate but
+   * slower; transcription always runs on CPU. Passed straight through to the
+   * `transcribe_audio_base64` / `transcribe_video` Tauri commands.
+   */
+  whisperModel: "tiny" | "base" | "small" | "medium";
 }
 
 interface SettingsState extends Settings {
@@ -34,6 +41,7 @@ interface SettingsState extends Settings {
   setCloseToTray: (val: boolean) => void;
   /** Pin a model to a role, or pass `null` to clear the pin (fall back to auto). */
   setModelRole: (role: ModelRole, modelRef: string | null) => void;
+  setWhisperModel: (model: Settings["whisperModel"]) => void;
 }
 
 export const DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434";
@@ -50,6 +58,7 @@ export const useSettingsStore = create<SettingsState>()(
       ollamaBaseUrl: DEFAULT_OLLAMA_BASE_URL,
       closeToTray: true,
       modelRoles: {},
+      whisperModel: "base",
 
       setDefaultSystemPrompt: (prompt) => set({ defaultSystemPrompt: prompt }),
       setAgentAutoApproveReads: (val) => set({ agentAutoApproveReads: val }),
@@ -65,6 +74,7 @@ export const useSettingsStore = create<SettingsState>()(
           else delete next[role];
           return { modelRoles: next };
         }),
+      setWhisperModel: (model) => set({ whisperModel: model }),
     }),
     { name: "localmind-settings" }
   )

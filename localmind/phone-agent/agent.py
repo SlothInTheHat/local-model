@@ -1,9 +1,18 @@
 """LocalMind Phone Agent - Telegram bot entrypoint.
 
-Text messages run through agent_loop's tool-using agent (file/grep/git/
-shell/web tools scoped to the LocalMind workspace; mutating tools require
-inline Approve/Deny). Videos are transcribed and mined for skills, which
-are written into the LocalMind workspace's .localmind/skills/ directory.
+This bot is a thin relay, not an agent: text messages are forwarded to the
+LocalMind desktop app's local IPC listener (127.0.0.1:41777), which queues
+them onto the same task queue and headless agent runtime the desktop UI
+itself uses. Every tool allowlist, approval gate, and workspace confinement
+already built into that runtime applies automatically - this file never
+calls a tool, model, or shell itself. See localmind_client.py for the HTTP
+side of that relationship.
+
+The LocalMind desktop app must be running for text messages to work.
+
+Videos are still transcribed and mined for skills locally (video_pipeline.py)
+- that capability doesn't go through the desktop app.
+
 Run with:
 
     python agent.py
@@ -15,19 +24,18 @@ import tempfile
 from pathlib import Path
 
 import requests
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 
-import agent_loop
 import config
 import db
+import localmind_client
 import video_pipeline
 
 logging.basicConfig(
@@ -35,6 +43,13 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("phone-agent")
+
+# How long to wait synchronously for a relayed task to finish before telling
+# the user it's still running. A local agent run is typically tens of
+# seconds; this gives real headroom above that without blocking forever.
+POLL_TIMEOUT_S = 240.0
+
+_STATUS_LABELS = {"queued": "queued", "running": "running"}
 
 
 def _is_allowed(update: Update) -> bool:
@@ -51,39 +66,30 @@ async def _reply_unauthorized(update: Update) -> None:
     )
 
 
-_APPROVAL_KEYBOARD = InlineKeyboardMarkup([
-    [
-        InlineKeyboardButton("Approve", callback_data="approve"),
-        InlineKeyboardButton("Deny", callback_data="deny"),
-    ],
-])
+async def _safe_edit(message, text: str) -> None:
+    """Edit a message, swallowing failures (e.g. Telegram's "message is not
+    modified" error, or the message having been deleted) - a failed status
+    update must never crash the handler."""
+    try:
+        await message.edit_text(text)
+    except Exception:  # noqa: BLE001 - best-effort UI update only
+        logger.exception("Failed to edit status message")
 
 
-def _format_arg(value) -> str:
-    text = str(value)
-    if len(text) > 200:
-        text = text[:200] + "…"
-    return text
+def _log_future_exception(fut: "asyncio.Future") -> None:
+    exc = fut.exception()
+    if exc is not None:
+        logger.exception("Background status edit failed", exc_info=exc)
 
 
-def _format_call(name: str, args: dict) -> str:
-    arg_str = ", ".join(f"{k}={_format_arg(v)!r}" for k, v in args.items())
-    return f"{name}({arg_str})"
-
-
-def _format_pending(calls: list[tuple[str, dict]]) -> str:
-    lines = [f"{i}. {_format_call(name, args)}" for i, (name, args) in enumerate(calls, start=1)]
-    return "The agent wants to run:\n" + "\n".join(lines) + "\n\nApprove?"
-
-
-async def _send_step_result(message, result: agent_loop.StepResult) -> None:
-    if result.kind == "approval_needed":
-        await message.reply_text(_format_pending(result.calls), reply_markup=_APPROVAL_KEYBOARD)
-        return
-
-    text = result.text or "(empty response)"
-    for i in range(0, len(text), 4000):
-        await message.reply_text(text[i:i + 4000])
+async def _finish_with_text(context: ContextTypes.DEFAULT_TYPE, chat_id: int, placeholder, text: str) -> None:
+    """Edit `placeholder` with `text`, splitting into follow-up messages if
+    it's too long for a single Telegram message (mirrors the old bot's
+    4000-char chunking)."""
+    limit = 4000
+    await _safe_edit(placeholder, text[:limit] or "(empty response)")
+    for i in range(limit, len(text), limit):
+        await context.bot.send_message(chat_id=chat_id, text=text[i:i + limit])
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -96,63 +102,64 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     chat_id = update.effective_chat.id
-    if agent_loop.has_pending(chat_id):
+    task_text = message.text
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    try:
+        task_id = await asyncio.to_thread(localmind_client.submit, task_text)
+    except localmind_client.LocalMindClientError as exc:
+        await message.reply_text(f"LocalMind isn't set up correctly on this computer: {exc}")
+        return
+    except requests.RequestException:
         await message.reply_text(
-            "There's a tool call awaiting Approve/Deny above — respond to that first, "
-            "or send /reset to start a new conversation."
+            "Couldn't reach LocalMind - make sure the LocalMind desktop app "
+            "is running on this computer."
         )
         return
 
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    placeholder = await message.reply_text("Working…")
+
+    loop = asyncio.get_running_loop()
+
+    def on_status(status: str) -> None:
+        if status in localmind_client.TERMINAL_STATUSES:
+            return
+        label = _STATUS_LABELS.get(status, status)
+        fut = asyncio.run_coroutine_threadsafe(_safe_edit(placeholder, f"Working… ({label})"), loop)
+        fut.add_done_callback(_log_future_exception)
 
     try:
-        result = await asyncio.to_thread(agent_loop.start, chat_id, message.text)
-    except requests.RequestException as exc:
-        await message.reply_text(f"Couldn't reach Ollama at {config.OLLAMA_HOST}: {exc}")
+        result = await asyncio.to_thread(localmind_client.poll, task_id, POLL_TIMEOUT_S, on_status)
+    except requests.RequestException:
+        await _safe_edit(placeholder, "Lost connection to LocalMind while waiting for a reply.")
         return
 
-    await _send_step_result(message, result)
+    status = result.get("status")
+    summary = result.get("summary")
 
-
-async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    chat = update.effective_chat
-    if query is None or chat is None:
-        return
-    if chat.id != config.ALLOWED_CHAT_ID:
-        await query.answer("Not authorized.")
-        return
-
-    await query.answer()
-    chat_id = chat.id
-
-    if not agent_loop.has_pending(chat_id):
-        await query.edit_message_reply_markup(reply_markup=None)
-        return
-
-    approved = query.data == "approve"
-    suffix = "\n\nApproved." if approved else "\n\nDenied."
-    await query.edit_message_text((query.message.text or "") + suffix)
-
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    try:
-        if approved:
-            result = await asyncio.to_thread(agent_loop.approve, chat_id)
-        else:
-            result = await asyncio.to_thread(agent_loop.deny, chat_id)
-    except requests.RequestException as exc:
-        await query.message.reply_text(f"Couldn't reach Ollama at {config.OLLAMA_HOST}: {exc}")
-        return
-
-    await _send_step_result(query.message, result)
+    if status == "done":
+        await _finish_with_text(context, chat_id, placeholder, summary or "(no summary returned)")
+    elif status == "error":
+        await _finish_with_text(
+            context, chat_id, placeholder, f"⚠️ LocalMind reported an error:\n{summary or '(no details)'}"
+        )
+    else:
+        await _safe_edit(
+            placeholder,
+            f"Still running after {int(POLL_TIMEOUT_S)}s — it'll keep going in LocalMind. "
+            f"Task id: `{task_id}`",
+        )
 
 
 async def handle_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update):
         await _reply_unauthorized(update)
         return
-    agent_loop.reset(update.effective_chat.id)
-    await update.message.reply_text("Conversation reset.")
+    await update.message.reply_text(
+        "Nothing to reset — each message is now handled independently by "
+        "the LocalMind desktop app, which keeps its own conversation state."
+    )
 
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -162,14 +169,16 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         "LocalMind Phone Agent\n\n"
         f"Workspace: {config.WORKSPACE_DIR}\n\n"
-        "- Send a message to chat with the agent — it can read/write files, "
-        "run commands, search git history, search/fetch the web, and save "
-        "skills in this workspace. Mutating actions need your Approve/Deny.\n"
+        "- Send a message and it's relayed to the LocalMind desktop app, "
+        "which must be running on this computer — it answers using its "
+        "own memory, tools, and skills. Unattended runs from this bot use "
+        "the desktop app's safe tool allowlist (shell commands, package "
+        "installs, and git writes are auto-denied; there's no approval "
+        "step here).\n"
         "- Send a video to transcribe it and mine it for skills.\n"
         "- /skills — recently learned skills.\n"
-        "- /model [name] — show or switch the model for this chat.\n"
-        "- /models — list installed models and which support tool-calling.\n"
-        "- /reset — clear the conversation history."
+        "- /model — model selection now happens in the LocalMind desktop app.\n"
+        "- /reset — no longer needed; each message is independent."
     )
 
 
@@ -223,80 +232,16 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await message.reply_text(reply)
 
 
-def _format_model_line(name: str, current: str) -> str:
-    marker = "*" if name == current else " "
-    tools = "tools" if agent_loop.supports_native_tools(name) else "no tools"
-    return f"{marker} {name} ({tools})"
-
-
-async def handle_models_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_allowed(update):
-        await _reply_unauthorized(update)
-        return
-
-    message = update.message
-    if message is None:
-        return
-
-    try:
-        available = await asyncio.to_thread(agent_loop.list_models)
-    except requests.RequestException as exc:
-        await message.reply_text(f"Couldn't reach Ollama at {config.OLLAMA_HOST}: {exc}")
-        return
-
-    if not available:
-        await message.reply_text("No models found - pull one with `ollama pull <name>`.")
-        return
-
-    current = agent_loop.get_model(update.effective_chat.id)
-    lines = ["Installed models (* = current for this chat):"]
-    lines += [_format_model_line(name, current) for name in sorted(available)]
-    lines.append("\nSwitch with /model <name>.")
-    await message.reply_text("\n".join(lines))
-
-
 async def handle_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update):
         await _reply_unauthorized(update)
         return
-
-    message = update.message
-    if message is None:
+    if update.message is None:
         return
-
-    chat_id = update.effective_chat.id
-    current = agent_loop.get_model(chat_id)
-
-    if not context.args:
-        tools = "supports" if agent_loop.supports_native_tools(current) else "does NOT support"
-        await message.reply_text(
-            f"Current model: {current} ({tools} tool-calling)\n\n"
-            "/model <name> to switch, /models to list installed models."
-        )
-        return
-
-    requested = " ".join(context.args).strip()
-    try:
-        available = await asyncio.to_thread(agent_loop.list_models)
-    except requests.RequestException as exc:
-        await message.reply_text(f"Couldn't reach Ollama at {config.OLLAMA_HOST}: {exc}")
-        return
-
-    resolved = agent_loop.resolve_model(requested, available)
-    if resolved is None:
-        await message.reply_text(
-            f"Model '{requested}' isn't installed. Use /models to see what's available."
-        )
-        return
-
-    agent_loop.set_model(chat_id, resolved)
-    reply = f"Switched to {resolved} for this chat."
-    if not agent_loop.supports_native_tools(resolved):
-        reply += (
-            "\n\n⚠️ This model may not support native tool-calling - "
-            "the agent will likely just chat without using tools."
-        )
-    await message.reply_text(reply)
+    await update.message.reply_text(
+        "Model selection now happens in the LocalMind desktop app (this bot "
+        "no longer runs its own model/agent loop) - switch models there."
+    )
 
 
 async def handle_skills_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -326,18 +271,15 @@ def main() -> None:
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("skills", handle_skills_command))
     app.add_handler(CommandHandler("model", handle_model_command))
-    app.add_handler(CommandHandler("models", handle_models_command))
+    app.add_handler(CommandHandler("models", handle_model_command))
     app.add_handler(CommandHandler("reset", handle_reset))
-    app.add_handler(CallbackQueryHandler(handle_approval_callback))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    if not agent_loop.supports_native_tools(config.OLLAMA_MODEL):
+    if not localmind_client.health():
         logger.warning(
-            "OLLAMA_MODEL=%s may not support native tool-calling — the agent loop "
-            "will likely just chat without using tools. See modelCapabilities.ts's "
-            "supportsNativeTools() for known-good models (e.g. llama3.2, qwen2.5).",
-            config.OLLAMA_MODEL,
+            "LocalMind desktop app does not appear to be reachable at startup "
+            "(health check failed) - text messages will fail until it's running."
         )
 
     logger.info("LocalMind Phone Agent starting (workspace: %s)", config.WORKSPACE_DIR)

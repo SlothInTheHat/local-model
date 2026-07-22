@@ -1,32 +1,37 @@
 # LocalMind Phone Agent
 
 A standalone Telegram bot that lets you message your local LocalMind setup
-from your phone:
+from your phone. **It is a thin relay, not an agent**: it does no
+reasoning, calls no models, and runs no tools itself. Instead:
 
-- **Text messages** run through a tool-using agent loop (see
-  [Agent mode](#agent-mode-tools--approvals) below) — it can read/write
-  files, run shell commands, search/diff git, search and fetch the web, and
-  save skills, all scoped to your LocalMind workspace.
-- **Videos** are transcribed (faster-whisper), mined for tools/skills/
-  techniques (Ollama), researched on the web (DuckDuckGo, no API key), and
-  saved as LocalMind skills in `<workspace>/.localmind/skills/` — they show
-  up automatically in LocalMind's Skills tab.
-- `/skills` lists the most recently learned skills, `/reset` clears the
-  conversation, `/start` shows a quick help message.
-- `/model` shows the model currently in use for this chat; `/model <name>`
-  switches it (per-chat, resets to `OLLAMA_MODEL` on restart). `/models`
-  lists every model installed in Ollama and whether each one supports
-  native tool-calling.
+- **Text messages** are forwarded over HTTP to the LocalMind desktop app's
+  local IPC listener (`127.0.0.1:41777`), which queues them onto the same
+  task queue and headless agent runtime the desktop UI itself uses. Every
+  tool allowlist, memory, skill, and MCP integration already built into the
+  desktop app applies automatically — this bot has none of its own.
+  **The LocalMind desktop app must be running** for text messages to work;
+  if it isn't, the bot tells you plainly instead of failing silently.
+- **Videos** are still transcribed locally (faster-whisper), mined for
+  tools/skills/techniques (Ollama), researched on the web (DuckDuckGo, no
+  API key), and saved as LocalMind skills in
+  `<workspace>/.localmind/skills/` — they show up automatically in
+  LocalMind's Skills tab. This path doesn't go through the desktop app's
+  IPC listener; it's a standalone pipeline (`video_pipeline.py`).
+- `/skills` lists the most recently learned skills, `/start` shows a quick
+  help message.
+- `/reset` and `/model`/`/models` still exist as commands but no longer do
+  anything stateful — there is no per-chat conversation or model to reset
+  or switch here anymore (see [Architecture](#architecture) below).
 
 This is a separate Python process. It does not touch LocalMind's npm/cargo
-build and runs independently of the Tauri app.
+build and runs independently of the Tauri app (except that the app must be
+running for text relaying to work).
 
 ## Requirements
 
 - Python 3.11+ (3.13 recommended)
-- [Ollama](https://ollama.com) running locally with a model pulled
-  (e.g. `ollama pull llama3.2`)
-- ffmpeg on your `PATH`
+- The LocalMind desktop app, running, for text messages to work
+- ffmpeg on your `PATH` (for video transcription)
 - A Telegram bot token
 
 ## 1. Create a Telegram bot
@@ -47,7 +52,8 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Install ffmpeg if you don't already have it:
+Install ffmpeg if you don't already have it (only needed for video
+transcription):
 
 ```powershell
 winget install ffmpeg
@@ -72,22 +78,29 @@ MAX_VIDEO_MB=500
 ```
 
 `LOCALMIND_WORKSPACE` should be the **same folder** you open as a workspace
-in LocalMind — skills get written to
-`LOCALMIND_WORKSPACE\.localmind\skills\`.
+in LocalMind — skills mined from videos get written to
+`LOCALMIND_WORKSPACE\.localmind\skills\`. `OLLAMA_HOST`/`OLLAMA_MODEL` are
+only used by the video pipeline (transcript skill-mining); text messages no
+longer talk to Ollama directly — the desktop app does that.
 
 ## 4. Run
+
+Start the LocalMind desktop app first (`npm run tauri dev`, or the built
+app) — it generates the IPC token on first launch and must be running for
+text messages to relay successfully. Then:
 
 ```powershell
 python agent.py
 ```
 
-The first time you send a video, faster-whisper will download the
-`WHISPER_MODEL` (~150 MB for "base") — this needs internet once, then
-transcription runs fully offline.
+Send your bot a text message — it's relayed to the desktop app and you'll
+get its answer back (with a "Working…" status message that updates while
+it runs).
 
-Send your bot a text message — you should get a reply from your local model.
 Send a short video or voice-note-as-video — after a minute or two you should
-get a summary plus a list of any new skill files.
+get a summary plus a list of any new skill files. The first time you send a
+video, faster-whisper will download the `WHISPER_MODEL` (~150 MB for
+"base") — this needs internet once, then transcription runs fully offline.
 
 ### Starting everything at once
 
@@ -120,43 +133,63 @@ opens separate windows for the phone-agent bot and the LocalMind desktop app
    `C:\path\to\localmind\phone-agent`.
 5. Save (you'll be prompted for your Windows password).
 
-## Agent mode (tools & approvals)
+## Architecture: relay, not agent
 
-Every text message is sent to Ollama (`/api/chat`) along with a set of
-tools (`agent_tools.py`), mirroring a subset of LocalMind's own
-`src/lib/tools.ts`:
+Prior versions of this bot ran their own duplicate tool-using agent loop
+(`agent_loop.py` + `agent_tools.py`, since removed) that reimplemented a
+subset of LocalMind's TypeScript agent runtime and tool schemas. That meant
+two independent implementations of "an agent that reads files and runs
+commands" could drift, and the Python one had none of the desktop app's
+guarding, memory, MCP servers, or skills.
 
-- **Files**: `read_file`, `write_file`, `patch_file`, `delete_file`,
-  `list_directory`, `grep_files`, `find_files`, `create_folder`
-- **Shell & git**: `run_command`, `git_status`, `git_diff`, `git_log`,
-  `git_add`, `git_commit`
-- **Web & misc**: `web_search`, `web_fetch`, `calculator`,
-  `get_system_info`
-- **Skills**: `save_skill`, `list_skills`
+Now, `handle_text` in `agent.py` does only this (see `localmind_client.py`
+for the implementation):
 
-All file/command tools are scoped to `LOCALMIND_WORKSPACE` and run with
-direct filesystem access (no path-traversal sandboxing — this is a trusted
-local process for a single user).
+1. `POST /task` with `{"task": <your message>, "targetView": "chat",
+   "expectSideEffects": false}` to `http://127.0.0.1:41777` — the desktop
+   app's loopback-only HTTP listener — and get back a task id.
+2. `GET /task/{id}` repeatedly until the task reaches `done` or `error`
+   (or a few minutes pass), editing a single Telegram status message along
+   the way instead of spamming new ones.
+3. Reply with the final summary (or a clear error / "still running, here's
+   the task id" message).
 
-**Approvals**: read-only tools (file reads, search, git status/diff/log,
-web search/fetch, etc.) run automatically. Mutating tools — `write_file`,
-`patch_file`, `delete_file`, `create_folder`, `run_command`, `git_add`,
-`git_commit`, `save_skill` — are queued and the bot sends an
-Approve/Deny message before running them.
+**Tool approvals don't apply here.** The desktop app's headless task-queue
+runtime — the same one that runs everything queued this way — treats
+IPC-submitted tasks as unattended runs: mutating/dangerous tools (shell
+commands, package installs, git writes, etc.) are auto-denied by the
+desktop app's safe tool allowlist rather than prompted for approval. There
+is no Approve/Deny flow in Telegram anymore; if you need to run something
+that requires approval, do it in the LocalMind desktop app directly.
 
-Conversation history is kept in memory per chat and is lost on restart;
-use `/reset` to start a fresh conversation manually.
+### Finding the IPC token
 
-**Model requirement**: tool-calling needs a model that supports Ollama's
-native `tools` API (e.g. `llama3.2`, `qwen2.5`, `mistral-nemo` — see
-`supports_native_tools()` in `agent_loop.py`, mirroring
-`src/lib/modelCapabilities.ts`'s `supportsNativeTools()`). With other
-models, the bot still replies but won't use tools.
+The desktop app generates a bearer token on first launch and persists it to
+`%APPDATA%\com.lalwa.localmind\ipc-token.txt` (Windows). `localmind_client.py`
+looks for it in this order:
+
+1. `LOCALMIND_IPC_TOKEN` env var — the raw token string.
+2. `LOCALMIND_IPC_TOKEN_FILE` env var — a path to a file containing it.
+3. `%APPDATA%\com.lalwa.localmind\ipc-token.txt` (the default).
+
+If none of these resolve to a token, the bot will tell you exactly which
+path it looked for and how to override it — it won't fail with a raw
+traceback.
+
+The IPC base URL defaults to `http://127.0.0.1:41777` and can be overridden
+with `LOCALMIND_IPC_URL` (e.g. for testing against a different port).
 
 ## Verification
 
-1. **Pipeline smoke test (no Telegram needed)** — from the `phone-agent`
-   directory with the venv active:
+1. **Relay smoke test (no Telegram needed)** — from the `phone-agent`
+   directory with the venv active and the LocalMind desktop app running:
+   ```powershell
+   python -c "import localmind_client as lc; print(lc.health()); tid = lc.submit('say hello'); print(lc.poll(tid, 60))"
+   ```
+   Confirm `health()` prints `True` and `poll()` eventually returns a dict
+   with `status: "done"` and a non-empty `summary`.
+2. **Video pipeline smoke test** — same as before, independent of the
+   desktop app:
    ```powershell
    python -c "from video_pipeline import process_video; print(process_video('sample.mp4'))"
    ```
@@ -164,18 +197,18 @@ models, the bot still replies but won't use tools.
    with real transcript text, and at least one
    `<workspace>\.localmind\skills\<slug>.md` with `---\nname:\ntags:\n---`
    frontmatter.
-2. **Open the workspace in LocalMind** (`npm run tauri dev`) → Skills tab →
-   confirm the new skill appears.
-3. **Telegram smoke test** — run `python agent.py`, message your bot from
-   your phone, then send the same test video.
-4. **Ask the in-app agent** "what skills do you have access to?" — it should
-   pick up the new skill via its existing skill-matching.
+3. **Telegram smoke test** — with the desktop app running, run
+   `python agent.py`, message your bot from your phone, and confirm you get
+   a relayed answer. Then stop the desktop app and send another message —
+   confirm you get a plain "LocalMind isn't running" reply, not a crash.
 
 ## Notes / limitations
 
-- This bot can reply to you, but it can't currently push messages *into* a
-  running LocalMind window — that would require a local HTTP listener in
-  the Tauri backend (not part of this).
-- Only the chat ID in `ALLOWED_CHAT_ID` can use the bot.
+- Only the chat ID in `ALLOWED_CHAT_ID` can use the bot — this check is
+  unchanged and is the only thing standing between a stranger on Telegram
+  and your desktop agent.
+- The desktop app must be running for text messages; the bot itself has no
+  fallback model or offline mode for text.
 - `phone_agent.db` (SQLite) tracks processed videos and written skills to
-  avoid re-downloading resources for skills you already have.
+  avoid re-downloading resources for skills you already have — unrelated to
+  the IPC relay.

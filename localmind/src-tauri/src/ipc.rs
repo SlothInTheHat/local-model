@@ -73,6 +73,14 @@ struct TaskRequest {
     task: String,
     #[serde(rename = "targetView")]
     target_view: Option<String>,
+    /// Whether this task is meant to CHANGE something rather than answer a
+    /// question. Omitted defaults to false on this path: an IPC caller is
+    /// typically conversational (the Telegram relay forwarding "what's in my
+    /// README?"), and the headless runtime forces `outcome: "error"` when a
+    /// run that expected side effects produced none. Senders that really do
+    /// queue work to be done can pass `true`.
+    #[serde(rename = "expectSideEffects")]
+    expect_side_effects: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -101,6 +109,8 @@ struct IpcTaskEvent {
     task: String,
     #[serde(rename = "targetView")]
     target_view: String,
+    #[serde(rename = "expectSideEffects")]
+    expect_side_effects: bool,
 }
 
 // ─── WP6.4a: task result store ─────────────────────────────────────────────
@@ -406,6 +416,7 @@ fn handle_task_post(app: &AppHandle, mut request: tiny_http::Request) {
         .target_view
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "chat".to_string());
+    let expect_side_effects = task_req.expect_side_effects;
 
     // WP6.4a: mint an id for this task before emitting, so both the event
     // payload (which src/App.tsx correlates against its own queue-store id)
@@ -426,7 +437,12 @@ fn handle_task_post(app: &AppHandle, mut request: tiny_http::Request) {
         );
     }
 
-    let event = IpcTaskEvent { id: id.clone(), task, target_view };
+    let event = IpcTaskEvent {
+        id: id.clone(),
+        task,
+        target_view,
+        expect_side_effects: expect_side_effects.unwrap_or(false),
+    };
     if let Err(e) = app.emit("ipc-task", event) {
         eprintln!("[ipc] failed to emit ipc-task event: {e}");
         let _ = request.respond(json_response(500, r#"{"error":"internal error"}"#));

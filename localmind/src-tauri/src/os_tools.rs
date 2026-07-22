@@ -83,11 +83,80 @@ pub struct WindowInfo {
 
 /// Result of `take_screenshot`: the saved PNG's absolute path plus whatever
 /// OCR text (if any) could be extracted from it.
-#[derive(serde::Serialize)]
+///
+/// `Clone` is needed so `capture_region` (WP7.1) can both return this to its
+/// caller AND stash a copy in `PENDING_REGION` for `take_screenshot` to pick
+/// up later — the two consumers need independent owned values.
+#[derive(serde::Serialize, Clone)]
 pub struct ScreenshotResult {
     pub path: String,
     pub ocr_text: String,
     pub ocr_available: bool,
+}
+
+// ─── Region capture (WP7.1: "circle what you care about") ─────────────────
+//
+// The annotate overlay (src/annotate/Annotate.tsx) lets the user draw a
+// freehand marker loop around a region of their screen; it computes a
+// bounding box in physical pixels and calls `capture_region` directly. But
+// the AGENT never calls capture_region itself — its tool schema only knows
+// about `take_screenshot` (see QUICK_INVOKE_ALLOWLIST in App.tsx, which is
+// deliberately NOT touched by this feature). So capture_region stashes its
+// result here, and `take_screenshot` below checks the stash first and
+// returns the cropped region in its place if one is fresh enough. This is
+// the entire seam that makes "circle a region" work without adding a new
+// tool the model has to be taught about.
+use std::sync::Mutex;
+
+/// A stashed region capture plus the epoch-ms timestamp it was captured at
+/// (for the freshness check in `take_screenshot`).
+static PENDING_REGION: Mutex<Option<(ScreenshotResult, u128)>> = Mutex::new(None);
+
+/// How long a stashed region capture stays valid. Generous enough to survive
+/// the round-trip from "user finishes circling" through "agent gets invoked
+/// and decides to call take_screenshot", but short enough that a stale region
+/// from a much earlier session can never silently leak into an unrelated
+/// later screenshot request.
+const PENDING_REGION_MAX_AGE_MS: u128 = 120_000;
+
+fn now_epoch_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Capture exactly the given rectangle (physical pixels, screen-origin
+/// coordinates) of the primary monitor, save it as a PNG using the same
+/// filename pattern `take_screenshot` uses, OCR the cropped pixels, and stash
+/// the result for `take_screenshot` to hand to the agent next. Called by the
+/// annotate overlay right after the user finishes drawing.
+#[tauri::command]
+pub fn capture_region(x: i32, y: i32, width: u32, height: u32) -> Result<ScreenshotResult, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let result = windows_impl::capture_region(x, y, width, height)?;
+        if let Ok(mut slot) = PENDING_REGION.lock() {
+            *slot = Some((result.clone(), now_epoch_ms()));
+        }
+        Ok(result)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (x, y, width, height);
+        Err("Screen capture is only supported on Windows".to_string())
+    }
+}
+
+/// Discard a stashed region capture without consuming it — used when the
+/// user cancels the annotate overlay (Escape / right-click) so a screenshot
+/// taken later in the session doesn't unexpectedly come back cropped to a
+/// region the user explicitly abandoned.
+#[tauri::command]
+pub fn clear_pending_region() {
+    if let Ok(mut slot) = PENDING_REGION.lock() {
+        *slot = None;
+    }
 }
 
 /// Enumerate visible top-level windows (title + stable id).
@@ -123,6 +192,26 @@ pub fn focus_window(id: String) -> Result<String, String> {
 /// result just carries a note that OCR was unavailable instead of an error.
 #[tauri::command]
 pub fn take_screenshot() -> Result<ScreenshotResult, String> {
+    // WP7.1 seam: if the user recently circled a region via the annotate
+    // overlay, hand back THAT cropped capture instead of grabbing the whole
+    // screen again — this is what makes "circle what you care about" work
+    // through the agent's existing take_screenshot tool call with no schema
+    // changes. Consume (take) the stash so a second take_screenshot call in
+    // the same run falls through to a normal full-screen capture rather than
+    // replaying the same region forever. A stash older than
+    // PENDING_REGION_MAX_AGE_MS is treated as stale and dropped, not returned
+    // — an ancient region from an abandoned earlier session must never
+    // silently answer a fresh, unrelated screenshot request.
+    if let Ok(mut slot) = PENDING_REGION.lock() {
+        if let Some((result, captured_at)) = slot.take() {
+            if now_epoch_ms().saturating_sub(captured_at) < PENDING_REGION_MAX_AGE_MS {
+                return Ok(result);
+            }
+            // else: fall through to the full-screen path below; the stale
+            // entry has already been cleared by `.take()` above.
+        }
+    }
+
     #[cfg(target_os = "windows")]
     {
         windows_impl::take_screenshot()
@@ -401,6 +490,103 @@ mod windows_impl {
         result
     }
 
+    /// Crop the given rectangle out of a full-monitor BGRA32 buffer,
+    /// clamping it to the buffer's actual bounds first. Returns the cropped
+    /// buffer plus its (clamped) width/height/origin, or an `Err` if the
+    /// clamped rect has zero area (e.g. the requested rect was entirely off
+    /// the monitor).
+    fn crop_bgra(
+        bgra: &[u8],
+        full_width: i32,
+        full_height: i32,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    ) -> Result<(Vec<u8>, i32, i32, i32, i32), String> {
+        // Clamp the requested rect to the captured bounds. `x`/`y` can be
+        // negative (multi-monitor setups place secondary monitors at
+        // negative coordinates) but this capture is always of the PRIMARY
+        // monitor at origin (0, 0), so clamp against [0, full_width) /
+        // [0, full_height) directly.
+        let clamped_x = x.clamp(0, full_width);
+        let clamped_y = y.clamp(0, full_height);
+        let requested_right = clamped_x.saturating_add(width as i32);
+        let requested_bottom = clamped_y.saturating_add(height as i32);
+        let clamped_right = requested_right.clamp(0, full_width);
+        let clamped_bottom = requested_bottom.clamp(0, full_height);
+
+        let crop_width = (clamped_right - clamped_x).max(0);
+        let crop_height = (clamped_bottom - clamped_y).max(0);
+
+        if crop_width == 0 || crop_height == 0 {
+            return Err(format!(
+                "Requested region ({x}, {y}, {width}x{height}) has zero area after clamping to the captured {full_width}x{full_height} screen"
+            ));
+        }
+
+        let src_row_bytes = full_width as usize * 4;
+        let crop_row_bytes = crop_width as usize * 4;
+        let mut cropped = vec![0u8; crop_row_bytes * crop_height as usize];
+
+        for row in 0..crop_height as usize {
+            let src_start = (clamped_y as usize + row) * src_row_bytes + clamped_x as usize * 4;
+            let src_end = src_start + crop_row_bytes;
+            let dst_start = row * crop_row_bytes;
+            let dst_end = dst_start + crop_row_bytes;
+            cropped[dst_start..dst_end].copy_from_slice(&bgra[src_start..src_end]);
+        }
+
+        Ok((cropped, crop_width, crop_height, clamped_x, clamped_y))
+    }
+
+    /// Save a BGRA32 buffer as a PNG at the given path, converting to RGBA
+    /// first (the `image` crate's PNG encoder wants RGBA order; GDI/OCR both
+    /// produce BGRA). Shared by the full-screen and region capture paths.
+    fn save_bgra_as_png(bgra: &[u8], width: u32, height: u32, path: &std::path::Path) -> Result<(), String> {
+        let rgba = image::RgbaImage::from_raw_bgra(width, height, bgra.to_vec())
+            .ok_or_else(|| "Failed to build image buffer from captured pixels".to_string())?;
+        rgba.save(path)
+            .map_err(|e| format!("Failed to save screenshot PNG: {e}"))
+    }
+
+    /// Capture only the given rectangle of the primary monitor (WP7.1: the
+    /// "circle what you care about" annotate flow). Reuses
+    /// `capture_primary_monitor` for the underlying GDI grab — there's no
+    /// cheaper Win32 path to a sub-rect capture than blitting the whole
+    /// screen and cropping in memory — then crops, saves under the exact
+    /// same `localmind-screenshot-<epoch_ms>.png` pattern `take_screenshot`
+    /// uses (critical: `read_image_base64`'s allowlist only accepts that
+    /// pattern), and OCRs the CROPPED pixels so the recognized text matches
+    /// what's actually in the saved image rather than the whole screen.
+    pub fn capture_region(x: i32, y: i32, width: u32, height: u32) -> Result<ScreenshotResult, String> {
+        let (bgra, full_width, full_height) = capture_primary_monitor()?;
+        let (cropped, crop_width, crop_height, _clamped_x, _clamped_y) =
+            crop_bgra(&bgra, full_width, full_height, x, y, width, height)?;
+
+        let epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("localmind-screenshot-{epoch_ms}.png"));
+        save_bgra_as_png(&cropped, crop_width as u32, crop_height as u32, &path)?;
+
+        let path_str = path.to_string_lossy().to_string();
+
+        match try_ocr(&cropped, crop_width, crop_height) {
+            Ok(text) => Ok(ScreenshotResult {
+                path: path_str,
+                ocr_text: text,
+                ocr_available: true,
+            }),
+            Err(e) => Ok(ScreenshotResult {
+                path: path_str,
+                ocr_text: format!("(OCR unavailable: {e})"),
+                ocr_available: false,
+            }),
+        }
+    }
+
     pub fn take_screenshot() -> Result<ScreenshotResult, String> {
         let (bgra, width, height) = capture_primary_monitor()?;
 
@@ -409,13 +595,7 @@ mod windows_impl {
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let path = std::env::temp_dir().join(format!("localmind-screenshot-{epoch_ms}.png"));
-
-        // `image` wants RGBA order; GDI/OCR both use BGRA, so convert on a
-        // clone rather than disturbing the buffer OCR still needs.
-        let rgba = image::RgbaImage::from_raw_bgra(width as u32, height as u32, bgra.clone())
-            .ok_or_else(|| "Failed to build image buffer from captured pixels".to_string())?;
-        rgba.save(&path)
-            .map_err(|e| format!("Failed to save screenshot PNG: {e}"))?;
+        save_bgra_as_png(&bgra, width as u32, height as u32, &path)?;
 
         let path_str = path.to_string_lossy().to_string();
 

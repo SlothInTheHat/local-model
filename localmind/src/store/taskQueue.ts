@@ -22,6 +22,23 @@ export interface QueuedTask {
    * forever while the task actually ran to completion.
    */
   externalId?: string;
+  /**
+   * Whether this task is expected to CHANGE something (write a file, run a
+   * command) versus just answer a question.
+   *
+   * The runner passes this to the headless runtime, which forces
+   * `outcome: "error"` when a run that expected side effects produced none —
+   * a guard against the model narrating "I've updated the file" without ever
+   * calling write_file. That's right for `send_task_to_tab`, where a human
+   * queued work to be done.
+   *
+   * It is wrong for conversational senders. A task arriving over IPC from the
+   * Telegram relay is usually a QUESTION ("what's in my README?"), and
+   * answering it correctly touches nothing — which the guard would report as a
+   * failure. Undefined keeps the historical `true`, so existing callers are
+   * unchanged; the IPC path sets it explicitly.
+   */
+  expectSideEffects?: boolean;
   startedAt?: number;
   finishedAt?: number;
 }
@@ -39,7 +56,13 @@ interface TaskQueueState {
    */
   deferReason: string | null;
   setDeferReason: (reason: string | null) => void;
-  enqueue: (targetView: AppView, task: string, sourceView: AppView, externalId?: string) => string;
+  enqueue: (
+    targetView: AppView,
+    task: string,
+    sourceView: AppView,
+    externalId?: string,
+    expectSideEffects?: boolean,
+  ) => string;
   setStatus: (id: string, status: QueuedTask["status"]) => void;
   setResult: (id: string, resultId: string) => void;
   remove: (id: string) => void;
@@ -49,12 +72,21 @@ export const useTaskQueueStore = create<TaskQueueState>()(
   persist(
     (set) => ({
       tasks: [],
-      enqueue: (targetView, task, sourceView, externalId) => {
+      enqueue: (targetView, task, sourceView, externalId, expectSideEffects) => {
         const id = crypto.randomUUID();
         set((s) => ({
           tasks: [
             ...s.tasks,
-            { id, targetView, task, sourceView, createdAt: Date.now(), status: "pending", externalId },
+            {
+              id,
+              targetView,
+              task,
+              sourceView,
+              createdAt: Date.now(),
+              status: "pending",
+              externalId,
+              expectSideEffects,
+            },
           ],
         }));
         return id;

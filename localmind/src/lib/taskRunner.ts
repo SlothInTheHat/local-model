@@ -188,7 +188,13 @@ export async function processNextPending(): Promise<void> {
         origin: "task-queue",
         agentBuildMode: true,
         toolAllowlist: SAFE_QUEUE_ALLOWLIST,
-        expectSideEffects: true,
+        // Per-task now: `send_task_to_tab` queues work to be DONE, so a run
+        // that changes nothing is a genuine failure and keeps the historical
+        // `true`. Conversational senders (the IPC/Telegram relay) set it false
+        // — answering a question without touching a file is a correct outcome,
+        // and forcing it to "error" would make the relay report failure on
+        // almost every message. See QueuedTask.expectSideEffects.
+        expectSideEffects: task.expectSideEffects ?? true,
       });
 
     // Retry a failed attempt once with a fresh session — small local models

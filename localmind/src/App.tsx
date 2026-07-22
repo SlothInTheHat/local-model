@@ -105,6 +105,22 @@ const AgentLogs = lazy(() =>
 // (not inside the component) so it isn't rebuilt on every render.
 const QUICK_INVOKE_ALLOWLIST = [...SAFE_QUEUE_ALLOWLIST, "take_screenshot", "read_clipboard", "list_windows"];
 
+// ─── WP7.1: "circle what you care about" region preamble ──────────────────
+//
+// The annotate overlay (src/annotate/Annotate.tsx) captures a cropped region
+// of the screen and stashes it in Rust (see PENDING_REGION in
+// src-tauri/src/os_tools.rs) so the NEXT take_screenshot call returns that
+// crop instead of the whole screen. But the model has no other way to know
+// a region is even waiting for it — its take_screenshot tool schema is
+// completely unchanged, and nothing about the prompt text implies "call
+// take_screenshot" on its own. This preamble is the only signal: it's
+// prepended to the task text whenever hasRegion is true, telling the model
+// exactly what calling take_screenshot will get it and why. take_screenshot
+// is already in QUICK_INVOKE_ALLOWLIST above, so no allowlist change is
+// needed for this to work.
+const QUICK_INVOKE_REGION_PREAMBLE =
+  "The user has circled a specific region of their screen. Call take_screenshot to see it — it returns ONLY that circled region, already cropped. Answer about what is in it.\n\n";
+
 // ─── WP6.4a: IPC task result correlation ───────────────────────────────────
 //
 // The Rust IPC listener (src-tauri/src/ipc.rs) mints an id per `POST /task`
@@ -542,15 +558,41 @@ export default function App() {
   // browser dev mode never tries to subscribe.
   useEffect(() => {
     if (!isTauriEnv()) return;
-    const unlistenPromise = listen<{ prompt: string; mode: "chat" | "widget" }>(
+    // hasRegion (WP7.1): true when the user circled a screen region via the
+    // annotate overlay before submitting. See QUICK_INVOKE_REGION_PREAMBLE
+    // below for why the handlers need this flag at all.
+    const unlistenPromise = listen<{ prompt: string; mode: "chat" | "widget"; hasRegion?: boolean }>(
       "quick-invoke",
       (event) => {
-        const { prompt, mode } = event.payload;
+        const { prompt, mode, hasRegion } = event.payload;
         if (mode === "chat") {
-          void handleQuickInvokeChat(prompt);
+          void handleQuickInvokeChat(prompt, hasRegion ?? false);
         } else {
-          void handleQuickInvokeWidget(prompt);
+          void handleQuickInvokeWidget(prompt, hasRegion ?? false);
         }
+      }
+    );
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ─── Quick-invoke result-widget follow-up (WP7.3) ──────────────────────────
+  //
+  // The result widget (src/result/ResultWidget.tsx) stays as dumb as the
+  // overlay above: once a quick-invoke "widget" answer is showing, a
+  // follow-up question or the "Open in chat →" button just emits
+  // `quick-followup` with the original prompt/answer and (if the user typed
+  // one) a follow-up — it never touches the chat store or handleSend itself.
+  // This is where the real work happens, same split as quick-invoke. Guarded
+  // by isTauriEnv() and cleaned up on unmount like every other listener here.
+  useEffect(() => {
+    if (!isTauriEnv()) return;
+    const unlistenPromise = listen<{ prompt: string; answer: string; followUp: string }>(
+      "quick-followup",
+      (event) => {
+        const { prompt, answer, followUp } = event.payload;
+        void handleQuickFollowup(prompt, answer, followUp);
       }
     );
     return () => {
@@ -584,17 +626,26 @@ export default function App() {
   // outcome back under it.
   useEffect(() => {
     if (!isTauriEnv()) return;
-    const unlistenPromise = listen<{ id: string; task: string; targetView?: string }>(
+    const unlistenPromise = listen<{
+      id: string;
+      task: string;
+      targetView?: string;
+      expectSideEffects?: boolean;
+    }>(
       "ipc-task",
       (event) => {
-        const { id, task, targetView } = event.payload;
+        const { id, task, targetView, expectSideEffects } = event.payload;
         // Validate against the real AppView list here (the Rust side passes
         // through whatever the caller sent, or "chat", without validating —
         // src/types/app.ts is the single source of truth for AppView).
         const view: AppView = APP_VIEWS.includes(targetView as AppView)
           ? (targetView as AppView)
           : "chat";
-        useTaskQueueStore.getState().enqueue(view, task, view, id);
+        // expectSideEffects comes from the sender (Rust defaults it to false
+        // for IPC — see TaskRequest in ipc.rs). Conversational senders like the
+        // Telegram relay would otherwise have every answered question reported
+        // as a failure by the headless runtime's no-side-effects guard.
+        useTaskQueueStore.getState().enqueue(view, task, view, id, expectSideEffects ?? false);
         const label = task.slice(0, 60) + (task.length > 60 ? "…" : "");
         toast.info(`Task received from an external program: "${label}"`);
 
@@ -622,7 +673,7 @@ export default function App() {
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  async function handleQuickInvokeChat(prompt: string): Promise<void> {
+  async function handleQuickInvokeChat(prompt: string, hasRegion: boolean): Promise<void> {
     // Surfacing the window is best-effort and must NEVER block the send. These
     // three calls each need their own capability permission in
     // capabilities/default.json (core:window:allow-show / allow-unminimize /
@@ -640,13 +691,73 @@ export default function App() {
       console.error("[quick-invoke] could not surface the main window:", err);
     }
     setView("chat");
+    // WP7.1: prepend the region preamble so the model knows to call
+    // take_screenshot for the circled crop — see
+    // QUICK_INVOKE_REGION_PREAMBLE's doc comment above for why this is the
+    // only way it finds out. This does mean the preamble shows up as part of
+    // the visible chat message (handleSend's `text` arg is both what's sent
+    // and what's displayed) — an acceptable tradeoff for a one-line, clearly
+    // worded sentence versus a bigger refactor to separate "sent" from
+    // "shown" text.
+    const task = hasRegion ? QUICK_INVOKE_REGION_PREAMBLE + prompt : prompt;
     // forceNewConversation=true: quick-invoke always starts a fresh
     // conversation rather than appending to whatever chat happens to be
     // active. handleSendRef.current is always the latest handleSend closure
     // (refreshed every render, see the assignment above), so this reads
     // current selectedModel/agentMode/etc. even though this listener itself
     // was registered once on mount.
-    void handleSendRef.current?.(prompt, false, true);
+    void handleSendRef.current?.(task, false, true);
+  }
+
+  // Handles `quick-followup` from the result widget (WP7.3): surfaces the
+  // main window, seeds a NEW conversation with the widget's Q&A as history,
+  // and — if the user typed a follow-up rather than just clicking "Open in
+  // chat →" — sends it through the normal handleSend path so it appends to
+  // that same conversation. Mirrors handleQuickInvokeChat above.
+  async function handleQuickFollowup(prompt: string, answer: string, followUp: string): Promise<void> {
+    // Same best-effort surfacing as handleQuickInvokeChat, same reason: each
+    // call needs its own window-permission grant, and an unguarded rejection
+    // here would reach main.tsx's global unhandledrejection handler and wipe
+    // #root instead of just failing to raise the window.
+    try {
+      const win = getCurrentWindow();
+      await win.show();
+      await win.unminimize();
+      await win.setFocus();
+    } catch (err) {
+      console.error("[quick-followup] could not surface the main window:", err);
+    }
+    setView("chat");
+
+    // Seed a brand-new conversation rather than appending to whatever chat
+    // happens to be active — the widget's answer came from a headless
+    // quick-invoke run with no conversation of its own, so there is nothing
+    // sensible for it to append to. useModelSelectionStore.getState() (not
+    // the component's closured `selectedModel`) mirrors handleQuickInvokeWidget's
+    // read-live-state pattern above.
+    const model = useModelSelectionStore.getState().selectedModel;
+    const convId = newConversation(model);
+    // newConversation() sets activeId synchronously in the zustand store (see
+    // store/chat.ts), but handleSend reads `activeId` from THIS component's
+    // closured useChatStore() hook value, which only refreshes on the next
+    // React render — so the id is passed to it explicitly below instead. Only
+    // ChatMessage's actual fields (role/content[/images]) are needed — see
+    // lib/ollama.ts; there's no id/timestamp on this type.
+    addMessage(convId, { role: "user", content: prompt });
+    addMessage(convId, { role: "assistant", content: answer });
+
+    if (!followUp) return; // "Open in chat →" — nothing more to send.
+
+    // Pass `convId` EXPLICITLY (handleSend's 4th arg) rather than relying on
+    // handleSendRef's closured `activeId` catching up. The earlier draft
+    // deferred this call by a macrotask and hoped React had committed the
+    // store update by then — but React schedules its own work through the
+    // scheduler package (MessageChannel), so the ordering between that and a
+    // setTimeout(0) is an implementation detail, not a guarantee. Losing that
+    // race would silently file the follow-up in the previously-active chat.
+    // The override makes the target unambiguous and removes the timing
+    // question entirely.
+    void handleSendRef.current?.(followUp, false, false, convId);
   }
 
   // Best-effort wrapper around invoke("show_result_widget"): this crosses the
@@ -678,7 +789,7 @@ export default function App() {
     );
   }
 
-  async function handleQuickInvokeWidget(prompt: string): Promise<void> {
+  async function handleQuickInvokeWidget(prompt: string, hasRegion: boolean): Promise<void> {
     // Read live store state rather than this component's (possibly stale,
     // mount-time) closured values — mirrors the exact pattern taskRunner.ts /
     // scheduler.ts use for their headless runs.
@@ -701,13 +812,19 @@ export default function App() {
     const numCtxOverride = useSettingsStore.getState().numCtxOverride;
 
     await showResultWidget(true);
+    // Widget display always shows the user's original, undecorated prompt —
+    // only the `task` string handed to runHeadlessTask below gets the WP7.1
+    // region preamble prepended. Keeping emitQuickResult's `prompt` clean
+    // means the widget never shows the model-facing instructions as if the
+    // user had typed them.
     emitQuickResult({ status: "running", prompt });
+    const task = hasRegion ? QUICK_INVOKE_REGION_PREAMBLE + prompt : prompt;
 
     try {
       const { record, transcript } = await runHeadlessTask({
         workspacePath,
         modelRef,
-        task: prompt,
+        task,
         hardware,
         numCtxOverride,
         currentView: "chat",
@@ -858,7 +975,20 @@ export default function App() {
 
   // ─── Normal send (non-agent) ──────────────────────────────────────────────
 
-  async function handleSend(text: string, forceAgentMode = false, forceNewConversation = false) {
+  async function handleSend(
+    text: string,
+    forceAgentMode = false,
+    forceNewConversation = false,
+    // Explicit target conversation, overriding both `activeId` and
+    // `forceNewConversation` (WP7.3). Exists because `activeId` here is a
+    // CLOSURED value from this component's useChatStore() hook, refreshed only
+    // on the next React render — so an imperative caller that just created a
+    // conversation via the store (handleQuickFollowup) cannot rely on this
+    // closure knowing about it yet. Timing tricks (deferring the call a
+    // macrotask and hoping React has committed) are a race against React's
+    // internal scheduler; passing the id is not.
+    conversationIdOverride?: string,
+  ) {
     if (!selectedModel) return;
 
     // Abort any still-in-flight session before starting a new one. Covers the
@@ -888,7 +1018,7 @@ export default function App() {
     // forceNewConversation (quick-invoke "open in chat", see the effect below)
     // always starts a fresh conversation instead of appending to whatever's
     // currently active.
-    let convId = forceNewConversation ? null : activeId;
+    let convId = conversationIdOverride ?? (forceNewConversation ? null : activeId);
     if (!convId) convId = newConversation(selectedModel);
     activeConvIdRef.current = convId;
 

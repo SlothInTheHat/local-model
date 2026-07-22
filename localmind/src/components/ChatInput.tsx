@@ -1,10 +1,14 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Send, Square, Globe, Zap, Loader2, Bot, Paperclip, Mic } from "lucide-react";
+import { toast } from "sonner";
 import { cn } from "./ui/utils";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { fileToBase64 } from "../lib/imageUtils";
+import { isTauriEnv } from "../lib/fileSystem";
+import { isDictationSupported, startDictation, cancelDictation, type DictationSession } from "../lib/dictation";
+import { useSettingsStore } from "../store/settings";
 
 interface Props {
   onSend: (text: string) => void;
@@ -43,10 +47,26 @@ export function ChatInput({
   onRemoveImage,
 }: Props) {
   const [text, setText] = useState("");
-  const [micActive, setMicActive] = useState(false);
+  // "recording" and "transcribing" only ever apply to the Tauri local-dictation
+  // path below; the browser Web Speech fallback only ever toggles between
+  // "idle" and "recording" (no separate transcribing phase — it streams a
+  // result event instead).
+  const [micState, setMicState] = useState<"idle" | "recording" | "transcribing">("idle");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const recognitionRef = useRef<{ stop: () => void } | null>(null);
+  const dictationSessionRef = useRef<DictationSession | null>(null);
+  const whisperModel = useSettingsStore((s) => s.whisperModel);
+
+  // If this component unmounts mid-recording (e.g. the user navigates away),
+  // make sure the mic is released rather than left hot with no UI left to
+  // stop it.
+  useEffect(() => {
+    return () => {
+      cancelDictation(dictationSessionRef.current);
+      dictationSessionRef.current = null;
+    };
+  }, []);
 
   function submit() {
     const trimmed = text.trim();
@@ -63,10 +83,74 @@ export function ChatInput({
     }
   }
 
-  function toggleMic() {
-    if (micActive) {
+  /**
+   * Tauri path (WP6.3): local offline dictation via mic capture + the
+   * faster-whisper pipeline (src/lib/dictation.ts -> `transcribe_audio_base64`).
+   * Click to start, click again to stop. Unlike the Web Speech fallback below,
+   * this has real latency and no interim results, so the transcript is
+   * inserted into the composer rather than auto-sent — the user reads it and
+   * presses enter themselves.
+   */
+  async function toggleTauriDictation() {
+    if (micState === "transcribing") return; // ignore clicks mid-transcription
+
+    if (micState === "recording") {
+      const session = dictationSessionRef.current;
+      dictationSessionRef.current = null;
+      if (!session) {
+        setMicState("idle");
+        return;
+      }
+      setMicState("transcribing");
+      try {
+        const transcript = await session.stop(whisperModel);
+        if (transcript) {
+          setText((prev) => (prev.trim() ? `${prev.trim()} ${transcript}` : transcript));
+          // Focus + move cursor to end so the user can immediately review/edit.
+          requestAnimationFrame(() => {
+            const el = textareaRef.current;
+            if (el) {
+              el.focus();
+              el.selectionStart = el.selectionEnd = el.value.length;
+            }
+          });
+        } else {
+          toast.error("Transcription produced no text — try speaking closer to the mic.");
+        }
+      } catch (e) {
+        toast.error(`Transcription failed: ${(e as Error).message}`);
+      } finally {
+        setMicState("idle");
+      }
+      return;
+    }
+
+    // idle -> start recording
+    if (!isDictationSupported()) {
+      toast.error("This device/browser build doesn't support microphone capture (getUserMedia/MediaRecorder unavailable).");
+      return;
+    }
+    try {
+      const session = await startDictation();
+      dictationSessionRef.current = session;
+      setMicState("recording");
+    } catch (e) {
+      const err = e as DOMException | Error;
+      if ("name" in err && err.name === "NotAllowedError") {
+        toast.error("Microphone access was denied. Grant microphone permission to LocalMind (Windows Settings > Privacy > Microphone) and try again.");
+      } else {
+        toast.error(`Could not start microphone recording: ${err.message}`);
+      }
+      setMicState("idle");
+    }
+  }
+
+  /** Browser dev-mode fallback: unchanged Web Speech API behavior (cloud-based,
+   * auto-sends on result). Only used when NOT running inside Tauri. */
+  function toggleWebSpeechMic() {
+    if (micState === "recording") {
       recognitionRef.current?.stop();
-      setMicActive(false);
+      setMicState("idle");
       return;
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -80,16 +164,24 @@ export function ChatInput({
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     rec.onresult = (e: any) => {
       const transcript = String(e.results[0][0].transcript).trim();
-      setMicActive(false);
+      setMicState("idle");
       if (transcript && !isStreaming && !isSearching && !disabled) {
         onSend(transcript);
       }
     };
-    rec.onerror = () => setMicActive(false);
-    rec.onend = () => setMicActive(false);
+    rec.onerror = () => setMicState("idle");
+    rec.onend = () => setMicState("idle");
     rec.start();
     recognitionRef.current = rec;
-    setMicActive(true);
+    setMicState("recording");
+  }
+
+  function toggleMic() {
+    if (isTauriEnv()) {
+      void toggleTauriDictation();
+    } else {
+      toggleWebSpeechMic();
+    }
   }
 
   async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -239,19 +331,35 @@ export function ChatInput({
                 the popover itself lives in AgentToolbar. */}
             {agentMode && agentToolbarSlot}
 
-            {/* Mic — voice input */}
+            {/* Mic — voice input. Tauri: local offline dictation (WP6.3).
+                Browser dev mode: Web Speech API fallback. Three visual states:
+                idle, recording (pulsing destructive-red mic), transcribing
+                (disabled spinner while the local whisper pipeline runs). */}
             <button
               type="button"
               onClick={toggleMic}
-              title={micActive ? "Listening… click to stop" : "Voice input"}
+              disabled={micState === "transcribing"}
+              title={
+                micState === "recording"
+                  ? "Listening… click to stop"
+                  : micState === "transcribing"
+                  ? "Transcribing…"
+                  : "Voice input"
+              }
               className={cn(
                 "size-7 flex items-center justify-center rounded-full transition-colors",
-                micActive
-                  ? "bg-red-500 text-white animate-pulse"
+                micState === "recording"
+                  ? "bg-destructive text-destructive-foreground animate-pulse"
+                  : micState === "transcribing"
+                  ? "text-muted-foreground cursor-not-allowed"
                   : "text-muted-foreground hover:text-foreground hover:bg-accent"
               )}
             >
-              <Mic className="size-4" />
+              {micState === "transcribing" ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <Mic className="size-4" />
+              )}
             </button>
           </div>
 

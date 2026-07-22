@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Eye, EyeOff, CheckCircle2, XCircle, RefreshCw, Settings, User, GitBranch, Globe, Plug, Clock, Trash2, Lightbulb, Check, Monitor, Keyboard, FolderOpen, Cpu, Sparkles, Copy, Network, Layers } from "lucide-react";
+import { Eye, EyeOff, CheckCircle2, XCircle, RefreshCw, Settings, User, GitBranch, Globe, Plug, Clock, Trash2, Lightbulb, Check, Monitor, Keyboard, FolderOpen, Cpu, Sparkles, Copy, Network, Layers, Mic } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { Card, CardContent } from "./ui/card";
@@ -598,7 +598,7 @@ function FeatureProposalsSection() {
 const IPC_ENDPOINT = "http://127.0.0.1:41777";
 
 function DesktopIntegrationSection() {
-  const { closeToTray, setCloseToTray } = useSettingsStore();
+  const { closeToTray, setCloseToTray, whisperModel, setWhisperModel } = useSettingsStore();
   const [autostartOn, setAutostartOn] = useState(false);
   const [autostartBusy, setAutostartBusy] = useState(false);
   const [ipcToken, setIpcToken] = useState<string | null>(null);
@@ -683,6 +683,35 @@ function DesktopIntegrationSection() {
           <Keyboard className="size-3.5 shrink-0" />
           Global hotkey <kbd className="px-1.5 py-0.5 rounded border border-border bg-muted font-mono text-[11px]">Ctrl+Shift+Space</kbd> shows/hides LocalMind from anywhere.
         </div>
+
+        {tauri && (
+          <div className="pt-3 border-t border-border space-y-2">
+            <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+              <Mic className="size-4" />
+              Voice dictation
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              The mic button in chat records locally and transcribes offline via faster-whisper — no audio ever
+              leaves this machine. Nothing to configure beyond the model size below.
+            </p>
+            <Field label="Whisper model">
+              <select
+                value={whisperModel}
+                onChange={(e) => setWhisperModel(e.target.value as typeof whisperModel)}
+                className="w-full text-sm px-3 py-1.5 rounded-md border border-border bg-background text-foreground outline-none focus:ring-2 focus:ring-ring"
+              >
+                <option value="tiny">Tiny — fastest, least accurate</option>
+                <option value="base">Base — good balance (default)</option>
+                <option value="small">Small — more accurate, slower</option>
+                <option value="medium">Medium — most accurate, slowest</option>
+              </select>
+              <p className="text-[11px] text-muted-foreground">
+                Larger models are more accurate but slower. Transcription always runs on CPU, so bigger models take
+                noticeably longer per dictation.
+              </p>
+            </Field>
+          </div>
+        )}
 
         {tauri && (
           <div className="pt-3 border-t border-border space-y-2">

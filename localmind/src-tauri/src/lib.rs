@@ -220,7 +220,7 @@ mod mcp;
 use mcp::{mcp_start_server, mcp_stop_server, mcp_send_request};
 
 mod transcribe;
-use transcribe::transcribe_video;
+use transcribe::{transcribe_video, transcribe_audio_base64};
 
 mod db;
 use db::{
@@ -233,7 +233,10 @@ mod tray;
 use tray::{set_close_to_tray, show_result_widget};
 
 mod os_tools;
-use os_tools::{open_application, list_windows, focus_window, take_screenshot, read_image_base64};
+use os_tools::{
+    open_application, list_windows, focus_window, take_screenshot, read_image_base64,
+    capture_region, clear_pending_region,
+};
 
 mod ipc;
 use ipc::{get_ipc_token, ipc_report_task_result};
@@ -411,6 +414,59 @@ pub(crate) fn base64_encode(data: &[u8]) -> String {
         if len > 2 { out.push(T[(n & 0x3f) as usize] as char); } else { out.push('='); }
     }
     out
+}
+
+/// Decode a standard base64 string (with the '+'/'/' alphabet and '=' padding,
+/// matching `base64_encode` above) back to raw bytes. Used by
+/// `transcribe::transcribe_audio_base64` (WP6.3 local dictation) to turn a
+/// recorded audio Blob's base64 payload back into bytes before writing it to
+/// a temp file for the whisper pipeline. Whitespace (e.g. a stray newline) is
+/// tolerated; any other invalid character or a length that isn't a multiple
+/// of 4 is a hard error rather than a silent skip, since corrupted audio
+/// bytes would otherwise fail confusingly deep inside ffmpeg/whisper instead
+/// of here.
+pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let cleaned: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if cleaned.is_empty() {
+        return Ok(Vec::new());
+    }
+    if cleaned.len() % 4 != 0 {
+        return Err("Invalid base64 length (not a multiple of 4)".to_string());
+    }
+
+    let mut out = Vec::with_capacity(cleaned.len() / 4 * 3);
+    for group in cleaned.chunks(4) {
+        let mut pad = 0usize;
+        let mut vals = [0u8; 4];
+        for (i, &b) in group.iter().enumerate() {
+            if b == b'=' {
+                pad += 1;
+                vals[i] = 0;
+            } else {
+                vals[i] = val(b).ok_or_else(|| format!("Invalid base64 character: '{}'", b as char))?;
+            }
+        }
+        let n = ((vals[0] as u32) << 18) | ((vals[1] as u32) << 12) | ((vals[2] as u32) << 6) | (vals[3] as u32);
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Serialize)]
@@ -1105,6 +1161,7 @@ pub fn run() {
             mcp_stop_server,
             mcp_send_request,
             transcribe_video,
+            transcribe_audio_base64,
             fs_read_file,
             fs_write_file,
             fs_list_dir,
@@ -1131,6 +1188,8 @@ pub fn run() {
             focus_window,
             take_screenshot,
             read_image_base64,
+            capture_region,
+            clear_pending_region,
             get_ipc_token,
             ipc_report_task_result,
         ])
@@ -1241,6 +1300,57 @@ mod tests {
 
     fn roots(paths: &[&str]) -> HashSet<PathBuf> {
         paths.iter().map(PathBuf::from).collect()
+    }
+
+    // ── base64 (WP6.3: hand-rolled, decodes recorded microphone audio) ───────
+    //
+    // Worth real coverage rather than a read-through: a subtle decoder bug
+    // wouldn't fail loudly, it would hand ffmpeg/whisper corrupted audio and
+    // surface as "transcription is gibberish", which is miserable to trace
+    // back to here. The padding cases are where hand-rolled decoders go wrong.
+
+    #[test]
+    fn base64_roundtrips_all_padding_cases() {
+        // Lengths mod 3 = 1, 2, 0 exercise "==", "=", and no padding.
+        for len in 0..=64usize {
+            let original: Vec<u8> = (0..len).map(|i| (i * 7 % 256) as u8).collect();
+            let encoded = base64_encode(&original);
+            let decoded = base64_decode(&encoded)
+                .unwrap_or_else(|e| panic!("len {len} failed to decode: {e}"));
+            assert_eq!(decoded, original, "round-trip mismatch at length {len}");
+        }
+    }
+
+    #[test]
+    fn base64_decodes_known_vectors() {
+        // RFC 4648 test vectors — catches an encoder and decoder that are
+        // wrong in the same direction and would agree with each other.
+        assert_eq!(base64_decode("").unwrap(), b"");
+        assert_eq!(base64_decode("Zg==").unwrap(), b"f");
+        assert_eq!(base64_decode("Zm8=").unwrap(), b"fo");
+        assert_eq!(base64_decode("Zm9v").unwrap(), b"foo");
+        assert_eq!(base64_decode("Zm9vYg==").unwrap(), b"foob");
+        assert_eq!(base64_decode("Zm9vYmE=").unwrap(), b"fooba");
+        assert_eq!(base64_decode("Zm9vYmFy").unwrap(), b"foobar");
+    }
+
+    #[test]
+    fn base64_handles_binary_high_bytes() {
+        // Audio is binary, not ASCII — make sure 0x80..0xFF survive.
+        let original: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(base64_decode(&base64_encode(&original)).unwrap(), original);
+    }
+
+    #[test]
+    fn base64_rejects_malformed_input() {
+        assert!(base64_decode("abc").is_err(), "bad length should be rejected");
+        assert!(base64_decode("ab*d").is_err(), "invalid char should be rejected");
+    }
+
+    #[test]
+    fn base64_ignores_whitespace() {
+        // Some encoders wrap at 76 columns; the decoder strips whitespace.
+        assert_eq!(base64_decode("Zm9v\nYmFy").unwrap(), b"foobar");
     }
 
     // ── Path containment (WP0.1: S3 confinement logic) ───────────────────────
