@@ -12,11 +12,12 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Plus, Trash2, Upload, Search, FileText, Check, GraduationCap, ExternalLink,
-  Network, ChevronDown, ChevronRight, X,
+  Network, ChevronDown, ChevronRight, X, Waypoints, List,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
+import { ConceptGraph } from "./ConceptGraph";
 import { useKnowledgeStore, type DocRow } from "../store/knowledge";
 import { pickUploadFiles } from "../lib/knowledge/ingest";
 import { searchMemory } from "../lib/vectorMemory";
@@ -97,6 +98,8 @@ export function KnowledgeHub() {
   const [kbEdges, setKbEdges] = useState<KbEdge[]>([]);
   const [kbLoading, setKbLoading] = useState(false);
   const [expandedNodeId, setExpandedNodeId] = useState<string | null>(null);
+  // KM4b: Graph (default) vs the KM4a cited List, within the Concept Map tab.
+  const [conceptView, setConceptView] = useState<"graph" | "list">("graph");
   // Tracks the in-flight buildGraph() call's AbortController so the Cancel
   // button has something to abort — see graph.ts's module doc comment for
   // what "cancel" actually does (stops future batches, still saves partial work).
@@ -146,6 +149,7 @@ export function KnowledgeHub() {
     }
     setRightView("search");
     setExpandedNodeId(null);
+    setConceptView("graph");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
 
@@ -514,6 +518,8 @@ export function KnowledgeHub() {
               onToggleExpand={(id) => setExpandedNodeId((cur) => (cur === id ? null : id))}
               onBuild={() => void handleBuildGraph()}
               onCancel={handleCancelBuild}
+              view={conceptView}
+              onViewChange={setConceptView}
             />
           )}
         </div>
@@ -522,13 +528,13 @@ export function KnowledgeHub() {
   );
 }
 
-// ─── KM4a: Concept Map panel ─────────────────────────────────────────────────
+// ─── Concept Map panel ────────────────────────────────────────────────────
 //
-// A cited concept LIST, not a visual graph — the interactive node/edge
-// visualization is a separate later task (KM4b). This proves extraction
-// works end-to-end and is citeable: each concept shows how many relations it
-// has and a few of its source citations, and expanding it shows its full
-// relation list plus every source chunk it was extracted from.
+// KM4a built the extraction + a cited concept LIST view (still here, gated
+// behind the "List" sub-toggle below). KM4b adds the interactive visual
+// node-link diagram (ConceptGraph.tsx) as the DEFAULT view — same
+// nodes/edges data, just rendered as a graph instead of a flat list. Both
+// views prove extraction works end-to-end and are fully citeable.
 
 interface ConceptMapPanelProps {
   collectionId: string;
@@ -541,6 +547,9 @@ interface ConceptMapPanelProps {
   onToggleExpand: (nodeId: string) => void;
   onBuild: () => void;
   onCancel: () => void;
+  /** KM4b: Graph (default, ConceptGraph.tsx) vs List (KM4a, unchanged). */
+  view: "graph" | "list";
+  onViewChange: (view: "graph" | "list") => void;
 }
 
 /** Max source citation badges shown on a collapsed node row before "+N more". */
@@ -548,13 +557,13 @@ const COLLAPSED_CITATION_LIMIT = 3;
 
 function ConceptMapPanel({
   collectionId, nodes, edges, loading, building, progress,
-  expandedNodeId, onToggleExpand, onBuild, onCancel,
+  expandedNodeId, onToggleExpand, onBuild, onCancel, view, onViewChange,
 }: ConceptMapPanelProps) {
   const nodeById = new Map(nodes.map((n) => [n.id, n]));
 
   return (
-    <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3">
-      <div className="flex items-center gap-2 flex-wrap mb-1.5">
+    <div className="flex-1 min-h-0 flex flex-col px-4 py-3">
+      <div className="flex items-center gap-2 flex-wrap mb-1.5 shrink-0">
         <Button size="sm" className="h-7 text-xs gap-1" onClick={onBuild} disabled={building}>
           <Network className="size-3.5" />
           {building ? "Building…" : nodes.length > 0 ? "Rebuild concept map" : "Build concept map"}
@@ -568,7 +577,7 @@ function ConceptMapPanel({
           <span className="text-xs text-muted-foreground truncate">{graphProgressLabel(progress)}</span>
         )}
       </div>
-      <p className="text-[11px] text-muted-foreground mb-3">
+      <p className="text-[11px] text-muted-foreground mb-3 shrink-0">
         Reads every document in this class with the digest model to find concepts and the relationships between
         them — can take a while for large classes.
       </p>
@@ -580,7 +589,36 @@ function ConceptMapPanel({
           No concept map yet — build one to see cited concepts across this class's notes.
         </p>
       ) : (
-        <div className="space-y-1.5">
+        <>
+          <div className="flex items-center gap-1 mb-2 shrink-0">
+            <button
+              onClick={() => onViewChange("graph")}
+              className={`px-2 py-1 rounded-md text-[11px] font-medium flex items-center gap-1 transition-colors ${
+                view === "graph"
+                  ? "bg-accent text-accent-foreground"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <Waypoints className="size-3" /> Graph
+            </button>
+            <button
+              onClick={() => onViewChange("list")}
+              className={`px-2 py-1 rounded-md text-[11px] font-medium flex items-center gap-1 transition-colors ${
+                view === "list"
+                  ? "bg-accent text-accent-foreground"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <List className="size-3" /> List
+            </button>
+          </div>
+
+          {view === "graph" ? (
+            <div className="flex-1 min-h-0">
+              <ConceptGraph collectionId={collectionId} nodes={nodes} edges={edges} />
+            </div>
+          ) : (
+          <div className="flex-1 min-h-0 overflow-y-auto space-y-1.5">
           {nodes.map((node) => {
             const outgoing = edges.filter((e) => e.sourceId === node.id);
             const incoming = edges.filter((e) => e.targetId === node.id);
@@ -659,7 +697,9 @@ function ConceptMapPanel({
               </div>
             );
           })}
-        </div>
+          </div>
+          )}
+        </>
       )}
     </div>
   );
