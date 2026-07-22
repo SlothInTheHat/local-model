@@ -46,7 +46,7 @@ export async function addMemory(
   text: string,
   tags: string[] = [],
   source: "user" | "agent" | "session-digest" | "knowledge" = "user",
-  opts?: { collection?: string; docId?: string; sourceUri?: string; location?: string; chunkIndex?: number }
+  opts?: { collection?: string; docId?: string; sourceUri?: string; location?: string; chunkIndex?: number; sourcePath?: string }
 ): Promise<MemoryEntry> {
   await ensureHydrated();
   const { embedModel, addEntry } = useMemoryStore.getState();

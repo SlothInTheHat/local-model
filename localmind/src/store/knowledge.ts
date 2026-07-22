@@ -22,6 +22,10 @@ export interface DocRow {
   docId: string;
   sourceUri: string;
   chunkCount: number;
+  /** Full original file path (KM4 "open source file"), if this document was
+   *  ingested after source_path started being captured. Undefined for
+   *  documents ingested before then — the "Open" action hides itself. */
+  sourcePath?: string;
 }
 
 // Mirrors src/store/memory.ts's isTauri()/invoke() helpers (not exported
@@ -48,6 +52,7 @@ interface DbDocRow {
   doc_id: string;
   source_uri: string;
   chunk_count: number;
+  source_path?: string;
 }
 
 function rowToCollection(row: CollectionRow): Collection {
@@ -55,7 +60,12 @@ function rowToCollection(row: CollectionRow): Collection {
 }
 
 function rowToDoc(row: DbDocRow): DocRow {
-  return { docId: row.doc_id, sourceUri: row.source_uri, chunkCount: row.chunk_count };
+  return {
+    docId: row.doc_id,
+    sourceUri: row.source_uri,
+    chunkCount: row.chunk_count,
+    sourcePath: row.source_path ?? undefined,
+  };
 }
 
 interface KnowledgeState {

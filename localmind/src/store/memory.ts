@@ -25,6 +25,13 @@ export interface MemoryEntry {
   location?: string;
   /** Position of this chunk within its document. */
   chunkIndex?: number;
+  // ─── "Open source file" (KM4) ───────────────────────────────────────────
+  /** Full original file path this chunk was ingested from (unlike `sourceUri`,
+   *  which is deliberately just the basename) — captured once at ingest time
+   *  (src/lib/knowledge/ingest.ts) so the "Open file" action has somewhere to
+   *  point the opener plugin. Undefined for documents ingested before this
+   *  column existed; the "Open file" affordance simply hides itself. */
+  sourcePath?: string;
 }
 
 interface MemoryState {
@@ -82,6 +89,7 @@ interface DbMemoryRow {
   source_uri?: string;
   location?: string;
   chunk_index?: number;
+  source_path?: string;
 }
 
 function tagsToDb(tags: string[]): string {
@@ -114,6 +122,7 @@ function rowToEntry(row: DbMemoryRow): MemoryEntry {
     sourceUri: row.source_uri ?? undefined,
     location: row.location ?? undefined,
     chunkIndex: row.chunk_index ?? undefined,
+    sourcePath: row.source_path ?? undefined,
   };
 }
 
@@ -197,6 +206,7 @@ export const useMemoryStore = create<MemoryState>()((set, get) => ({
         sourceUri: entry.sourceUri,
         location: entry.location,
         chunkIndex: entry.chunkIndex,
+        sourcePath: entry.sourcePath,
       }).catch((e) => console.error("memory_upsert failed", e));
     }
     // Browser mode: no backend — the entry just lives in memory for this

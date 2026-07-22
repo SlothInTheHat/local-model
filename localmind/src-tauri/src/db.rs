@@ -116,6 +116,7 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE memories ADD COLUMN source_uri TEXT",
         "ALTER TABLE memories ADD COLUMN location TEXT",
         "ALTER TABLE memories ADD COLUMN chunk_index INTEGER",
+        "ALTER TABLE memories ADD COLUMN source_path TEXT",
     ] {
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
@@ -177,12 +178,21 @@ pub struct MemoryRow {
     pub source_uri: Option<String>,
     pub location: Option<String>,
     pub chunk_index: Option<i64>,
+    // ─── "Open source file" (KM4): full original file path ─────────────────
+    // `source_uri` above is deliberately just a basename (see ingest.ts's
+    // docId contract) so it's safe to show in a citation. `source_path` is
+    // the FULL path the file was ingested from, captured once at ingest time
+    // (src/lib/knowledge/ingest.ts), so the "Open file" action can hand it to
+    // the opener plugin. Optional/nullable like the other provenance columns
+    // — pre-existing knowledge rows ingested before this column existed have
+    // no path on file, and the "Open file" affordance simply hides itself.
+    pub source_path: Option<String>,
 }
 
 /// Insert or update (by id) a memory entry. Embeddings are JSON-encoded —
 /// see the module doc comment for why.
 ///
-/// The five knowledge-provenance params are optional so pre-existing callers
+/// The six knowledge-provenance params are optional so pre-existing callers
 /// (plain user/agent/session-digest memories) that only ever pass the
 /// original 6 args keep working unchanged — Tauri maps missing/omitted args
 /// to `None` on the Rust side.
@@ -200,13 +210,14 @@ pub fn memory_upsert(
     source_uri: Option<String>,
     location: Option<String>,
     chunk_index: Option<i64>,
+    source_path: Option<String>,
 ) -> Result<(), String> {
     let db = get_db(&app)?;
     let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
     let embedding_json = serde_json::to_string(&embedding).map_err(|e| e.to_string())?;
     conn.execute(
-        "INSERT INTO memories (id, text, embedding, tags, source, created_at, last_used_at, use_count, collection, doc_id, source_uri, location, chunk_index)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0, ?7, ?8, ?9, ?10, ?11)
+        "INSERT INTO memories (id, text, embedding, tags, source, created_at, last_used_at, use_count, collection, doc_id, source_uri, location, chunk_index, source_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(id) DO UPDATE SET
             text = excluded.text,
             embedding = excluded.embedding,
@@ -217,8 +228,9 @@ pub fn memory_upsert(
             doc_id = excluded.doc_id,
             source_uri = excluded.source_uri,
             location = excluded.location,
-            chunk_index = excluded.chunk_index",
-        params![id, text, embedding_json, tags, source, created_at, collection, doc_id, source_uri, location, chunk_index],
+            chunk_index = excluded.chunk_index,
+            source_path = excluded.source_path",
+        params![id, text, embedding_json, tags, source, created_at, collection, doc_id, source_uri, location, chunk_index, source_path],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -232,9 +244,9 @@ pub fn memory_all(app: tauri::AppHandle) -> Result<Vec<MemoryRow>, String> {
     let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
     let mut stmt = conn
         // COALESCE: pre-existing rows may have NULL last_used_at / use_count.
-        // The 5 knowledge-provenance columns are read as-is (Option) — they
+        // The 6 knowledge-provenance columns are read as-is (Option) — they
         // are genuinely NULL (not just missing) on every non-knowledge row.
-        .prepare("SELECT id, text, embedding, tags, source, created_at, COALESCE(last_used_at, created_at), COALESCE(use_count, 0), collection, doc_id, source_uri, location, chunk_index FROM memories ORDER BY created_at DESC")
+        .prepare("SELECT id, text, embedding, tags, source, created_at, COALESCE(last_used_at, created_at), COALESCE(use_count, 0), collection, doc_id, source_uri, location, chunk_index, source_path FROM memories ORDER BY created_at DESC")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| {
@@ -253,6 +265,7 @@ pub fn memory_all(app: tauri::AppHandle) -> Result<Vec<MemoryRow>, String> {
                 row.get::<_, Option<String>>(10)?,
                 row.get::<_, Option<String>>(11)?,
                 row.get::<_, Option<i64>>(12)?,
+                row.get::<_, Option<String>>(13)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -273,6 +286,7 @@ pub fn memory_all(app: tauri::AppHandle) -> Result<Vec<MemoryRow>, String> {
             source_uri,
             location,
             chunk_index,
+            source_path,
         ) = r.map_err(|e| e.to_string())?;
         let embedding: Vec<f32> = embedding_json
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -291,6 +305,7 @@ pub fn memory_all(app: tauri::AppHandle) -> Result<Vec<MemoryRow>, String> {
             source_uri,
             location,
             chunk_index,
+            source_path,
         });
     }
     Ok(out)
@@ -403,22 +418,27 @@ pub struct DocRow {
     pub doc_id: String,
     pub source_uri: String,
     pub chunk_count: i64,
+    // "Open source file" (KM4): the full original path, if this document was
+    // ingested after source_path started being captured — see MemoryRow's
+    // field of the same name. None for documents ingested before then.
+    pub source_path: Option<String>,
 }
 
 /// List every document ingested into a collection, most-recently-ingested
-/// first, with its chunk count. `MAX(source_uri)`/`MAX(created_at)` are used
-/// instead of a bare column reference because SQLite's GROUP BY only
-/// guarantees an arbitrary row's value for a non-aggregated, non-grouped
-/// column — every chunk of a given `doc_id` carries the same `source_uri` in
-/// practice (ingest.ts always sets it from the same file), so MAX() just
-/// makes that assumption SQL-legal rather than accidental.
+/// first, with its chunk count. `MAX(source_uri)`/`MAX(source_path)`/
+/// `MAX(created_at)` are used instead of a bare column reference because
+/// SQLite's GROUP BY only guarantees an arbitrary row's value for a
+/// non-aggregated, non-grouped column — every chunk of a given `doc_id`
+/// carries the same `source_uri`/`source_path` in practice (ingest.ts always
+/// sets them from the same file), so MAX() just makes that assumption
+/// SQL-legal rather than accidental.
 #[tauri::command]
 pub fn collection_docs(app: tauri::AppHandle, collection: String) -> Result<Vec<DocRow>, String> {
     let db = get_db(&app)?;
     let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT doc_id, MAX(source_uri), COUNT(*) FROM memories
+            "SELECT doc_id, MAX(source_uri), MAX(source_path), COUNT(*) FROM memories
              WHERE collection = ?1 AND doc_id IS NOT NULL
              GROUP BY doc_id
              ORDER BY MAX(created_at) DESC",
@@ -429,7 +449,8 @@ pub fn collection_docs(app: tauri::AppHandle, collection: String) -> Result<Vec<
             Ok(DocRow {
                 doc_id: row.get(0)?,
                 source_uri: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                chunk_count: row.get(2)?,
+                source_path: row.get::<_, Option<String>>(2)?,
+                chunk_count: row.get(3)?,
             })
         })
         .map_err(|e| e.to_string())?;

@@ -152,6 +152,12 @@ export async function ingestFiles(
           sourceUri,
           location: chunk.location,
           chunkIndex: chunk.chunkIndex,
+          // "Open source file" (KM4): the FULL original path, captured here —
+          // this is the only place in the ingest pipeline that still has it
+          // (sourceUri above is deliberately just the basename; see the
+          // docId contract doc comment above for why the basename is what
+          // gets baked into the citeable id/anchor instead).
+          sourcePath: filePath,
         });
         onProgress?.({ file, phase: "embedding", done: i + 1, total });
       }

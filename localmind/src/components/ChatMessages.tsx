@@ -1,8 +1,12 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { Brain, ChevronDown, ChevronRight } from "lucide-react";
+import type { MouseEvent } from "react";
+import { Brain, ChevronDown, ChevronRight, ExternalLink, X } from "lucide-react";
+import { toast } from "sonner";
 import { cn } from "./ui/utils";
 import { Markdown } from "./Markdown";
 import type { ChatMessage } from "../lib/ollama";
+import { useMemoryStore } from "../store/memory";
+import { openSourceFile } from "../lib/openFile";
 
 interface Props {
   messages: ChatMessage[];
@@ -156,6 +160,77 @@ function clamp(text: string): { text: string; clamped: boolean } {
   return { text: s.slice(0, MAX_DISPLAY_LEN), clamped: true };
 }
 
+// ─── Clickable citation popover ────────────────────────────────────────────
+//
+// citationsRehype.ts (a pure, store-free rehype plugin used by Markdown.tsx)
+// turns inline citations like `[test/Sp26_Lec18_post.pdf p.45]` into
+// `<span class="km-citation" data-cite-collection/-file/-location>` markup.
+// This file — which is main-app-only and free to use Zustand stores — is
+// where clicking one of those spans actually resolves to the word-for-word
+// passage it refers to, by looking up the matching "knowledge" memory row(s)
+// that the Knowledge Hub ingested it from.
+
+/** State for the popover shown when a citation span is clicked. `text` starts
+ *  as a "Loading…" placeholder (lookup is async — it may need to hydrate the
+ *  memory store first) and is replaced once resolution finishes. */
+interface CitePopoverState {
+  collection: string;
+  file: string;
+  location: string;
+  text: string;
+  // "Open source file" (KM4): the matched entry's full original path, if it
+  // has one (undefined for documents ingested before source_path existed —
+  // the popover's "Open file" button simply doesn't render in that case).
+  sourcePath?: string;
+}
+
+/**
+ * Resolve the exact passage a citation refers to by searching the memory
+ * store for "knowledge" rows matching `collection` + `sourceUri` (file).
+ * Location matching allows a citation's location to be a prefix of a chunk's
+ * stored location (e.g. citing "p.45" should also surface a chunk stored as
+ * "p.45 (cont.)" when a cited passage was split across adjacent chunks at
+ * ingestion time). Matches are sorted by `chunkIndex` and up to the first
+ * two are joined with a blank line, since a single cited location can still
+ * span two adjacent chunks.
+ *
+ * Ensures the store is hydrated first — `loadFromDb()` is idempotent and a
+ * no-op once `hydrated` is true, so this is safe to call on every click.
+ *
+ * Also returns the first match's `sourcePath` (KM4 "open source file") so
+ * the popover can offer an "Open file" button — undefined if the document
+ * was ingested before that column existed, or no match was found.
+ */
+async function resolveCitationSnippet(
+  collection: string,
+  file: string,
+  location: string,
+): Promise<{ text: string; sourcePath?: string }> {
+  const store = useMemoryStore.getState();
+  if (!store.hydrated) {
+    await store.loadFromDb();
+  }
+  const entries = useMemoryStore.getState().entries;
+  const matches = entries.filter(
+    (e) =>
+      e.source === "knowledge" &&
+      e.collection === collection &&
+      e.sourceUri === file &&
+      (e.location === location || (location !== "" && !!e.location?.startsWith(location)))
+  );
+  matches.sort((a, b) => (a.chunkIndex ?? 0) - (b.chunkIndex ?? 0));
+  if (matches.length === 0) {
+    return { text: "(Couldn't find this passage — the document may have been deleted or re-ingested.)" };
+  }
+  return {
+    text: matches
+      .slice(0, 2)
+      .map((m) => m.text)
+      .join("\n\n"),
+    sourcePath: matches[0].sourcePath,
+  };
+}
+
 const MessageRow = memo(function MessageRow({
   msg,
   index,
@@ -180,6 +255,11 @@ const MessageRow = memo(function MessageRow({
     () => (showFull ? sanitize(msg.content ?? "") : displayContent),
     [showFull, msg.content, displayContent],
   );
+  // Citation-popover state (clicking a `.km-citation` span in the assistant
+  // branch below sets this). Placed here — with showFull/displayContent/
+  // rendered — so the hook count stays constant across renders regardless of
+  // which early return (system/tool/user/assistant) this row takes.
+  const [citePopover, setCitePopover] = useState<CitePopoverState | null>(null);
 
   // Tool result system messages — render as collapsible chip
   if (msg.role === "system" && msg.content.startsWith("[Tool result:")) {
@@ -252,6 +332,43 @@ const MessageRow = memo(function MessageRow({
   // bouncing-dot indicator instead of an empty markdown block.
   const isThinking = isLast && isStreaming && !msg.content?.trim();
 
+  // Citation click handling: citationsRehype.ts (via Markdown.tsx) has
+  // already rewritten every `[collection/file location]` token into a
+  // `<span class="km-citation" data-cite-*>`. We don't need per-span
+  // listeners — a single delegated click handler on the wrapping div below
+  // catches bubbled clicks and checks whether they landed on (or inside) one
+  // of those spans via `.closest()`.
+  function handleCiteClick(e: MouseEvent<HTMLDivElement>) {
+    const el = (e.target as HTMLElement).closest<HTMLElement>(".km-citation");
+    if (!el) return;
+    const collection = el.dataset.citeCollection ?? "";
+    const file = el.dataset.citeFile ?? "";
+    const location = el.dataset.citeLocation ?? "";
+    // Show a synchronous "Loading…" placeholder immediately (lookup below is
+    // async — it may need to hydrate the memory store first), then replace
+    // it once resolution finishes. Guard against a second, newer click
+    // having already replaced the popover by the time this resolves.
+    setCitePopover({ collection, file, location, text: "Loading…" });
+    resolveCitationSnippet(collection, file, location).then(({ text, sourcePath }) => {
+      setCitePopover((prev) =>
+        prev && prev.collection === collection && prev.file === file && prev.location === location
+          ? { collection, file, location, text, sourcePath }
+          : prev,
+      );
+    });
+  }
+
+  // "Open source file" (KM4): hand the citation popover's resolved
+  // sourcePath to the opener plugin. Not a hook — plain async handler, safe
+  // to define per-render like handleCiteClick above.
+  async function handleOpenSourceFile(sourcePath: string) {
+    try {
+      await openSourceFile(sourcePath);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Could not open file");
+    }
+  }
+
   return (
     <div className="flex justify-start">
       <div className="max-w-2xl min-w-0 space-y-1">
@@ -276,7 +393,9 @@ const MessageRow = memo(function MessageRow({
             </div>
           ) : (
             <>
-              <Markdown>{rendered || " "}</Markdown>
+              <div onClick={handleCiteClick}>
+                <Markdown>{rendered || " "}</Markdown>
+              </div>
               {isLast && isStreaming && (
                 <span className="inline-block w-0.5 h-4 bg-foreground/40 animate-pulse ml-0.5 align-middle" />
               )}
@@ -293,6 +412,56 @@ const MessageRow = memo(function MessageRow({
           </button>
         )}
       </div>
+
+      {/* Citation popover: a centered, dismissible card showing the exact
+          passage a clicked `[collection/file location]` citation refers to.
+          Backdrop click or the ✕ button both dismiss it. */}
+      {citePopover && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+          onClick={() => setCitePopover(null)}
+        >
+          <div
+            className="w-full max-w-lg max-h-[70vh] flex flex-col bg-popover border border-border rounded-xl shadow-lg overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-3 px-4 py-2.5 border-b border-border shrink-0">
+              <span className="font-mono text-xs text-muted-foreground truncate">
+                {citePopover.collection}/{citePopover.file}
+                {citePopover.location ? ` ${citePopover.location}` : ""}
+              </span>
+              <div className="flex items-center gap-2 shrink-0">
+                {/* KM4: only shown when this citation resolved to a chunk that
+                    has a full source path on file (post-KM4 ingests) — older
+                    documents have no path to open, so the button is simply
+                    absent rather than shown disabled. */}
+                {citePopover.sourcePath && (
+                  <button
+                    type="button"
+                    onClick={() => void handleOpenSourceFile(citePopover.sourcePath!)}
+                    title="Open source file"
+                    className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    <ExternalLink className="size-3.5" />
+                    Open file
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setCitePopover(null)}
+                  aria-label="Close"
+                  className="text-muted-foreground hover:text-foreground"
+                >
+                  <X className="size-4" />
+                </button>
+              </div>
+            </div>
+            <div className="px-4 py-3 max-h-[50vh] overflow-y-auto whitespace-pre-wrap text-sm leading-relaxed text-foreground">
+              {citePopover.text}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 });

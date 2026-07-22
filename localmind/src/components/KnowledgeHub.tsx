@@ -10,13 +10,14 @@
  * purely presentational + local UI state (selected class, doc list, search).
  */
 import { useEffect, useState } from "react";
-import { Plus, Trash2, Upload, Search, FileText, Check, GraduationCap } from "lucide-react";
+import { Plus, Trash2, Upload, Search, FileText, Check, GraduationCap, ExternalLink } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { useKnowledgeStore, type DocRow } from "../store/knowledge";
 import { pickUploadFiles } from "../lib/knowledge/ingest";
 import { searchMemory } from "../lib/vectorMemory";
+import { openSourceFile } from "../lib/openFile";
 import type { MemoryEntry } from "../store/memory";
 import type { IngestProgress } from "../lib/knowledge/types";
 
@@ -155,6 +156,18 @@ export function KnowledgeHub() {
     }
   }
 
+  // "Open source file" (KM4): shared by the document list's "Open" button and
+  // the search result cards' "Open file" affordance. Not available for
+  // documents ingested before source_path was captured — callers only render
+  // the button when a sourcePath is present.
+  async function handleOpenSourceFile(sourcePath: string) {
+    try {
+      await openSourceFile(sourcePath);
+    } catch (err) {
+      toast.error((err as Error).message);
+    }
+  }
+
   async function copyAnchor(anchor: string) {
     try {
       const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
@@ -287,6 +300,15 @@ export function KnowledgeHub() {
                     <span className="text-[10px] text-muted-foreground shrink-0">
                       {d.chunkCount} chunk{d.chunkCount === 1 ? "" : "s"}
                     </span>
+                    {d.sourcePath && (
+                      <button
+                        onClick={() => void handleOpenSourceFile(d.sourcePath!)}
+                        className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-foreground shrink-0"
+                        title="Open file"
+                      >
+                        <ExternalLink className="size-3" />
+                      </button>
+                    )}
                     <button
                       onClick={() => void handleDeleteDoc(d.docId)}
                       className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive shrink-0"
@@ -332,14 +354,25 @@ export function KnowledgeHub() {
                   return (
                     <div key={r.entry.id ?? i} className="rounded-lg border bg-card px-3 py-2.5">
                       <div className="flex items-center justify-between gap-2 mb-1.5">
-                        <button
-                          onClick={() => void copyAnchor(anchor)}
-                          className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-muted text-foreground/80 hover:bg-accent hover:text-accent-foreground transition-colors flex items-center gap-1"
-                          title="Copy citation"
-                        >
-                          {copiedAnchor === anchor ? <Check className="size-3" /> : null}
-                          {copiedAnchor === anchor ? "Copied" : anchor}
-                        </button>
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <button
+                            onClick={() => void copyAnchor(anchor)}
+                            className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-muted text-foreground/80 hover:bg-accent hover:text-accent-foreground transition-colors flex items-center gap-1"
+                            title="Copy citation"
+                          >
+                            {copiedAnchor === anchor ? <Check className="size-3" /> : null}
+                            {copiedAnchor === anchor ? "Copied" : anchor}
+                          </button>
+                          {r.entry.sourcePath && (
+                            <button
+                              onClick={() => void handleOpenSourceFile(r.entry.sourcePath!)}
+                              className="text-muted-foreground hover:text-foreground transition-colors shrink-0"
+                              title="Open file"
+                            >
+                              <ExternalLink className="size-3" />
+                            </button>
+                          )}
+                        </div>
                         <span className="text-[10px] text-muted-foreground shrink-0">
                           {Math.round(r.score * 100)}% match
                         </span>

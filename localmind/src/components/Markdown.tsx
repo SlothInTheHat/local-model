@@ -7,6 +7,10 @@ import rehypeKatex from "rehype-katex";
 // dist/assets/ so math renders correctly fully offline — same reasoning as
 // the self-hosted fonts in src/main.tsx.
 import "katex/dist/katex.min.css";
+// Pure, store-free tree transform (text-node regex → <span class="km-citation">)
+// — safe to import here under the HARD CONSTRAINT below. See its header
+// comment for why detection and interactivity are split across two files.
+import { rehypeCitations } from "../lib/citationsRehype";
 
 // HARD CONSTRAINT: this component is shared by the main app AND the isolated
 // result widget webview (see the import-graph comments at the top of
@@ -32,7 +36,7 @@ interface MarkdownProps {
 
 export function Markdown({ children }: MarkdownProps) {
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
+    <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex, rehypeCitations]}>
       {children}
     </ReactMarkdown>
   );
