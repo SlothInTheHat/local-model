@@ -228,6 +228,7 @@ use db::{
     jobs_insert, jobs_list, jobs_due, jobs_update_next, jobs_cancel,
     session_insert, session_search,
     collection_upsert, collections_all, collection_delete, collection_docs,
+    kb_replace_graph, kb_get_graph, kb_delete_graph,
 };
 
 mod tray;
@@ -1244,6 +1245,9 @@ pub fn run() {
             collections_all,
             collection_delete,
             collection_docs,
+            kb_replace_graph,
+            kb_get_graph,
+            kb_delete_graph,
             jobs_insert,
             jobs_list,
             jobs_due,

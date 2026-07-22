@@ -95,6 +95,24 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             label TEXT,
             created_at INTEGER
         );
+
+        CREATE TABLE IF NOT EXISTS kb_nodes (
+            id TEXT PRIMARY KEY,
+            collection TEXT,
+            name TEXT,
+            chunk_refs TEXT,
+            created_at INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS kb_edges (
+            id TEXT PRIMARY KEY,
+            collection TEXT,
+            source_id TEXT,
+            target_id TEXT,
+            label TEXT,
+            chunk_refs TEXT,
+            created_at INTEGER
+        );
         ",
     )
     .map_err(|e| format!("Schema init failed: {e}"))?;
@@ -396,12 +414,17 @@ pub fn collections_all(app: tauri::AppHandle) -> Result<Vec<CollectionRow>, Stri
 
 /// Delete a collection AND every memory chunk filed under it — removing a
 /// class should remove its knowledge, not leave orphaned rows with a
-/// dangling `collection` id.
+/// dangling `collection` id. Also wipes any concept graph (KM4a: `kb_nodes`/
+/// `kb_edges`) built for the collection, for the same reason.
 #[tauri::command]
 pub fn collection_delete(app: tauri::AppHandle, id: String) -> Result<(), String> {
     let db = get_db(&app)?;
     let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
     conn.execute("DELETE FROM memories WHERE collection = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM kb_nodes WHERE collection = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM kb_edges WHERE collection = ?1", params![id])
         .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM collections WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
@@ -459,6 +482,167 @@ pub fn collection_docs(app: tauri::AppHandle, collection: String) -> Result<Vec<
         out.push(r.map_err(|e| e.to_string())?);
     }
     Ok(out)
+}
+
+// ─── Concept graph (KM4a: per-class knowledge graph) ────────────────────────
+//
+// A "concept graph" is extracted (src/lib/knowledge/graph.ts, entirely on the
+// TypeScript side — this module just stores/retrieves the result) from a
+// collection's knowledge chunks: `kb_nodes` are concepts, `kb_edges` are
+// labeled relations between two concepts, and both carry a `chunk_refs` JSON
+// array of `{docId, sourceUri, location}` so every node/edge stays citeable
+// back to the passage(s) it was extracted from. Ids are computed entirely on
+// the TS side (`${collection}::${normalizedName}` for nodes,
+// `${collection}::${srcId}->${tgtId}::${label}` for edges) — Rust treats them
+// as opaque strings, mirroring how `collections`/`memories` already keep id
+// construction in TypeScript. `chunk_refs` is stored pre-serialized (the TS
+// side does `JSON.stringify`) rather than re-parsed/re-validated here, same
+// tradeoff as `embedding` in `memories` (see module doc comment).
+//
+// A build always *replaces* the whole graph for a collection (`kb_replace_graph`)
+// rather than incrementally patching it — extraction re-reads every chunk each
+// time, so a stale partial graph is never left mixed with a fresh one.
+
+#[derive(serde::Deserialize)]
+pub struct KbNodeIn {
+    pub id: String,
+    pub name: String,
+    pub chunk_refs: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct KbEdgeIn {
+    pub id: String,
+    pub source_id: String,
+    pub target_id: String,
+    pub label: String,
+    pub chunk_refs: String,
+}
+
+#[derive(Serialize)]
+pub struct KbNodeRow {
+    pub id: String,
+    pub collection: String,
+    pub name: String,
+    pub chunk_refs: String,
+    pub created_at: i64,
+}
+
+#[derive(Serialize)]
+pub struct KbEdgeRow {
+    pub id: String,
+    pub collection: String,
+    pub source_id: String,
+    pub target_id: String,
+    pub label: String,
+    pub chunk_refs: String,
+    pub created_at: i64,
+}
+
+#[derive(Serialize)]
+pub struct KbGraph {
+    pub nodes: Vec<KbNodeRow>,
+    pub edges: Vec<KbEdgeRow>,
+}
+
+/// Replace the entire concept graph for `collection`: delete every existing
+/// `kb_nodes`/`kb_edges` row for it, then insert the given nodes/edges.
+/// Wrapped in a transaction so a mid-batch failure can't leave the graph
+/// half-deleted (old graph gone, new one only partially written).
+#[tauri::command]
+pub fn kb_replace_graph(
+    app: tauri::AppHandle,
+    collection: String,
+    nodes: Vec<KbNodeIn>,
+    edges: Vec<KbEdgeIn>,
+) -> Result<(), String> {
+    let db = get_db(&app)?;
+    let mut conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
+    let created_at = now_ms();
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM kb_nodes WHERE collection = ?1", params![collection])
+        .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM kb_edges WHERE collection = ?1", params![collection])
+        .map_err(|e| e.to_string())?;
+    for node in &nodes {
+        tx.execute(
+            "INSERT INTO kb_nodes (id, collection, name, chunk_refs, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![node.id, collection, node.name, node.chunk_refs, created_at],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    for edge in &edges {
+        tx.execute(
+            "INSERT INTO kb_edges (id, collection, source_id, target_id, label, chunk_refs, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![edge.id, collection, edge.source_id, edge.target_id, edge.label, edge.chunk_refs, created_at],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Fetch the stored concept graph for a collection (empty node/edge vecs if
+/// none has been built yet).
+#[tauri::command]
+pub fn kb_get_graph(app: tauri::AppHandle, collection: String) -> Result<KbGraph, String> {
+    let db = get_db(&app)?;
+    let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
+
+    let mut node_stmt = conn
+        .prepare("SELECT id, collection, name, chunk_refs, created_at FROM kb_nodes WHERE collection = ?1 ORDER BY name ASC")
+        .map_err(|e| e.to_string())?;
+    let node_rows = node_stmt
+        .query_map(params![collection], |row| {
+            Ok(KbNodeRow {
+                id: row.get(0)?,
+                collection: row.get(1)?,
+                name: row.get(2)?,
+                chunk_refs: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut nodes = Vec::new();
+    for r in node_rows {
+        nodes.push(r.map_err(|e| e.to_string())?);
+    }
+
+    let mut edge_stmt = conn
+        .prepare("SELECT id, collection, source_id, target_id, label, chunk_refs, created_at FROM kb_edges WHERE collection = ?1")
+        .map_err(|e| e.to_string())?;
+    let edge_rows = edge_stmt
+        .query_map(params![collection], |row| {
+            Ok(KbEdgeRow {
+                id: row.get(0)?,
+                collection: row.get(1)?,
+                source_id: row.get(2)?,
+                target_id: row.get(3)?,
+                label: row.get(4)?,
+                chunk_refs: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut edges = Vec::new();
+    for r in edge_rows {
+        edges.push(r.map_err(|e| e.to_string())?);
+    }
+
+    Ok(KbGraph { nodes, edges })
+}
+
+/// Delete the concept graph (both tables) for a collection. Not an error if
+/// none existed.
+#[tauri::command]
+pub fn kb_delete_graph(app: tauri::AppHandle, collection: String) -> Result<(), String> {
+    let db = get_db(&app)?;
+    let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
+    conn.execute("DELETE FROM kb_nodes WHERE collection = ?1", params![collection])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM kb_edges WHERE collection = ?1", params![collection])
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Delete a memory by id. Not an error if the id doesn't exist.

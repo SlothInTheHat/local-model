@@ -10,6 +10,7 @@
 import { create } from "zustand";
 import { ingestFiles } from "../lib/knowledge/ingest";
 import type { IngestProgress } from "../lib/knowledge/types";
+import { buildGraph as buildGraphImpl, getGraph as getGraphImpl, type GraphProgress, type KbNode, type KbEdge } from "../lib/knowledge/graph";
 
 export interface Collection {
   id: string;
@@ -74,6 +75,11 @@ interface KnowledgeState {
   ingesting: boolean;
   /** Most recent progress event from the in-flight ingest() call, if any. */
   progress: IngestProgress | null;
+  /** True while a buildGraph() extraction run is in flight (KM4a) — gates the
+   *  Hub's "Build concept map" button the same way `ingesting` gates Upload. */
+  buildingGraph: boolean;
+  /** Most recent progress event from the in-flight buildGraph() call, if any. */
+  graphProgress: GraphProgress | null;
 
   loadCollections: () => Promise<void>;
   createCollection: (label: string) => Promise<void>;
@@ -85,12 +91,25 @@ interface KnowledgeState {
     filePaths: string[],
     onProgress?: (p: IngestProgress) => void,
   ) => Promise<{ docId: string; chunks: number }[]>;
+  /** KM4a: (re)build a class's concept graph from its ingested chunks. See
+   *  src/lib/knowledge/graph.ts's module doc comment for the full pipeline
+   *  and cancellation contract; this is a thin store wrapper that tracks
+   *  `buildingGraph`/`graphProgress` around the call. */
+  buildGraph: (
+    collectionId: string,
+    onProgress?: (p: GraphProgress) => void,
+    signal?: AbortSignal,
+  ) => Promise<{ nodes: number; edges: number }>;
+  /** KM4a: fetch a class's stored concept graph (empty if none built yet). */
+  getGraph: (collectionId: string) => Promise<{ nodes: KbNode[]; edges: KbEdge[] }>;
 }
 
 export const useKnowledgeStore = create<KnowledgeState>()((set, get) => ({
   collections: [],
   ingesting: false,
   progress: null,
+  buildingGraph: false,
+  graphProgress: null,
 
   loadCollections: async () => {
     if (!isTauri()) return; // browser mode: no SQLite backend — leave empty
@@ -140,5 +159,21 @@ export const useKnowledgeStore = create<KnowledgeState>()((set, get) => ({
     } finally {
       set({ ingesting: false });
     }
+  },
+
+  buildGraph: async (collectionId, onProgress, signal) => {
+    set({ buildingGraph: true, graphProgress: null });
+    try {
+      return await buildGraphImpl(collectionId, (p) => {
+        set({ graphProgress: p });
+        onProgress?.(p);
+      }, signal);
+    } finally {
+      set({ buildingGraph: false });
+    }
+  },
+
+  getGraph: async (collectionId) => {
+    return getGraphImpl(collectionId);
   },
 }));

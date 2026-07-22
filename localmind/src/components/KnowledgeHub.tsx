@@ -9,8 +9,11 @@
  * and the ingest pipeline (src/lib/knowledge/ingest.ts) — this component is
  * purely presentational + local UI state (selected class, doc list, search).
  */
-import { useEffect, useState } from "react";
-import { Plus, Trash2, Upload, Search, FileText, Check, GraduationCap, ExternalLink } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import {
+  Plus, Trash2, Upload, Search, FileText, Check, GraduationCap, ExternalLink,
+  Network, ChevronDown, ChevronRight, X,
+} from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -20,6 +23,7 @@ import { searchMemory } from "../lib/vectorMemory";
 import { openSourceFile } from "../lib/openFile";
 import type { MemoryEntry } from "../store/memory";
 import type { IngestProgress } from "../lib/knowledge/types";
+import type { ChunkRef, GraphProgress, KbEdge, KbNode } from "../lib/knowledge/graph";
 
 type SearchResult = { entry: MemoryEntry; score: number; rawScore: number };
 
@@ -28,6 +32,31 @@ type SearchResult = { entry: MemoryEntry; score: number; rawScore: number };
 function citationAnchor(entry: MemoryEntry): string {
   const parts = [entry.collection, entry.sourceUri].filter(Boolean).join("/");
   return `[${[parts, entry.location].filter(Boolean).join(" ")}]`;
+}
+
+/** Same anchor shape as citationAnchor above, for a KM4a ChunkRef (which
+ *  doesn't carry its own `collection` field — every ChunkRef in a class's
+ *  concept graph belongs to that class by construction, so the collection id
+ *  is threaded in by the caller instead). */
+function chunkRefAnchor(ref: ChunkRef, collectionId: string): string {
+  const parts = [collectionId, ref.sourceUri].filter(Boolean).join("/");
+  return `[${[parts, ref.location].filter(Boolean).join(" ")}]`;
+}
+
+/** Human label for the live buildGraph() progress line (KM4a). */
+function graphProgressLabel(p: GraphProgress): string {
+  switch (p.phase) {
+    case "reading":
+      return "Reading chunks…";
+    case "extracting":
+      return `Extracting concepts — ${p.done}/${p.total}`;
+    case "saving":
+      return "Saving concept map…";
+    case "done":
+      return "Concept map ready";
+    case "error":
+      return p.error ?? "Failed";
+  }
 }
 
 function progressLabel(p: IngestProgress): string {
@@ -39,8 +68,11 @@ function progressLabel(p: IngestProgress): string {
 }
 
 export function KnowledgeHub() {
-  const { collections, ingesting, progress, loadCollections, createCollection, deleteCollection, listDocs, deleteDoc, ingest } =
-    useKnowledgeStore();
+  const {
+    collections, ingesting, progress, buildingGraph, graphProgress,
+    loadCollections, createCollection, deleteCollection, listDocs, deleteDoc, ingest,
+    buildGraph, getGraph,
+  } = useKnowledgeStore();
 
   useEffect(() => {
     void loadCollections();
@@ -59,7 +91,31 @@ export function KnowledgeHub() {
   const [searching, setSearching] = useState(false);
   const [copiedAnchor, setCopiedAnchor] = useState<string | null>(null);
 
+  // ─── KM4a: concept map (right-pane "Concept Map" tab) ───────────────────
+  const [rightView, setRightView] = useState<"search" | "concepts">("search");
+  const [kbNodes, setKbNodes] = useState<KbNode[]>([]);
+  const [kbEdges, setKbEdges] = useState<KbEdge[]>([]);
+  const [kbLoading, setKbLoading] = useState(false);
+  const [expandedNodeId, setExpandedNodeId] = useState<string | null>(null);
+  // Tracks the in-flight buildGraph() call's AbortController so the Cancel
+  // button has something to abort — see graph.ts's module doc comment for
+  // what "cancel" actually does (stops future batches, still saves partial work).
+  const buildAbortRef = useRef<AbortController | null>(null);
+
   const selected = collections.find((c) => c.id === selectedId) ?? null;
+
+  async function refreshGraph(id: string) {
+    setKbLoading(true);
+    try {
+      const { nodes, edges } = await getGraph(id);
+      setKbNodes(nodes);
+      setKbEdges(edges);
+    } catch (err) {
+      toast.error(`Failed to load concept map: ${(err as Error).message}`);
+    } finally {
+      setKbLoading(false);
+    }
+  }
 
   async function refreshDocs(id: string) {
     setDocsLoading(true);
@@ -74,13 +130,22 @@ export function KnowledgeHub() {
   }
 
   useEffect(() => {
+    // Switching classes mid-build would otherwise keep extracting into the
+    // previously-selected class's graph — abort any in-flight build first.
+    buildAbortRef.current?.abort();
+    buildAbortRef.current = null;
     if (selectedId) {
       void refreshDocs(selectedId);
+      void refreshGraph(selectedId);
       setResults(null);
       setQuery("");
     } else {
       setDocs([]);
+      setKbNodes([]);
+      setKbEdges([]);
     }
+    setRightView("search");
+    setExpandedNodeId(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
 
@@ -166,6 +231,29 @@ export function KnowledgeHub() {
     } catch (err) {
       toast.error((err as Error).message);
     }
+  }
+
+  async function handleBuildGraph() {
+    if (!selectedId) return;
+    const controller = new AbortController();
+    buildAbortRef.current = controller;
+    try {
+      const result = await buildGraph(selectedId, () => {}, controller.signal);
+      await refreshGraph(selectedId);
+      if (controller.signal.aborted) {
+        toast(`Build cancelled — kept ${result.nodes} concepts, ${result.edges} relations extracted so far`);
+      } else {
+        toast.success(`Concept map built — ${result.nodes} concepts, ${result.edges} relations`);
+      }
+    } catch (err) {
+      toast.error(`Could not build concept map: ${(err as Error).message}`);
+    } finally {
+      buildAbortRef.current = null;
+    }
+  }
+
+  function handleCancelBuild() {
+    buildAbortRef.current?.abort();
   }
 
   async function copyAnchor(anchor: string) {
@@ -322,68 +410,255 @@ export function KnowledgeHub() {
             )}
           </div>
 
-          {/* Search */}
-          <div className="border-b px-4 py-2 flex gap-2 items-center shrink-0">
-            <Search className="size-3.5 text-muted-foreground shrink-0" />
-            <Input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") void handleSearch(); }}
-              placeholder={`Search ${selected.label}'s notes… (Enter)`}
-              className="text-xs h-7 flex-1 border-0 focus-visible:ring-0 bg-transparent"
-            />
-            <Button size="sm" className="h-7 text-xs" onClick={() => void handleSearch()} disabled={searching || !query.trim()}>
-              {searching ? "Searching…" : "Search"}
-            </Button>
+          {/* Passages / Concept Map tabs (KM4a) */}
+          <div className="border-b px-4 pt-2 flex items-center gap-1 shrink-0">
+            <button
+              onClick={() => setRightView("search")}
+              className={`px-2.5 py-1.5 rounded-t-md text-xs font-medium flex items-center gap-1.5 transition-colors ${
+                rightView === "search"
+                  ? "bg-card text-foreground border border-b-card"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <Search className="size-3.5" /> Passages
+            </button>
+            <button
+              onClick={() => setRightView("concepts")}
+              className={`px-2.5 py-1.5 rounded-t-md text-xs font-medium flex items-center gap-1.5 transition-colors ${
+                rightView === "concepts"
+                  ? "bg-card text-foreground border border-b-card"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <Network className="size-3.5" /> Concept Map
+              {kbNodes.length > 0 && (
+                <span className="text-[10px] text-muted-foreground">({kbNodes.length})</span>
+              )}
+            </button>
           </div>
 
-          {/* Results */}
-          <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3">
-            {results === null ? (
-              <p className="text-xs text-muted-foreground text-center py-8">
-                Search this class's notes to see cited passages here.
-              </p>
-            ) : results.length === 0 ? (
-              <p className="text-xs text-muted-foreground text-center py-8">
-                No matching passages in this class's notes.
-              </p>
-            ) : (
-              <div className="space-y-2">
-                {results.map((r, i) => {
-                  const anchor = citationAnchor(r.entry);
-                  return (
-                    <div key={r.entry.id ?? i} className="rounded-lg border bg-card px-3 py-2.5">
-                      <div className="flex items-center justify-between gap-2 mb-1.5">
-                        <div className="flex items-center gap-1.5 min-w-0">
-                          <button
-                            onClick={() => void copyAnchor(anchor)}
-                            className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-muted text-foreground/80 hover:bg-accent hover:text-accent-foreground transition-colors flex items-center gap-1"
-                            title="Copy citation"
-                          >
-                            {copiedAnchor === anchor ? <Check className="size-3" /> : null}
-                            {copiedAnchor === anchor ? "Copied" : anchor}
-                          </button>
-                          {r.entry.sourcePath && (
-                            <button
-                              onClick={() => void handleOpenSourceFile(r.entry.sourcePath!)}
-                              className="text-muted-foreground hover:text-foreground transition-colors shrink-0"
-                              title="Open file"
-                            >
-                              <ExternalLink className="size-3" />
-                            </button>
-                          )}
-                        </div>
-                        <span className="text-[10px] text-muted-foreground shrink-0">
-                          {Math.round(r.score * 100)}% match
-                        </span>
-                      </div>
-                      <p className="text-sm text-foreground leading-snug whitespace-pre-wrap">{r.entry.text}</p>
-                    </div>
-                  );
-                })}
+          {rightView === "search" ? (
+            <>
+              {/* Search */}
+              <div className="border-b px-4 py-2 flex gap-2 items-center shrink-0">
+                <Search className="size-3.5 text-muted-foreground shrink-0" />
+                <Input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") void handleSearch(); }}
+                  placeholder={`Search ${selected.label}'s notes… (Enter)`}
+                  className="text-xs h-7 flex-1 border-0 focus-visible:ring-0 bg-transparent"
+                />
+                <Button size="sm" className="h-7 text-xs" onClick={() => void handleSearch()} disabled={searching || !query.trim()}>
+                  {searching ? "Searching…" : "Search"}
+                </Button>
               </div>
-            )}
-          </div>
+
+              {/* Results */}
+              <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3">
+                {results === null ? (
+                  <p className="text-xs text-muted-foreground text-center py-8">
+                    Search this class's notes to see cited passages here.
+                  </p>
+                ) : results.length === 0 ? (
+                  <p className="text-xs text-muted-foreground text-center py-8">
+                    No matching passages in this class's notes.
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {results.map((r, i) => {
+                      const anchor = citationAnchor(r.entry);
+                      return (
+                        <div key={r.entry.id ?? i} className="rounded-lg border bg-card px-3 py-2.5">
+                          <div className="flex items-center justify-between gap-2 mb-1.5">
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <button
+                                onClick={() => void copyAnchor(anchor)}
+                                className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-muted text-foreground/80 hover:bg-accent hover:text-accent-foreground transition-colors flex items-center gap-1"
+                                title="Copy citation"
+                              >
+                                {copiedAnchor === anchor ? <Check className="size-3" /> : null}
+                                {copiedAnchor === anchor ? "Copied" : anchor}
+                              </button>
+                              {r.entry.sourcePath && (
+                                <button
+                                  onClick={() => void handleOpenSourceFile(r.entry.sourcePath!)}
+                                  className="text-muted-foreground hover:text-foreground transition-colors shrink-0"
+                                  title="Open file"
+                                >
+                                  <ExternalLink className="size-3" />
+                                </button>
+                              )}
+                            </div>
+                            <span className="text-[10px] text-muted-foreground shrink-0">
+                              {Math.round(r.score * 100)}% match
+                            </span>
+                          </div>
+                          <p className="text-sm text-foreground leading-snug whitespace-pre-wrap">{r.entry.text}</p>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <ConceptMapPanel
+              collectionId={selected.id}
+              nodes={kbNodes}
+              edges={kbEdges}
+              loading={kbLoading}
+              building={buildingGraph}
+              progress={graphProgress}
+              expandedNodeId={expandedNodeId}
+              onToggleExpand={(id) => setExpandedNodeId((cur) => (cur === id ? null : id))}
+              onBuild={() => void handleBuildGraph()}
+              onCancel={handleCancelBuild}
+            />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── KM4a: Concept Map panel ─────────────────────────────────────────────────
+//
+// A cited concept LIST, not a visual graph — the interactive node/edge
+// visualization is a separate later task (KM4b). This proves extraction
+// works end-to-end and is citeable: each concept shows how many relations it
+// has and a few of its source citations, and expanding it shows its full
+// relation list plus every source chunk it was extracted from.
+
+interface ConceptMapPanelProps {
+  collectionId: string;
+  nodes: KbNode[];
+  edges: KbEdge[];
+  loading: boolean;
+  building: boolean;
+  progress: GraphProgress | null;
+  expandedNodeId: string | null;
+  onToggleExpand: (nodeId: string) => void;
+  onBuild: () => void;
+  onCancel: () => void;
+}
+
+/** Max source citation badges shown on a collapsed node row before "+N more". */
+const COLLAPSED_CITATION_LIMIT = 3;
+
+function ConceptMapPanel({
+  collectionId, nodes, edges, loading, building, progress,
+  expandedNodeId, onToggleExpand, onBuild, onCancel,
+}: ConceptMapPanelProps) {
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
+
+  return (
+    <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3">
+      <div className="flex items-center gap-2 flex-wrap mb-1.5">
+        <Button size="sm" className="h-7 text-xs gap-1" onClick={onBuild} disabled={building}>
+          <Network className="size-3.5" />
+          {building ? "Building…" : nodes.length > 0 ? "Rebuild concept map" : "Build concept map"}
+        </Button>
+        {building && (
+          <Button size="sm" variant="ghost" className="h-7 text-xs gap-1" onClick={onCancel}>
+            <X className="size-3.5" /> Cancel
+          </Button>
+        )}
+        {building && progress && (
+          <span className="text-xs text-muted-foreground truncate">{graphProgressLabel(progress)}</span>
+        )}
+      </div>
+      <p className="text-[11px] text-muted-foreground mb-3">
+        Reads every document in this class with the digest model to find concepts and the relationships between
+        them — can take a while for large classes.
+      </p>
+
+      {loading ? (
+        <p className="text-xs text-muted-foreground text-center py-8">Loading concept map…</p>
+      ) : nodes.length === 0 ? (
+        <p className="text-xs text-muted-foreground text-center py-8">
+          No concept map yet — build one to see cited concepts across this class's notes.
+        </p>
+      ) : (
+        <div className="space-y-1.5">
+          {nodes.map((node) => {
+            const outgoing = edges.filter((e) => e.sourceId === node.id);
+            const incoming = edges.filter((e) => e.targetId === node.id);
+            const connectionCount = outgoing.length + incoming.length;
+            const expanded = expandedNodeId === node.id;
+
+            return (
+              <div key={node.id} className="rounded-lg border bg-card">
+                <button
+                  onClick={() => onToggleExpand(node.id)}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-left"
+                >
+                  {expanded ? (
+                    <ChevronDown className="size-3.5 text-muted-foreground shrink-0" />
+                  ) : (
+                    <ChevronRight className="size-3.5 text-muted-foreground shrink-0" />
+                  )}
+                  <span className="text-sm font-medium flex-1 truncate">{node.name}</span>
+                  <span className="text-[10px] text-muted-foreground shrink-0">
+                    {connectionCount} connection{connectionCount === 1 ? "" : "s"}
+                  </span>
+                </button>
+
+                {!expanded && node.chunkRefs.length > 0 && (
+                  <div className="px-3 pb-2 flex flex-wrap gap-1">
+                    {node.chunkRefs.slice(0, COLLAPSED_CITATION_LIMIT).map((ref, i) => (
+                      <span key={i} className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-muted text-foreground/70">
+                        {chunkRefAnchor(ref, collectionId)}
+                      </span>
+                    ))}
+                    {node.chunkRefs.length > COLLAPSED_CITATION_LIMIT && (
+                      <span className="text-[10px] text-muted-foreground">
+                        +{node.chunkRefs.length - COLLAPSED_CITATION_LIMIT} more
+                      </span>
+                    )}
+                  </div>
+                )}
+
+                {expanded && (
+                  <div className="px-3 pb-2.5 space-y-2 border-t pt-2">
+                    {connectionCount === 0 ? (
+                      <p className="text-xs text-muted-foreground">No relations found for this concept.</p>
+                    ) : (
+                      <div className="space-y-1">
+                        {outgoing.map((e) => (
+                          <p key={e.id} className="text-xs text-foreground/80">
+                            — {e.label} → {nodeById.get(e.targetId)?.name ?? e.targetId}
+                          </p>
+                        ))}
+                        {incoming.map((e) => (
+                          <p key={e.id} className="text-xs text-foreground/80">
+                            ← {e.label} — {nodeById.get(e.sourceId)?.name ?? e.sourceId}
+                          </p>
+                        ))}
+                      </div>
+                    )}
+                    {node.chunkRefs.length > 0 && (
+                      <div>
+                        <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">
+                          Sources
+                        </p>
+                        <div className="flex flex-wrap gap-1">
+                          {node.chunkRefs.map((ref, i) => (
+                            <span
+                              key={i}
+                              className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-muted text-foreground/70"
+                            >
+                              {chunkRefAnchor(ref, collectionId)}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
