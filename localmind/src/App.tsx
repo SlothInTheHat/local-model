@@ -64,8 +64,8 @@ const SubagentManager = lazy(() =>
 const DeepResearch = lazy(() =>
   import("./components/DeepResearch").then((m) => ({ default: m.DeepResearch }))
 );
-const StudyMode = lazy(() =>
-  import("./components/StudyMode").then((m) => ({ default: m.StudyMode }))
+const KnowledgeHub = lazy(() =>
+  import("./components/KnowledgeHub").then((m) => ({ default: m.KnowledgeHub }))
 );
 const ImageEditor = lazy(() =>
   import("./components/ImageEditor").then((m) => ({ default: m.ImageEditor }))
@@ -1563,7 +1563,7 @@ export default function App() {
                     </Suspense>
                   ) : view === "study" ? (
                     <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
-                      <StudyMode selectedModel={selectedModel} />
+                      <KnowledgeHub />
                     </Suspense>
                   ) : view === "image" ? (
                     <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading editor…</div>}>

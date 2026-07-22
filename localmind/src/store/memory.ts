@@ -5,12 +5,26 @@ export interface MemoryEntry {
   text: string;
   embedding: number[];
   tags: string[];
-  source: "user" | "agent" | "session-digest";
+  // "knowledge" (KM0): a citeable chunk ingested from a document into a
+  // collection (class), rather than a fact distilled from a chat session.
+  source: "user" | "agent" | "session-digest" | "knowledge";
   createdAt: number;
   /** Optional (absent on legacy/browser-mode data): last retrieval time, ms epoch. */
   lastUsedAt?: number;
   /** Optional (absent on legacy/browser-mode data): retrieval count. */
   useCount?: number;
+  // ─── KM0: knowledge-chunk provenance ────────────────────────────────────
+  // Only populated for source === "knowledge" rows; undefined otherwise.
+  /** Class/collection id this chunk belongs to, e.g. "CS101". */
+  collection?: string;
+  /** Id of the source document this chunk was split from. */
+  docId?: string;
+  /** File name/path the chunk was ingested from. */
+  sourceUri?: string;
+  /** Human citation anchor, e.g. "p.12" or "#Eigenvalues L45". */
+  location?: string;
+  /** Position of this chunk within its document. */
+  chunkIndex?: number;
 }
 
 interface MemoryState {
@@ -62,6 +76,12 @@ interface DbMemoryRow {
   // still deserializes cleanly.
   last_used_at?: number;
   use_count?: number;
+  // KM0: knowledge-chunk provenance — NULL/absent on non-knowledge rows.
+  collection?: string;
+  doc_id?: string;
+  source_uri?: string;
+  location?: string;
+  chunk_index?: number;
 }
 
 function tagsToDb(tags: string[]): string {
@@ -78,10 +98,22 @@ function rowToEntry(row: DbMemoryRow): MemoryEntry {
     text: row.text,
     embedding: Array.isArray(row.embedding) ? row.embedding : [],
     tags: tagsFromDb(row.tags),
-    source: row.source === "agent" ? "agent" : row.source === "session-digest" ? "session-digest" : "user",
+    source:
+      row.source === "agent"
+        ? "agent"
+        : row.source === "session-digest"
+        ? "session-digest"
+        : row.source === "knowledge"
+        ? "knowledge"
+        : "user",
     createdAt: row.created_at,
     lastUsedAt: row.last_used_at ?? row.created_at,
     useCount: row.use_count ?? 0,
+    collection: row.collection ?? undefined,
+    docId: row.doc_id ?? undefined,
+    sourceUri: row.source_uri ?? undefined,
+    location: row.location ?? undefined,
+    chunkIndex: row.chunk_index ?? undefined,
   };
 }
 
@@ -157,6 +189,14 @@ export const useMemoryStore = create<MemoryState>()((set, get) => ({
         tags: tagsToDb(entry.tags),
         source: entry.source,
         createdAt: entry.createdAt,
+        // KM0 knowledge-chunk provenance — undefined for plain memories,
+        // Tauri maps that to None on the Rust side (memory_upsert's new
+        // optional params).
+        collection: entry.collection,
+        docId: entry.docId,
+        sourceUri: entry.sourceUri,
+        location: entry.location,
+        chunkIndex: entry.chunkIndex,
       }).catch((e) => console.error("memory_upsert failed", e));
     }
     // Browser mode: no backend — the entry just lives in memory for this

@@ -21,7 +21,7 @@ const MODE_LABEL: Record<AppView, string> = {
   terminal: "Terminal",
   agents: "Agents",
   research: "Research",
-  study: "Study",
+  study: "Knowledge",
   settings: "Settings",
   image: "Image",
   skills: "Skills",

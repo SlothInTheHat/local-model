@@ -75,7 +75,7 @@ export function ChatSidebar({ view, onViewChange, selectedModel, onModelChange, 
 
   const moreItems: NavItem[] = [
     { id: "compare",    icon: <Columns2 className="size-4" />,       label: "Compare Models" },
-    { id: "study",      icon: <BookOpen className="size-4" />,        label: "Study Mode" },
+    { id: "study",      icon: <BookOpen className="size-4" />,        label: "Knowledge Hub" },
     { id: "docs",       icon: <FileText className="size-4" />,        label: "Doc Editor" },
     { id: "image",      icon: <ImageIcon className="size-4" />,       label: "Image Editor" },
     { id: "skills",     icon: <BookMarked className="size-4" />,      label: "Skill Registry" },

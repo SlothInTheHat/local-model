@@ -63,6 +63,8 @@ const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   spawn_subagent: true,
   propose_feature: true,
   search_past_sessions: true,
+  search_knowledge: true,
+  list_collections: true,
   read_clipboard: true,
   set_clipboard: true,
   open_application: true,

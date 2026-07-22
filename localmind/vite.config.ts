@@ -41,6 +41,10 @@ export default defineConfig(async () => ({
           monaco: ["@monaco-editor/react", "monaco-editor"],
           tiptap: ["@tiptap/react", "@tiptap/starter-kit", "@tiptap/extension-placeholder", "@tiptap/suggestion"],
           docx: ["docx"],
+          // KM1: pdf.js is only touched by the Knowledge Hub's PDF ingestion
+          // path (src/lib/knowledge/pdf.ts) — split into its own chunk so it
+          // doesn't bloat the main bundle for users who never ingest a PDF.
+          pdfjs: ["pdfjs-dist"],
         },
       },
     },

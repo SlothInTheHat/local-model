@@ -89,9 +89,41 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             status TEXT,
             created_at INTEGER
         );
+
+        CREATE TABLE IF NOT EXISTS collections (
+            id TEXT PRIMARY KEY,
+            label TEXT,
+            created_at INTEGER
+        );
         ",
     )
     .map_err(|e| format!("Schema init failed: {e}"))?;
+
+    // ─── KM0: citation/collection columns on `memories` ────────────────────
+    //
+    // The knowledge-base feature stores document chunks as ordinary memory
+    // rows (source = "knowledge"), scoped to a collection (a class) and
+    // carrying enough provenance to CITE the passage. Rather than a parallel
+    // table, we widen `memories` — knowledge IS memory, just with more columns.
+    // These are additive nullable columns, so pre-existing rows read back as
+    // NULL (see memory_all's per-column Option handling). SQLite has no
+    // "ADD COLUMN IF NOT EXISTS", so each ALTER is run individually and a
+    // "duplicate column name" error (the column already exists from a prior
+    // launch) is swallowed — any other error is a real failure and propagates.
+    for stmt in [
+        "ALTER TABLE memories ADD COLUMN collection TEXT",
+        "ALTER TABLE memories ADD COLUMN doc_id TEXT",
+        "ALTER TABLE memories ADD COLUMN source_uri TEXT",
+        "ALTER TABLE memories ADD COLUMN location TEXT",
+        "ALTER TABLE memories ADD COLUMN chunk_index INTEGER",
+    ] {
+        if let Err(e) = conn.execute(stmt, []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(format!("memories column migration failed ({stmt}): {msg}"));
+            }
+        }
+    }
 
     // FTS5 virtual table for full-text session search (wired up by WP4.3).
     // rusqlite's `bundled` feature compiles FTS5 into the bundled SQLite by
@@ -136,10 +168,24 @@ pub struct MemoryRow {
     pub created_at: i64,
     pub last_used_at: i64,
     pub use_count: i64,
+    // ─── KM0: knowledge-chunk provenance (see init_schema's ALTER TABLE block
+    // for why these live on `memories` instead of a parallel table). All
+    // nullable/optional: plain memories (user/agent/session-digest) never
+    // populate them, and pre-existing rows read back as None.
+    pub collection: Option<String>,
+    pub doc_id: Option<String>,
+    pub source_uri: Option<String>,
+    pub location: Option<String>,
+    pub chunk_index: Option<i64>,
 }
 
 /// Insert or update (by id) a memory entry. Embeddings are JSON-encoded —
 /// see the module doc comment for why.
+///
+/// The five knowledge-provenance params are optional so pre-existing callers
+/// (plain user/agent/session-digest memories) that only ever pass the
+/// original 6 args keep working unchanged — Tauri maps missing/omitted args
+/// to `None` on the Rust side.
 #[tauri::command]
 pub fn memory_upsert(
     app: tauri::AppHandle,
@@ -149,20 +195,30 @@ pub fn memory_upsert(
     tags: String,
     source: String,
     created_at: i64,
+    collection: Option<String>,
+    doc_id: Option<String>,
+    source_uri: Option<String>,
+    location: Option<String>,
+    chunk_index: Option<i64>,
 ) -> Result<(), String> {
     let db = get_db(&app)?;
     let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
     let embedding_json = serde_json::to_string(&embedding).map_err(|e| e.to_string())?;
     conn.execute(
-        "INSERT INTO memories (id, text, embedding, tags, source, created_at, last_used_at, use_count)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0)
+        "INSERT INTO memories (id, text, embedding, tags, source, created_at, last_used_at, use_count, collection, doc_id, source_uri, location, chunk_index)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(id) DO UPDATE SET
             text = excluded.text,
             embedding = excluded.embedding,
             tags = excluded.tags,
             source = excluded.source,
-            created_at = excluded.created_at",
-        params![id, text, embedding_json, tags, source, created_at],
+            created_at = excluded.created_at,
+            collection = excluded.collection,
+            doc_id = excluded.doc_id,
+            source_uri = excluded.source_uri,
+            location = excluded.location,
+            chunk_index = excluded.chunk_index",
+        params![id, text, embedding_json, tags, source, created_at, collection, doc_id, source_uri, location, chunk_index],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -176,7 +232,9 @@ pub fn memory_all(app: tauri::AppHandle) -> Result<Vec<MemoryRow>, String> {
     let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
     let mut stmt = conn
         // COALESCE: pre-existing rows may have NULL last_used_at / use_count.
-        .prepare("SELECT id, text, embedding, tags, source, created_at, COALESCE(last_used_at, created_at), COALESCE(use_count, 0) FROM memories ORDER BY created_at DESC")
+        // The 5 knowledge-provenance columns are read as-is (Option) — they
+        // are genuinely NULL (not just missing) on every non-knowledge row.
+        .prepare("SELECT id, text, embedding, tags, source, created_at, COALESCE(last_used_at, created_at), COALESCE(use_count, 0), collection, doc_id, source_uri, location, chunk_index FROM memories ORDER BY created_at DESC")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| {
@@ -190,14 +248,32 @@ pub fn memory_all(app: tauri::AppHandle) -> Result<Vec<MemoryRow>, String> {
                 row.get::<_, i64>(5)?,
                 row.get::<_, i64>(6)?,
                 row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<i64>>(12)?,
             ))
         })
         .map_err(|e| e.to_string())?;
 
     let mut out = Vec::new();
     for r in rows {
-        let (id, text, embedding_json, tags, source, created_at, last_used_at, use_count) =
-            r.map_err(|e| e.to_string())?;
+        let (
+            id,
+            text,
+            embedding_json,
+            tags,
+            source,
+            created_at,
+            last_used_at,
+            use_count,
+            collection,
+            doc_id,
+            source_uri,
+            location,
+            chunk_index,
+        ) = r.map_err(|e| e.to_string())?;
         let embedding: Vec<f32> = embedding_json
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
@@ -210,7 +286,156 @@ pub fn memory_all(app: tauri::AppHandle) -> Result<Vec<MemoryRow>, String> {
             created_at,
             last_used_at,
             use_count,
+            collection,
+            doc_id,
+            source_uri,
+            location,
+            chunk_index,
         });
+    }
+    Ok(out)
+}
+
+/// Delete every memory row belonging to a given document (KM1 re-ingestion:
+/// re-indexing a file should first wipe its old chunks so stale/renumbered
+/// passages don't linger alongside the fresh ones). Not an error if no rows
+/// match `doc_id`.
+#[tauri::command]
+pub fn memory_delete_by_doc(app: tauri::AppHandle, doc_id: String) -> Result<(), String> {
+    let db = get_db(&app)?;
+    let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
+    conn.execute("DELETE FROM memories WHERE doc_id = ?1", params![doc_id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ─── Collections (KM0: lightweight class registry) ─────────────────────────
+//
+// A `collections` row is just a display label for a class id (e.g. "CS101" ->
+// "Intro to CS"), so the UI can list classes without scanning every memory
+// row for distinct `collection` values. Knowledge chunks reference a
+// collection by id (the `memories.collection` column) but there is no
+// foreign-key enforcement — SQLite FKs are off by default and it's not worth
+// the ceremony at this scale; `collection_delete` cleans up both sides.
+
+#[derive(Serialize)]
+pub struct CollectionRow {
+    pub id: String,
+    pub label: String,
+    pub created_at: i64,
+    pub doc_count: i64,
+}
+
+/// Insert or update (by id) a collection's label.
+#[tauri::command]
+pub fn collection_upsert(
+    app: tauri::AppHandle,
+    id: String,
+    label: String,
+    created_at: i64,
+) -> Result<(), String> {
+    let db = get_db(&app)?;
+    let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
+    conn.execute(
+        "INSERT INTO collections (id, label, created_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(id) DO UPDATE SET label = excluded.label",
+        params![id, label, created_at],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// List every collection, most recently created first, with a live
+/// doc_count (distinct `doc_id`s currently in `memories` for that
+/// collection) so the UI doesn't need a separate query per class.
+#[tauri::command]
+pub fn collections_all(app: tauri::AppHandle) -> Result<Vec<CollectionRow>, String> {
+    let db = get_db(&app)?;
+    let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.id, c.label, c.created_at,
+                    (SELECT COUNT(DISTINCT m.doc_id) FROM memories m
+                     WHERE m.collection = c.id AND m.doc_id IS NOT NULL) AS doc_count
+             FROM collections c
+             ORDER BY c.created_at DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(CollectionRow {
+                id: row.get(0)?,
+                label: row.get(1)?,
+                created_at: row.get(2)?,
+                doc_count: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+/// Delete a collection AND every memory chunk filed under it — removing a
+/// class should remove its knowledge, not leave orphaned rows with a
+/// dangling `collection` id.
+#[tauri::command]
+pub fn collection_delete(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let db = get_db(&app)?;
+    let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
+    conn.execute("DELETE FROM memories WHERE collection = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM collections WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ─── KM1: per-collection document list ──────────────────────────────────────
+
+/// One ingested document's summary within a collection — feeds KM2's
+/// per-class document list (which files are in this class, how many chunks
+/// each contributed) without the frontend needing to scan every memory row.
+#[derive(Serialize)]
+pub struct DocRow {
+    pub doc_id: String,
+    pub source_uri: String,
+    pub chunk_count: i64,
+}
+
+/// List every document ingested into a collection, most-recently-ingested
+/// first, with its chunk count. `MAX(source_uri)`/`MAX(created_at)` are used
+/// instead of a bare column reference because SQLite's GROUP BY only
+/// guarantees an arbitrary row's value for a non-aggregated, non-grouped
+/// column — every chunk of a given `doc_id` carries the same `source_uri` in
+/// practice (ingest.ts always sets it from the same file), so MAX() just
+/// makes that assumption SQL-legal rather than accidental.
+#[tauri::command]
+pub fn collection_docs(app: tauri::AppHandle, collection: String) -> Result<Vec<DocRow>, String> {
+    let db = get_db(&app)?;
+    let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT doc_id, MAX(source_uri), COUNT(*) FROM memories
+             WHERE collection = ?1 AND doc_id IS NOT NULL
+             GROUP BY doc_id
+             ORDER BY MAX(created_at) DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![collection], |row| {
+            Ok(DocRow {
+                doc_id: row.get(0)?,
+                source_uri: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                chunk_count: row.get(2)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| e.to_string())?);
     }
     Ok(out)
 }

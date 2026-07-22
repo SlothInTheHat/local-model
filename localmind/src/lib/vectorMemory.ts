@@ -45,7 +45,8 @@ async function ensureHydrated(): Promise<void> {
 export async function addMemory(
   text: string,
   tags: string[] = [],
-  source: "user" | "agent" | "session-digest" = "user"
+  source: "user" | "agent" | "session-digest" | "knowledge" = "user",
+  opts?: { collection?: string; docId?: string; sourceUri?: string; location?: string; chunkIndex?: number }
 ): Promise<MemoryEntry> {
   await ensureHydrated();
   const { embedModel, addEntry } = useMemoryStore.getState();
@@ -57,6 +58,7 @@ export async function addMemory(
     tags,
     source,
     createdAt: Date.now(),
+    ...opts,
   };
   addEntry(entry);
   return entry;
@@ -87,14 +89,30 @@ const USAGE_BOOST_CAP = 0.3;
  * never awaited in the scoring path, errors swallowed, DB write skipped
  * outside Tauri. Recency stays anchored on createdAt (age of the fact);
  * retrieval frequency is rewarded by usageBoost, not by resetting decay.
+ *
+ * KD-3/knowledge scoping (`opts`): knowledge chunks (source === "knowledge")
+ * are citeable textbook/document passages, not chat facts, so two defaults
+ * differ for them:
+ *  - No recency decay. A 90-day-old textbook passage is exactly as valid as
+ *    a fresh one, so recencyDecay is skipped entirely (score = rawScore *
+ *    usageBoost) rather than unfairly discounting older-ingested chunks.
+ *  - Scoped opt-in only. Passing `opts.collection` restricts candidates to
+ *    that collection (any source). With no collection, knowledge rows are
+ *    EXCLUDED from the unscoped pool by default — otherwise class material
+ *    would pollute ordinary coding-chat recall — unless the caller passes
+ *    `opts.includeKnowledge: true` to opt back in explicitly.
  */
 export async function searchMemory(
   query: string,
   topK = 5,
-  threshold = 0.35
+  threshold = 0.35,
+  opts?: { collection?: string; includeKnowledge?: boolean }
 ): Promise<Array<{ entry: MemoryEntry; score: number; rawScore: number }>> {
   await ensureHydrated();
-  const { entries, embedModel } = useMemoryStore.getState();
+  const { entries: allEntries, embedModel } = useMemoryStore.getState();
+  const entries = opts?.collection
+    ? allEntries.filter((e) => e.collection === opts.collection)
+    : allEntries.filter((e) => e.source !== "knowledge" || opts?.includeKnowledge === true);
   if (entries.length === 0) return [];
 
   let queryEmbedding: number[];
@@ -117,9 +135,13 @@ export async function searchMemory(
     }))
     .filter(({ rawScore }) => rawScore >= threshold)
     .map(({ entry, rawScore }) => {
+      const usageBoost = 1 + Math.min(USAGE_BOOST_CAP, 0.1 * Math.log1p(entry.useCount ?? 0));
+      if (entry.source === "knowledge") {
+        // KD-3: knowledge facts do not decay — see doc comment above.
+        return { entry, rawScore, score: rawScore * usageBoost };
+      }
       const ageDays = Math.max(0, (now - entry.createdAt) / (1000 * 60 * 60 * 24));
       const recencyDecay = Math.max(RECENCY_FLOOR, Math.exp(-ageDays / RECENCY_DECAY_DAYS));
-      const usageBoost = 1 + Math.min(USAGE_BOOST_CAP, 0.1 * Math.log1p(entry.useCount ?? 0));
       return { entry, rawScore, score: rawScore * recencyDecay * usageBoost };
     })
     .sort((a, b) => b.score - a.score)
@@ -133,10 +155,18 @@ export function formatMemoriesForContext(
   results: Array<{ entry: MemoryEntry; score: number }>
 ): string {
   if (results.length === 0) return "";
-  const lines = results.map(
-    ({ entry }) =>
-      `- ${entry.text}${entry.tags.length > 0 ? ` [${entry.tags.join(", ")}]` : ""}`
-  );
+  const lines = results.map(({ entry }) => {
+    // KD-4: citations flow through this existing prompt seam. A knowledge
+    // chunk gets a bracketed anchor (collection/source, plus the human
+    // location if we have one) instead of the usual [tags] suffix, so the
+    // model can cite exactly where a fact came from.
+    if (entry.source === "knowledge" && (entry.location || entry.sourceUri || entry.collection)) {
+      const parts = [entry.collection, entry.sourceUri].filter(Boolean).join("/");
+      const anchor = [parts, entry.location].filter(Boolean).join(" ");
+      return `- ${entry.text} — [${anchor}]`;
+    }
+    return `- ${entry.text}${entry.tags.length > 0 ? ` [${entry.tags.join(", ")}]` : ""}`;
+  });
   return `## Relevant Memories\n${lines.join("\n")}`;
 }
 

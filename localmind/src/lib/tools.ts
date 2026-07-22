@@ -7,7 +7,7 @@ import { injectGitCredentials, sanitizeOutput } from "../store/profile";
 import { loadSkills, saveSkill } from "./skillEngine";
 import { saveImprovement } from "./improvements";
 import { updateMemorySection, readProjectMemory } from "./projectMemory";
-import { addMemory } from "./vectorMemory";
+import { addMemory, searchMemory } from "./vectorMemory";
 import { saveDynamicTool } from "./dynamicTools";
 import type { DynamicToolDef } from "./dynamicTools";
 import { APP_VIEWS } from "../types/app";
@@ -83,6 +83,8 @@ export type ToolName =
   | "spawn_subagent"
   | "propose_feature"
   | "search_past_sessions"
+  | "search_knowledge"
+  | "list_collections"
   | "read_clipboard"
   | "set_clipboard"
   | "open_application"
@@ -234,6 +236,38 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
         limit: { type: "number", description: "Max results to return. Defaults to 8." },
       },
       required: ["query"],
+    },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "search_knowledge",
+    description:
+      "Search the user's ingested class notes / knowledge bases (their uploaded documents) for passages relevant to a query, scoped to a class collection. Returns passages WITH source citations. Use this to answer questions about the user's coursework and ALWAYS cite the returned source locations.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "The search query string." },
+        collection: { type: "string", description: "Optional class/collection id to scope the search to, e.g. 'CS101'. Use list_collections to see valid ids." },
+        limit: { type: "number", description: "Max passages to return. Defaults to 6." },
+      },
+      required: ["query"],
+    },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "list_collections",
+    description:
+      "List the user's knowledge-base collections (their classes) with how many documents each contains. Use before search_knowledge if unsure which collection to search.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
     },
     group: "state",
     risk: "read",
@@ -1288,6 +1322,40 @@ export async function executeTool(
                 return `${i + 1}. [${h.origin}] ${h.task} (${date}, ${h.outcome})\n   ${h.snippet}`;
               })
               .join("\n\n");
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      case "search_knowledge": {
+        const query = argStr(call.args["query"]);
+        if (!query) throw new Error("Missing query argument");
+        const collection = argStr(call.args["collection"]) || undefined;
+        const limitArg = call.args["limit"];
+        const limit = typeof limitArg === "number" && limitArg > 0 ? Math.floor(limitArg) : 6;
+        const hits = await searchMemory(query, limit, 0.3, { collection, includeKnowledge: true });
+        const output = hits.length === 0
+          ? "No matching passages found in the user's notes."
+          : hits
+              .map(({ entry }, i) => {
+                const anchor = `[${[entry.collection, entry.sourceUri].filter(Boolean).join("/")}${entry.location ? " " + entry.location : ""}]`;
+                return `${i + 1}. ${anchor} ${entry.text}`;
+              })
+              .join("\n\n");
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      case "list_collections": {
+        let collections: Array<{ id: string; label: string; created_at: number; doc_count: number }> = [];
+        try {
+          collections = await tauriInvoke("collections_all");
+        } catch {
+          // Not in Tauri desktop mode, or no backend support yet — treat as empty.
+          collections = [];
+        }
+        const output = collections.length === 0
+          ? "No knowledge collections yet."
+          : collections
+              .map((c, i) => `${i + 1}. ${c.label || c.id} (${c.doc_count} docs)`)
+              .join("\n");
         return { toolCallId: call.id, name: call.name, output };
       }
 

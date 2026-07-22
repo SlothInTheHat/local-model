@@ -224,9 +224,10 @@ use transcribe::{transcribe_video, transcribe_audio_base64};
 
 mod db;
 use db::{
-    memory_upsert, memory_all, memory_delete, memory_touch,
+    memory_upsert, memory_all, memory_delete, memory_touch, memory_delete_by_doc,
     jobs_insert, jobs_list, jobs_due, jobs_update_next, jobs_cancel,
     session_insert, session_search,
+    collection_upsert, collections_all, collection_delete, collection_docs,
 };
 
 mod tray;
@@ -395,6 +396,57 @@ fn fs_read_file_base64(path: String) -> Result<String, String> {
     Ok(base64_encode(&bytes))
 }
 
+/// KM1 — file extensions the Knowledge Hub is allowed to ingest. Shared
+/// between `open_upload_dialog`'s picker filter and `read_upload_bytes`'s
+/// allowlist check so the two can never drift apart.
+const ALLOWED_UPLOAD_EXTENSIONS: &[&str] =
+    &["pdf", "md", "markdown", "txt", "png", "jpg", "jpeg", "webp"];
+
+/// Cap on `read_upload_bytes` file size — ingestion holds a whole file's
+/// bytes (and every extracted chunk) in memory at once, so this is a sane
+/// upper bound for a single document (50 MB).
+const MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024;
+
+/// KM1 — read an arbitrary file's bytes (base64-encoded) for document
+/// ingestion, invoked directly by the Knowledge Hub UI.
+///
+/// SECURITY: this is deliberately NOT `ensure_confined` — uploads are files
+/// the user explicitly chose via `open_upload_dialog`'s native OS picker
+/// (or will choose via an `<input type="file">` fallback), which IS the
+/// authorization, and legitimately live outside every registered workspace
+/// root (e.g. a PDF sitting in Downloads). To keep this from becoming a
+/// general arbitrary-file-read primitive despite skipping confinement:
+///   (a) the extension must be in `ALLOWED_UPLOAD_EXTENSIONS` (rejected otherwise);
+///   (b) the file must be <= `MAX_UPLOAD_BYTES` (rejected otherwise);
+///   (c) this is NOT registered as an agent tool (no entry in
+///       src/lib/tools.ts's ToolName/TOOL_DEFINITIONS) — it is only ever
+///       invoked directly by the Knowledge Hub UI, never reachable from a
+///       model-driven tool call.
+#[tauri::command]
+fn read_upload_bytes(path: String) -> Result<String, String> {
+    let p = Path::new(&path);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .ok_or_else(|| format!("File has no extension: '{path}'"))?;
+    if !ALLOWED_UPLOAD_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(format!(
+            "File type '.{ext}' is not allowed for ingestion (allowed: {})",
+            ALLOWED_UPLOAD_EXTENSIONS.join(", ")
+        ));
+    }
+    let meta = std::fs::metadata(p).map_err(|e| e.to_string())?;
+    if meta.len() > MAX_UPLOAD_BYTES {
+        return Err(format!(
+            "File is too large ({} bytes; max {MAX_UPLOAD_BYTES} bytes)",
+            meta.len()
+        ));
+    }
+    let bytes = std::fs::read(p).map_err(|e| e.to_string())?;
+    Ok(base64_encode(&bytes))
+}
+
 /// `pub(crate)` (not private) so `os_tools::read_image_base64` (WP6.2b) can
 /// reuse it instead of pulling in a whole crate for one encode call — this
 /// project already has zero base64 dependency and this hand-rolled encoder
@@ -500,6 +552,18 @@ fn open_workspace_dialog() -> Option<String> {
         .set_title("Select Workspace Folder")
         .pick_folder()
         .map(|p| p.to_string_lossy().to_string())
+}
+
+/// KM1 — open a native multi-file picker scoped to document types the
+/// Knowledge Hub can ingest (see `ALLOWED_UPLOAD_EXTENSIONS` below, which
+/// this filter matches). Returns None if the user cancels.
+#[tauri::command]
+fn open_upload_dialog() -> Option<Vec<String>> {
+    rfd::FileDialog::new()
+        .set_title("Select Documents to Ingest")
+        .add_filter("Documents", ALLOWED_UPLOAD_EXTENSIONS)
+        .pick_files()
+        .map(|paths| paths.into_iter().map(|p| p.to_string_lossy().to_string()).collect())
 }
 
 /// Split a command string on top-level `&&` (outside single/double quotes),
@@ -1169,10 +1233,17 @@ pub fn run() {
             fs_exists,
             fs_mkdir,
             fs_read_file_base64,
+            open_upload_dialog,
+            read_upload_bytes,
             memory_upsert,
             memory_all,
             memory_delete,
             memory_touch,
+            memory_delete_by_doc,
+            collection_upsert,
+            collections_all,
+            collection_delete,
+            collection_docs,
             jobs_insert,
             jobs_list,
             jobs_due,
