@@ -4,6 +4,24 @@
 
 LocalMind is a Tauri + React desktop app that wraps [Ollama](https://ollama.com) in a full agentic assistant — chat, a coding agent with its own editor, deep web research, per-class knowledge bases, scheduled automation, and a large set of tools that let it actually *act* on your computer (move files, download and edit images, merge PDFs, control windows, and more), all running against models on your own machine.
 
+## Screenshots
+
+**Study tab — per-class concept graph.** Click a concept to get a generated plain-English explanation (with real LaTeX formulas, pulled from and cited to your own uploaded notes), then ask a follow-up that jumps straight into a chat pre-loaded with that concept's context.
+
+![Concept graph with a generated explanation panel](docs/screenshots/study-concept-graph.png)
+
+**Chat — tools that actually act.** Removing an image's background and checking disk space, both as real tool calls with real results, not just descriptions of what you could do.
+
+![Chat session showing remove_background and get_disk_usage tool calls](docs/screenshots/chat-tool-use.png)
+
+**Code tab — a full coding agent.** Monaco editor, live preview, file tree, and an agent that plans and executes multi-step builds (here, a landing page) against a visible task list.
+
+![Code tab building a landing page with live preview and a task list](docs/screenshots/code-tab.png)
+
+**Circle anything on screen and ask about it.** The overlay lets you draw a loop around part of any application's window — here, a linear algebra example from a webpage — and ask LocalMind about exactly what you circled.
+
+![Annotate overlay circling a math example on an external webpage](docs/screenshots/annotate-overlay.png)
+
 ## Why
 
 Most AI assistants are either cloud-hosted (your data leaves your machine) or narrowly scoped to one job (just chat, just code). LocalMind is built to be a general-purpose everyday assistant that happens to be entirely local:
