@@ -54,6 +54,16 @@ const REPEATABLE_TOOLS = new Set(["run_command", "web_search", "web_fetch", "ins
 const READ_ONLY_TOOLS = new Set(["read_file", "list_directory", "grep_files", "find_files"]);
 
 /**
+ * Tools whose success means the model actually produced/changed something —
+ * as opposed to merely investigating. Used only to reset the read-only streak
+ * below; distinct from REAL_WORK_TOOLS (which also counts reads as "real
+ * work" for the management-streak guard, correctly — reading IS work in
+ * general, just not the specific kind that ends a read-only investigation
+ * loop).
+ */
+const MUTATING_TOOLS = new Set(["write_file", "patch_file", "apply_patch", "delete_file", "create_folder", "run_command", "install_deps"]);
+
+/**
  * Tracks tool-call patterns across an agent session and surfaces hard blocks
  * (call not executed) and soft notes (appended to the tool result) to keep
  * the model from looping on the same action.
@@ -63,6 +73,21 @@ export class StuckDetector {
   static readonly MANAGEMENT_STREAK_LIMIT = 2;
   static readonly RUN_ERROR_REPEAT_LIMIT = 2;
   static readonly WEB_SEARCH_LIMIT = 4;
+  /**
+   * Hard cap on consecutive read-only calls (read_file/list_directory/
+   * grep_files/find_files) with no mutating call in between. Distinct from
+   * rule 4's exact-duplicate block: a model can loop indefinitely on
+   * read-only tools while VARYING its arguments every call (different
+   * offset, different grep pattern) — that never trips rule 4's fingerprint
+   * match, and read-only tools have no per-tool TOOL_CALL_LIMITS entry
+   * either. Confirmed against real session logs: a model discovered a
+   * missing file 12+ times across one session (and again across a second,
+   * user-instructed-to-just-act session) purely by varying read_file/
+   * grep_files arguments, without ever calling write_file for it.
+   */
+  static readonly READ_ONLY_STREAK_LIMIT = 8;
+  /** Hard cap on a read-only call repeated with IDENTICAL arguments, non-consecutively (see rule 2b). One step above the soft note's threshold of 4. */
+  static readonly READ_ONLY_EXACT_DUPLICATE_LIMIT = 6;
   static readonly TOOL_CALL_LIMITS: Record<string, number> = {
     update_project_memory: 10,
     save_global_memory: 10,
@@ -95,6 +120,7 @@ export class StuckDetector {
   private lastRunErrorCount = 0;
   private managementStreak = 0;
   private webSearchCallCount = 0;
+  private readOnlyStreak = 0;
 
   private fingerprint(call: ToolCall): string {
     return `${call.name}:${JSON.stringify(call.args)}`;
@@ -118,6 +144,20 @@ export class StuckDetector {
       return `[BLOCKED — RESEARCH CAP] You have already called web_search ${this.webSearchCallCount} times this session. This call was NOT executed. You have enough information — make a decision and start writing code.`;
     }
 
+    // 2b. Hard block on a read-only call repeated (with identical arguments) too
+    // many times NON-consecutively — rule 4 below only catches back-to-back
+    // exact duplicates; interspersing other calls between repeats of the same
+    // read (read A, read B, read A again, ...) evades it entirely. The soft
+    // note in recordResult already fires at 4 identical repeats; this hard
+    // block fires once that count reaches READ_ONLY_EXACT_DUPLICATE_LIMIT,
+    // giving the model one more chance after the note before actually stopping it.
+    if (
+      READ_ONLY_TOOLS.has(call.name) &&
+      (this.fingerprintCounts.get(fingerprint) ?? 0) >= StuckDetector.READ_ONLY_EXACT_DUPLICATE_LIMIT
+    ) {
+      return `[BLOCKED — REPEATED CALL] You have called ${call.name} with these exact arguments ${this.fingerprintCounts.get(fingerprint)} times this session already. This call was NOT executed. You already have this information — use it instead of looking it up again.`;
+    }
+
     // 3. Whole-session duplicate for re-runnable side-effect tools
     if (REPEATABLE_TOOLS.has(call.name) && (this.fingerprintCounts.get(fingerprint) ?? 0) >= 1) {
       const what = String(call.args["cmd"] ?? call.args["query"] ?? call.args["url"] ?? call.name);
@@ -138,6 +178,13 @@ export class StuckDetector {
       this.lastFingerprint = "";
       this.lastFingerprintCount = 0;
       return `[BLOCKED — LOOP] You called ${call.name} with identical arguments ${StuckDetector.DUPLICATE_LIMIT} times in a row. This call was NOT executed. Try something different — re-read the relevant file, or move to the next todo item. If you're blocked because a capability is missing, use register_tool (a shell one-liner) or propose_feature (an app change) instead of retrying.`;
+    }
+
+    // 4b. Prolonged read-only streak, regardless of whether arguments vary
+    // (see READ_ONLY_STREAK_LIMIT's doc comment for why this is separate
+    // from rule 4).
+    if (READ_ONLY_TOOLS.has(call.name) && this.readOnlyStreak + 1 >= StuckDetector.READ_ONLY_STREAK_LIMIT) {
+      return `[BLOCKED — READ-ONLY LOOP] You have made ${this.readOnlyStreak + 1} read/search calls (read_file/grep_files/list_directory/find_files) in a row without writing, patching, running, or creating anything. This call was NOT executed. Stop investigating — use the information you already have and act now (write_file/patch_file/run_command/create_folder).`;
     }
 
     // 5. Management-tool streak (planning without acting)
@@ -172,6 +219,12 @@ export class StuckDetector {
       this.managementStreak++;
     } else if (StuckDetector.REAL_WORK_TOOLS.has(call.name)) {
       this.managementStreak = 0;
+    }
+
+    if (READ_ONLY_TOOLS.has(call.name)) {
+      this.readOnlyStreak++;
+    } else if (MUTATING_TOOLS.has(call.name) && !toolResultFailed(result)) {
+      this.readOnlyStreak = 0;
     }
 
     // No-op write detection

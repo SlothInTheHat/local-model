@@ -1,20 +1,20 @@
 import React, { Suspense, useRef, useState, useEffect } from "react";
-import { Save, ChevronRight, Send, Play, Square, ChevronDown, ChevronUp, X, Zap, ListTodo, Brain, Pencil } from "lucide-react";
+import { Save, ChevronRight, Send, Play, Square, ChevronDown, ChevronUp, X, Zap, ListTodo, Brain, Pencil, Sun, Moon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { FileTree } from "./FileTree";
 import { openWorkspace, readFileFromHandle, writeFileToHandle } from "../lib/fileSystem";
-import { getToolDefinitions } from "../lib/tools";
 import { injectGitCredentials, sanitizeOutput } from "../store/profile";
-import { streamChat } from "../lib/ollama";
+import { streamChatForModel } from "../lib/chatProvider";
 import type { ChatMessage } from "../lib/ollama";
 import { supportsNativeTools } from "../lib/modelCapabilities";
 import { useAgentStore } from "../store/agent";
 import { useModelStore } from "../store/models";
 import { useSettingsStore } from "../store/settings";
-import { resolveNumCtx } from "../lib/contextSize";
 import type { editor as MonacoEditorNS } from "monaco-editor";
+import { registerLocalMindMonacoThemes } from "../lib/monacoThemes";
+import { ToolIcon } from "./ToolCallCard";
 import { CheckpointBrowser } from "./CheckpointBrowser";
 import { inlineHtmlResources } from "../lib/htmlPreview";
 import { loadSkills, saveSkill } from "../lib/skillEngine";
@@ -157,9 +157,8 @@ interface CodeEditorProps {
 export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) {
   const { dirHandle, workspacePath, setWorkspace } = useAgentStore();
   const { hardware, vramOverride } = useModelStore();
-  const { numCtxOverride } = useSettingsStore();
+  const { numCtxOverride, codeEditorTheme, setCodeEditorTheme } = useSettingsStore();
   const effectiveHardware = vramOverride != null && hardware ? { ...hardware, vramGb: vramOverride } : hardware;
-  const numCtx = resolveNumCtx(effectiveHardware, numCtxOverride, selectedModel);
 
   // Multi-file tabs
   interface OpenTab { path: string; content: string; isDirty: boolean; }
@@ -204,6 +203,14 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
 
   // Plan / Build agent mode (Plan = read-only like OpenCode's Plan agent)
   const [agentBuildMode, setAgentBuildMode] = useState(true); // true = Build, false = Plan
+  // Mirrors agentBuildMode/autoApproveAll for the in-flight agent session to read live
+  // (see AgentRuntimeConfig's doc comment) — a plain boolean baked into the config at
+  // session start stayed frozen for the whole multi-round loop, so toggling either
+  // mid-response had no effect until the next message. Passing `() => ref.current`
+  // instead of the raw state value fixes that.
+  const agentBuildModeRef = useRef(agentBuildMode);
+  useEffect(() => { agentBuildModeRef.current = agentBuildMode; }, [agentBuildMode]);
+  const planModeDeniedThisSessionRef = useRef(false);
 
   // Todo list (mirrors .localmind/todos.json)
   const [todos, setTodos] = useState<TodoItem[]>([]);
@@ -223,6 +230,8 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
   const approvalResolverRef = useRef<((approved: boolean) => void) | null>(null);
   const [agentRound, setAgentRound] = useState(0);
   const [autoApproveAll, setAutoApproveAll] = useState(false);
+  const autoApproveAllRef = useRef(autoApproveAll);
+  useEffect(() => { autoApproveAllRef.current = autoApproveAll; }, [autoApproveAll]);
   const [expandedToolIndices, setExpandedToolIndices] = useState<Set<number>>(new Set());
 
   // Task queue
@@ -633,6 +642,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
     }
     setAgentRound(0);
     setReflectionOffer(false);
+    planModeDeniedThisSessionRef.current = false;
 
     const userMsg: AiMessage = { role: "user", content: prompt };
     const displayMessages: AiMessage[] = [...aiMessages, userMsg, { role: "assistant", content: "" }];
@@ -725,12 +735,25 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
         workspaceName: dirHandle?.name ?? null,
         currentView: "code",
         tools: CODE_TOOLS,
-        agentBuildMode,
-        autoApproveAll,
+        // Live getters, not the raw state values — lets toggling Full Auto or
+        // Plan/Build mode mid-session take effect on this session's very next
+        // tool call instead of only the next message (see AgentRuntimeConfig's
+        // doc comment on why a frozen snapshot was the actual cause of "Full
+        // Auto still prompted").
+        agentBuildMode: () => agentBuildModeRef.current,
+        autoApproveAll: () => autoApproveAllRef.current,
         toolsSupported,
         maxRounds: DEFAULT_MAX_ROUNDS,
         getCurrentOpenFile: () =>
           currentPath && fileContent ? { path: currentPath, content: fileContent, language } : null,
+
+        onPlanModeDenial: () => {
+          if (planModeDeniedThisSessionRef.current) return;
+          planModeDeniedThisSessionRef.current = true;
+          toast.warning("Blocked by Plan mode", {
+            description: "Full Auto only auto-approves in Build mode — switch to Build to let the agent write/run.",
+          });
+        },
 
         onTextDelta: (chunk) => {
           appendToLastAssistant(chunk);
@@ -924,7 +947,12 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
           autoRestartCountRef.current = 0;
         } else {
           const continueMsg = await (async () => {
-            if (hitRoundLimit) return "Round limit reached — resume from the next pending task.";
+            // Always check todos first, even when the round limit was hit — a
+            // session that spent its last few rounds on harmless
+            // re-verification (pushing it over the cap) must not be force-
+            // restarted into a whole new session if everything is actually
+            // done. Only fall back to the round-limit message when there's no
+            // todos.json to consult at all.
             try {
               const lm = await dirHandle.getDirectoryHandle(".localmind", { create: false });
               const fh = await lm.getFileHandle("todos.json", { create: false });
@@ -932,11 +960,13 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
               type TodoItem = { id: string; content: string; status: string };
               const latestTodos = JSON.parse(await f.text()) as TodoItem[];
               const incomplete = latestTodos.filter((t) => t.status === "pending" || t.status === "in_progress");
-              if (incomplete.length === 0) return null; // all done — stop
+              if (incomplete.length === 0) return null; // all done — stop, even if we hit the round cap
               const next = incomplete.find((t) => t.status === "in_progress") ?? incomplete[0];
-              return `Task incomplete — ${incomplete.length} todo(s) remaining. Resume from: "${next.content}"`;
+              return hitRoundLimit
+                ? `Round limit reached with ${incomplete.length} todo(s) still incomplete — resume from: "${next.content}"`
+                : `Task incomplete — ${incomplete.length} todo(s) remaining. Resume from: "${next.content}"`;
             } catch {
-              return null; // no todos file — nothing to resume
+              return hitRoundLimit ? "Round limit reached — resume from the next pending task." : null; // no todos file — nothing to resume
             }
           })();
           if (continueMsg) {
@@ -981,7 +1011,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
         { role: "user" as const, content: convoSummary },
       ];
       let json = "";
-      for await (const chunk of streamChat(selectedModel, genHistory)) {
+      for await (const chunk of streamChatForModel(selectedModel, genHistory)) {
         json += chunk;
       }
       const start = json.indexOf("{");
@@ -1092,7 +1122,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                     }`}
                   >
                     <span className={tab.isDirty ? "italic" : ""}>{name}</span>
-                    {tab.isDirty && <span className="size-1.5 rounded-full bg-amber-500 shrink-0" />}
+                    {tab.isDirty && <span className="size-1.5 rounded-full bg-warning shrink-0" />}
                     <button
                       onClick={(e) => handleCloseTab(tab.path, e)}
                       className="ml-0.5 opacity-50 hover:opacity-100 transition-opacity"
@@ -1132,6 +1162,15 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                 <option key={lang} value={lang}>{lang}</option>
               ))}
             </select>
+
+            <button
+              type="button"
+              onClick={() => setCodeEditorTheme(codeEditorTheme === "dark" ? "light" : "dark")}
+              title={codeEditorTheme === "dark" ? "Editor theme: Dark — click for Light" : "Editor theme: Light — click for Dark"}
+              className="size-7 shrink-0 flex items-center justify-center rounded border border-border text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+            >
+              {codeEditorTheme === "dark" ? <Moon className="size-3.5" /> : <Sun className="size-3.5" />}
+            </button>
 
             <Button
               size="sm" variant={canRun ? "default" : "outline"}
@@ -1177,7 +1216,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                   height="100%"
                   language={language}
                   value={fileContent}
-                  theme="vs-dark"
+                  theme={codeEditorTheme === "dark" ? "localmind-dark" : "localmind-light"}
                   onChange={(v) => {
                     const content = v ?? "";
                     setFileContent(content);
@@ -1187,6 +1226,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                       );
                     }
                   }}
+                  beforeMount={(monacoInstance) => registerLocalMindMonacoThemes(monacoInstance)}
                   onMount={(ed) => {
                     editorRef.current = ed;
                     // Ctrl+Enter to run/preview
@@ -1213,16 +1253,16 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
             {htmlPreviewUrl !== null && (
               <div className="w-1/2 border-l flex flex-col min-w-0">
                 {/* Preview header bar */}
-                <div className="flex items-center gap-2 px-3 h-8 bg-zinc-900 text-xs text-zinc-300 border-b border-zinc-700 shrink-0">
-                  <span className="text-blue-400 font-medium">Preview</span>
+                <div className="flex items-center gap-2 px-3 h-8 bg-card text-xs text-muted-foreground border-b border-border shrink-0">
+                  <span className="text-info font-medium">Preview</span>
                   {htmlPreviewPath && (
-                    <span className="text-zinc-500 truncate">{htmlPreviewPath.split("/").pop()}</span>
+                    <span className="text-muted-foreground truncate">{htmlPreviewPath.split("/").pop()}</span>
                   )}
-                  <span className="ml-auto text-[10px] text-zinc-600">live · 400 ms</span>
+                  <span className="ml-auto text-[10px] text-muted-foreground/70">live · 400 ms</span>
                   <button
                     type="button"
                     onClick={() => { setHtmlPreviewUrl(null); setHtmlPreviewPath(""); }}
-                    className="text-zinc-500 hover:text-zinc-200 transition-colors ml-1"
+                    className="text-muted-foreground hover:text-foreground transition-colors ml-1"
                     title="Close preview"
                   >
                     <X className="size-3" />
@@ -1242,27 +1282,27 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
           </div>
 
           {/* Integrated Terminal — VS Code style, shows agent + user commands */}
-          <div className="border-t bg-zinc-950 shrink-0 flex flex-col" style={{ height: terminalOpen ? 240 : 32 }}>
+          <div className="border-t bg-card shrink-0 flex flex-col" style={{ height: terminalOpen ? 240 : 32 }}>
             {/* Terminal header tab bar */}
-            <div className="flex items-center gap-0 h-8 shrink-0 border-b border-zinc-800">
+            <div className="flex items-center gap-0 h-8 shrink-0 border-b border-border">
               <button
                 type="button"
-                className="flex items-center gap-1.5 px-3 h-full text-xs text-zinc-300 hover:bg-zinc-800 border-t-2 border-t-green-500 transition-colors"
+                className="flex items-center gap-1.5 px-3 h-full text-xs text-muted-foreground hover:bg-muted border-t-2 border-t-green-500 transition-colors"
                 onClick={() => setTerminalOpen((v) => !v)}
               >
                 <span className="font-medium">Terminal</span>
                 {terminalLog.some((e) => e.running) && (
-                  <span className="size-1.5 rounded-full bg-amber-400 animate-pulse" />
+                  <span className="size-1.5 rounded-full bg-warning animate-pulse" />
                 )}
                 {!terminalLog.some((e) => e.running) && terminalLog.some((e) => e.error) && (
-                  <span className="size-1.5 rounded-full bg-red-500" />
+                  <span className="size-1.5 rounded-full bg-destructive" />
                 )}
               </button>
               <div className="flex-1" />
               {terminalLog.length > 0 && (
                 <button
                   type="button"
-                  className="px-2 h-full text-[10px] text-zinc-600 hover:text-zinc-300 transition-colors"
+                  className="px-2 h-full text-[10px] text-muted-foreground/70 hover:text-foreground transition-colors"
                   onClick={() => setTerminalLog([])}
                   title="Clear terminal"
                 >
@@ -1271,7 +1311,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
               )}
               <button
                 type="button"
-                className="px-2 h-full text-zinc-600 hover:text-zinc-300 transition-colors"
+                className="px-2 h-full text-muted-foreground/70 hover:text-foreground transition-colors"
                 onClick={() => setTerminalOpen((v) => !v)}
                 title={terminalOpen ? "Minimize terminal" : "Expand terminal"}
               >
@@ -1284,7 +1324,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                 {/* Output area */}
                 <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2 min-h-0 font-mono">
                   {terminalLog.length === 0 && (
-                    <p className="text-zinc-600 text-[11px]">No commands run yet. Type a command below or let the agent run one.</p>
+                    <p className="text-muted-foreground/70 text-[11px]">No commands run yet. Type a command below or let the agent run one.</p>
                   )}
                   {terminalLog.map((entry) => (
                     <div key={entry.id} className="space-y-0.5">
@@ -1292,15 +1332,15 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                         <span className={`text-[11px] shrink-0 ${entry.source === "user" ? "text-blue-400" : "text-green-400"}`}>
                           {entry.source === "user" ? "❯" : "⚡"}
                         </span>
-                        <span className="text-zinc-200 text-[11px] break-all">{entry.cmd}</span>
-                        {entry.running && <span className="text-amber-400 text-[10px] animate-pulse shrink-0">running…</span>}
+                        <span className="text-foreground text-[11px] break-all">{entry.cmd}</span>
+                        {entry.running && <span className="text-warning text-[10px] animate-pulse shrink-0">running…</span>}
                         {!entry.running && entry.durationMs !== undefined && (
-                          <span className="text-zinc-600 text-[10px] shrink-0 ml-auto">{entry.durationMs}ms</span>
+                          <span className="text-muted-foreground/70 text-[10px] shrink-0 ml-auto">{entry.durationMs}ms</span>
                         )}
                       </div>
                       {entry.output && (
                         <pre className={`text-[11px] whitespace-pre-wrap break-all pl-4 leading-relaxed ${
-                          entry.error ? "text-red-400" : "text-zinc-400"
+                          entry.error ? "text-destructive" : "text-muted-foreground"
                         }`}>
                           {entry.output.length > 3000 ? entry.output.slice(0, 3000) + "\n…(truncated)" : entry.output}
                         </pre>
@@ -1311,7 +1351,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                 </div>
 
                 {/* Input row */}
-                <div className="flex items-center gap-1.5 px-3 py-1.5 border-t border-zinc-800 shrink-0">
+                <div className="flex items-center gap-1.5 px-3 py-1.5 border-t border-border shrink-0">
                   <span className="text-green-400 text-[11px] font-mono shrink-0">
                     {workspacePath ? workspacePath.split(/[\\/]/).pop() : "~"}$
                   </span>
@@ -1329,12 +1369,12 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                     }}
                     disabled={terminalRunning}
                     placeholder="Type a command and press Enter…"
-                    className="flex-1 bg-transparent text-zinc-200 text-[11px] font-mono outline-none placeholder:text-zinc-700"
+                    className="flex-1 bg-transparent text-foreground text-[11px] font-mono outline-none placeholder:text-muted-foreground/60"
                     spellCheck={false}
                     autoCorrect="off"
                     autoCapitalize="off"
                   />
-                  {terminalRunning && <span className="text-amber-400 text-[10px] animate-pulse shrink-0">running</span>}
+                  {terminalRunning && <span className="text-warning text-[10px] animate-pulse shrink-0">running</span>}
                 </div>
               </>
             )}
@@ -1342,20 +1382,20 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
 
           {/* Text output panel */}
           {runOutput && !htmlPreviewUrl && (
-            <div className="border-t bg-zinc-950 shrink-0" style={{ maxHeight: isOutputOpen ? 200 : 32 }}>
+            <div className="border-t bg-card shrink-0" style={{ maxHeight: isOutputOpen ? 200 : 32 }}>
               <button
                 type="button"
-                className="w-full flex items-center gap-2 px-3 h-8 text-xs text-zinc-300 hover:bg-zinc-900 transition-colors"
+                className="w-full flex items-center gap-2 px-3 h-8 text-xs text-muted-foreground hover:bg-muted transition-colors"
                 onClick={() => setIsOutputOpen((v) => !v)}
               >
                 {isOutputOpen ? <ChevronDown className="size-3" /> : <ChevronUp className="size-3" />}
-                <span className={runOutput.error ? "text-red-400" : "text-green-400"}>
+                <span className={runOutput.error ? "text-destructive" : "text-success"}>
                   {runOutput.error ? "Error" : "Output"}
                 </span>
-                <span className="text-zinc-500 ml-auto">{currentPath.split("/").pop()}</span>
+                <span className="text-muted-foreground ml-auto">{currentPath.split("/").pop()}</span>
               </button>
               {isOutputOpen && (
-                <pre className="px-3 pb-3 text-xs font-mono overflow-y-auto text-zinc-200 whitespace-pre-wrap"
+                <pre className="px-3 pb-3 text-xs font-mono overflow-y-auto text-foreground whitespace-pre-wrap"
                   style={{ maxHeight: 168 }}>
                   {runOutput.output}
                 </pre>
@@ -1365,7 +1405,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
 
           {/* Checkpoint browser — collapsible, shows backups for current file */}
           <CheckpointBrowser
-            dirHandle={dirHandle}
+            workspacePath={workspacePath}
             currentPath={currentPath}
             onRestore={(content) => {
               setFileContent(content);
@@ -1383,16 +1423,16 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
               <div className="flex items-center gap-2 flex-wrap">
                 <span>AI Assistant</span>
                 {!supportsNativeTools(selectedModel) ? (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-200">
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-warning/15 text-warning border border-warning/30">
                     no tools · {selectedModel.split(":")[0]}
                   </span>
                 ) : (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-100 text-green-700 border border-green-200">
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-success/15 text-success border border-success/30">
                     tools on
                   </span>
                 )}
                 {isChatStreaming && agentRound > 0 && (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-600 border border-blue-200 tabular-nums">
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-info/10 text-info border border-info/30 tabular-nums">
                     Round {agentRound}/50
                   </span>
                 )}
@@ -1408,8 +1448,8 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                       onClick={() => setAgentBuildMode((v) => !v)}
                       className={`inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded border transition-colors ${
                         agentBuildMode
-                          ? "bg-orange-100 text-orange-700 border-orange-200"
-                          : "bg-blue-100 text-blue-700 border-blue-200"
+                          ? "bg-primary/10 text-primary border-primary/20"
+                          : "bg-muted text-muted-foreground border-border"
                       }`}
                     >
                       {agentBuildMode ? <Zap className="size-2.5" /> : <Brain className="size-2.5" />}
@@ -1423,7 +1463,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                       onClick={() => setAutoApproveAll((v) => !v)}
                       className={`inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded border transition-colors ${
                         autoApproveAll
-                          ? "bg-red-100 text-red-700 border-red-300"
+                          ? "bg-destructive/10 text-destructive border-destructive/30"
                           : "text-muted-foreground border-border hover:text-foreground hover:border-foreground/30"
                       }`}
                     >
@@ -1436,7 +1476,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                       onClick={() => setShowQueue((v) => !v)}
                       className={`inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded border transition-colors ${
                         taskQueue.length > 0
-                          ? "bg-green-100 text-green-700 border-green-200"
+                          ? "bg-primary/10 text-primary border-primary/20"
                           : "text-muted-foreground border-border hover:text-foreground hover:border-foreground/30"
                       }`}
                     >
@@ -1445,30 +1485,6 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                     </button>
                   </>
                 )}
-                <button
-                  type="button"
-                  title="Log request info to browser console (F12) to debug 500 errors"
-                  className="text-muted-foreground hover:text-foreground text-[10px]"
-                  onClick={() => {
-                    const ESSENTIAL = new Set(["read_file","write_file","patch_file","apply_patch","list_directory","grep_files","find_files","run_command","web_search","web_fetch","install_deps","todo_write","git_status","git_commit","update_project_memory","create_folder","register_tool","switch_model","switch_view","send_task_to_tab"]);
-                    const { default: BASE } = { default: getToolDefinitions() };
-                    const tools = BASE.filter(t => ESSENTIAL.has(t.name));
-                    const toolsJson = JSON.stringify(tools);
-                    const sysPrompt = `(system prompt + workspace context — varies)`;
-                    console.group("LocalMind Agent Debug");
-                    console.log("Model:", selectedModel);
-                    console.log("Tool count:", tools.length);
-                    console.log("Tools JSON chars:", toolsJson.length, "≈", Math.round(toolsJson.length/4), "tokens");
-                    console.log("Tools:", tools.map(t => t.name));
-                    console.log("num_ctx sent to Ollama:", numCtx);
-                    console.log("Tip: if Ollama 500s, try reducing tools further or use a model with larger context");
-                    console.log(sysPrompt);
-                    console.groupEnd();
-                    toast.info("Debug info logged to browser console (F12 → Console)", { duration: 4000 });
-                  }}
-                >
-                  Debug
-                </button>
                 {aiMessages.length > 0 && (
                   <button
                     type="button"
@@ -1490,7 +1506,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
             {/* Live activity status bar */}
             {isChatStreaming && (
               <div className="px-3 py-1.5 border-b bg-muted/30 flex items-center gap-2 shrink-0">
-                <span className="size-1.5 rounded-full bg-green-500 animate-pulse shrink-0" />
+                <span className="size-1.5 rounded-full bg-success animate-pulse shrink-0" />
                 <span className="text-[10px] text-muted-foreground truncate">
                   {currentActivity ?? "Thinking…"}
                 </span>
@@ -1509,34 +1525,14 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                   const isPending = !hasResult && !msg.toolError && isChatStreaming;
                   const toolName = msg.toolName ?? "";
 
-                  // Color by tool type
+                  // Status color only (error/pending) — tool identity is
+                  // conveyed by the icon, not a per-tool-type background hue,
+                  // to match the rest of the app's flatter, token-driven look.
                   const chipColor = msg.toolError
-                    ? "bg-red-50 text-red-600 border-red-300"
+                    ? "bg-destructive/10 text-destructive border-destructive/30"
                     : isPending
-                    ? "bg-amber-50 text-amber-700 border-amber-300"
-                    : toolName === "read_file"
-                    ? "bg-blue-50 text-blue-700 border-blue-200"
-                    : toolName === "write_file"
-                    ? "bg-green-50 text-green-700 border-green-200"
-                    : toolName === "patch_file" || toolName === "apply_patch"
-                    ? "bg-teal-50 text-teal-700 border-teal-200"
-                    : toolName === "todo_write"
-                    ? "bg-purple-50 text-purple-700 border-purple-200"
-                    : toolName === "web_fetch"
-                    ? "bg-sky-50 text-sky-700 border-sky-200"
-                    : toolName === "delete_file"
-                    ? "bg-red-50 text-red-600 border-red-200"
-                    : toolName === "list_directory"
-                    ? "bg-slate-50 text-slate-600 border-slate-200"
-                    : toolName === "grep_files" || toolName === "find_files"
-                    ? "bg-indigo-50 text-indigo-700 border-indigo-200"
-                    : toolName === "web_search"
-                    ? "bg-violet-50 text-violet-700 border-violet-200"
-                    : toolName === "run_command"
-                    ? "bg-orange-50 text-orange-700 border-orange-200"
-                    : toolName.startsWith("git_")
-                    ? "bg-yellow-50 text-yellow-700 border-yellow-200"
-                    : "bg-muted text-muted-foreground border-border";
+                    ? "bg-warning/10 text-warning border-warning/40"
+                    : "bg-muted text-foreground border-border";
 
                   return (
                     <div key={i} className="flex flex-col items-start gap-1 w-full">
@@ -1554,6 +1550,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                           isPending ? "animate-pulse" : ""
                         } ${hasResult ? "cursor-pointer hover:opacity-80" : "cursor-default"}`}
                       >
+                        <ToolIcon name={toolName} className="size-3 shrink-0 text-muted-foreground" />
                         <span className="flex-1 truncate">{msg.content}</span>
                         {isPending && <span className="shrink-0 text-[9px]">…</span>}
                         {hasResult && (
@@ -1561,7 +1558,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                         )}
                       </button>
                       {isExpanded && msg.toolResult && (
-                        <pre className="w-full text-[10px] font-mono bg-zinc-950 text-zinc-200 rounded p-2 overflow-y-auto whitespace-pre-wrap break-all"
+                        <pre className="w-full text-[10px] font-mono bg-muted text-foreground rounded p-2 overflow-y-auto whitespace-pre-wrap break-all"
                           style={{ maxHeight: 200 }}>
                           {msg.toolResult.length > 4000
                             ? msg.toolResult.slice(0, 4000) + "\n…(truncated)"
@@ -1588,8 +1585,8 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
 
             {/* Inline approval card — replaces window.confirm() for destructive tool calls */}
             {pendingApproval && (
-              <div className="mx-3 mb-1 rounded-lg border border-amber-200 bg-amber-50 p-3 space-y-2 shrink-0">
-                <p className="text-xs font-medium text-amber-900">
+              <div className="mx-3 mb-1 rounded-lg border border-warning/30 bg-warning/5 p-3 space-y-2 shrink-0">
+                <p className="text-xs font-medium text-warning">
                   {pendingApproval.name === "write_file" && `Write file: ${String(pendingApproval.args["path"] ?? "")}`}
                   {pendingApproval.name === "delete_file" && `DELETE: ${String(pendingApproval.args["path"] ?? "")}`}
                   {pendingApproval.name === "run_command" && "Run shell command:"}
@@ -1598,21 +1595,21 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                   {!["write_file","delete_file","run_command","git_add","git_commit"].includes(pendingApproval.name) && `Run: ${pendingApproval.name}`}
                 </p>
                 {(pendingApproval.name === "run_command" || pendingApproval.name === "git_commit") && (
-                  <pre className="text-[10px] font-mono bg-amber-100 rounded px-2 py-1 overflow-x-auto text-amber-800 whitespace-pre-wrap break-all">
+                  <pre className="text-[10px] font-mono bg-warning/15 rounded px-2 py-1 overflow-x-auto text-warning whitespace-pre-wrap break-all">
                     {String(pendingApproval.args[pendingApproval.name === "git_commit" ? "message" : "cmd"] ?? "")}
                   </pre>
                 )}
                 <div className="flex gap-2">
                   <Button
                     size="sm"
-                    className="flex-1 text-xs h-6 bg-green-600 hover:bg-green-700 text-white border-0"
+                    className="flex-1 text-xs h-6 bg-success hover:bg-success/90 text-success-foreground border-0"
                     onClick={() => handleApprovalDecision(true)}
                   >
                     Allow
                   </Button>
                   <Button
                     size="sm" variant="outline"
-                    className="flex-1 text-xs h-6 border-red-300 text-red-600 hover:bg-red-50"
+                    className="flex-1 text-xs h-6 border-destructive/40 text-destructive hover:bg-destructive/10"
                     onClick={() => handleApprovalDecision(false)}
                   >
                     Deny
@@ -1623,27 +1620,27 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
 
             {/* Reflection offer — save as skill after successful tool run */}
             {reflectionOffer && (
-              <div className="mx-3 mb-1 rounded-lg border border-green-200 bg-green-50 p-3 space-y-2 shrink-0">
+              <div className="mx-3 mb-1 rounded-lg border border-success/30 bg-success/5 p-3 space-y-2 shrink-0">
                 {isPreviewingSkill ? (
-                  <p className="text-xs text-green-700 italic">Analyzing workflow…</p>
+                  <p className="text-xs text-success italic">Analyzing workflow…</p>
                 ) : pendingSkill ? (
                   <>
-                    <p className="text-xs font-medium text-green-900">
+                    <p className="text-xs font-medium text-success">
                       Save as skill: <span className="font-semibold">"{pendingSkill.name}"</span>
                     </p>
                     {pendingSkill.tags.length > 0 && (
-                      <p className="text-[10px] text-green-700">
+                      <p className="text-[10px] text-success">
                         Tags: {pendingSkill.tags.join(", ")}
                       </p>
                     )}
                   </>
                 ) : (
-                  <p className="text-xs font-medium text-green-900">Save this workflow as a skill?</p>
+                  <p className="text-xs font-medium text-success">Save this workflow as a skill?</p>
                 )}
                 <div className="flex gap-2">
                   <Button
                     size="sm"
-                    className="flex-1 text-xs h-6 bg-green-600 hover:bg-green-700 text-white border-0"
+                    className="flex-1 text-xs h-6 bg-success hover:bg-success/90 text-success-foreground border-0"
                     onClick={() => void handleSaveAsSkill()}
                     disabled={isSavingSkill || isPreviewingSkill || !pendingSkill}
                   >
@@ -1651,7 +1648,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                   </Button>
                   <Button
                     size="sm" variant="outline"
-                    className="text-xs h-6 border-green-200 text-green-600"
+                    className="text-xs h-6 border-success/30 text-success"
                     onClick={() => { setReflectionOffer(false); setPendingSkill(null); }}
                   >
                     Dismiss
@@ -1726,7 +1723,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                     <span className="text-muted-foreground shrink-0">{i + 1}.</span>
                     <span className="flex-1 truncate">{task}</span>
                     <button onClick={() => setTaskQueue((prev) => prev.filter((_, j) => j !== i))}
-                      className="text-muted-foreground hover:text-red-600 shrink-0">
+                      className="text-muted-foreground hover:text-destructive shrink-0">
                       <X className="size-2.5" />
                     </button>
                   </div>
@@ -1754,7 +1751,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                       </span>
                       <span className={`text-[10px] leading-snug ${
                         todo.status === "completed" ? "line-through text-muted-foreground" :
-                        todo.status === "in_progress" ? "text-blue-600 font-medium" :
+                        todo.status === "in_progress" ? "text-info font-medium" :
                         todo.status === "cancelled" ? "line-through text-muted-foreground" :
                         "text-foreground"
                       }`}>
@@ -1775,7 +1772,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
               >
                 <Brain className="size-2.5" />
                 <span>Project Memory</span>
-                {projectMemory && <span className="ml-1 w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" />}
+                {projectMemory && <span className="ml-1 w-1.5 h-1.5 rounded-full bg-success shrink-0" />}
                 <span className="ml-auto">{showMemory ? <ChevronDown className="size-2.5" /> : <ChevronUp className="size-2.5" />}</span>
               </button>
               {showMemory && (

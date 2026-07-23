@@ -178,8 +178,8 @@ export function SkillRegistry() {
 
         {/* Suggested (auto-distilled) skills awaiting approval — never saved silently. */}
         {pendingSkills.length > 0 && (
-          <div className="border-b bg-amber-500/5">
-            <div className="px-3 py-2 text-[11px] font-semibold text-amber-600 dark:text-amber-400 flex items-center gap-1.5">
+          <div className="border-b bg-warning/5">
+            <div className="px-3 py-2 text-[11px] font-semibold text-warning flex items-center gap-1.5">
               <Sparkles className="size-3" />
               {pendingSkills.length} suggested from recent sessions
             </div>
@@ -251,7 +251,7 @@ export function SkillRegistry() {
                 </button>
                 <button
                   onClick={(e) => { e.stopPropagation(); void handleDelete(skill); }}
-                  className="p-1 rounded hover:bg-red-100 text-muted-foreground hover:text-red-600"
+                  className="p-1 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive"
                   title="Delete"
                 >
                   <Trash2 className="size-3" />
@@ -325,7 +325,7 @@ export function SkillRegistry() {
                 <Button size="sm" variant="outline" className="h-7 text-xs gap-1" onClick={() => openEdit(selected)}>
                   <Pencil className="size-3" /> Edit
                 </Button>
-                <Button size="sm" variant="outline" className="h-7 text-xs gap-1 text-red-600 border-red-200 hover:bg-red-50"
+                <Button size="sm" variant="outline" className="h-7 text-xs gap-1 text-destructive border-destructive/30 hover:bg-destructive/10"
                   onClick={() => void handleDelete(selected)}>
                   <Trash2 className="size-3" /> Delete
                 </Button>

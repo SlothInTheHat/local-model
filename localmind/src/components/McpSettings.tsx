@@ -42,8 +42,8 @@ const QUICK_TEMPLATES: QuickTemplate[] = MCP_PRESETS.map((p) => ({
 
 const STATUS_ICON: Record<McpServer["status"], React.ReactNode> = {
   disconnected: <Circle className="size-3 text-muted-foreground" />,
-  connecting: <RefreshCw className="size-3 text-amber-500 animate-spin" />,
-  connected: <CheckCircle2 className="size-3 text-green-500" />,
+  connecting: <RefreshCw className="size-3 text-warning animate-spin" />,
+  connected: <CheckCircle2 className="size-3 text-success" />,
   error: <XCircle className="size-3 text-destructive" />,
 };
 
@@ -139,13 +139,13 @@ export function McpSettings() {
                 }}
                 className={`flex flex-col items-start p-2 rounded-md border text-left transition-colors ${
                   alreadyAdded
-                    ? "border-green-200 bg-green-50 text-green-700 cursor-default"
+                    ? "border-success/30 bg-success/10 text-success cursor-default"
                     : "border-border bg-background hover:bg-accent hover:border-primary/30 cursor-pointer"
                 }`}
               >
                 <div className="flex items-center gap-1.5 mb-0.5">
                   {alreadyAdded
-                    ? <Check className="size-3 text-green-600 shrink-0" />
+                    ? <Check className="size-3 text-success shrink-0" />
                     : <t.Icon className="size-3 text-muted-foreground shrink-0" />}
                   <span className="text-[11px] font-medium leading-none">{t.label}</span>
                 </div>
@@ -247,7 +247,7 @@ export function McpSettings() {
                 onClick={() => updateServer(server.id, { enabled: !server.enabled })}
                 className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium transition-colors ${
                   server.enabled
-                    ? "bg-green-100 text-green-700"
+                    ? "bg-success/15 text-success"
                     : "bg-muted text-muted-foreground"
                 }`}
               >

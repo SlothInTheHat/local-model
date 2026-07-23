@@ -82,6 +82,14 @@ export interface HeadlessTaskOpts {
   currentView?: AppView;
   /** Where this run was launched from, e.g. "task-queue" | "scheduler" | "subagent" | "manual" — recorded on the session record. */
   origin?: string;
+  /** Additional tools offered beyond getHeadlessDefaultTools() — e.g. a Workflow's
+   *  opted-in MCP server tools (see workflowRunner.ts). Still subject to the same
+   *  toolAllowlist approval gate as everything else. */
+  extraTools?: ToolDef[];
+  /** The Workflow.id (src/store/workflows.ts) this run belongs to, if any — stamped
+   *  onto the resulting SessionResult so the Workflows dashboard can filter run
+   *  history per workflow. */
+  workflowId?: string;
   /**
    * This run's whole point is to mutate the workspace (write/patch a file,
    * etc.) — there's no chat UI for anyone to read a text-only answer, so
@@ -168,13 +176,19 @@ export async function runHeadlessTask(opts: HeadlessTaskOpts): Promise<HeadlessT
     workspacePath: opts.workspacePath,
     workspaceName,
     currentView: opts.currentView ?? "chat",
+    // Headless origins (scheduler/task-queue/subagent/workflow/manual) aren't
+    // real AppViews, so shadow-git commit messages need the actual origin
+    // label rather than the "chat" placeholder currentView falls back to.
+    surfaceLabel: origin,
 
     // Only offer tools the model can actually get approved: no-approval tools
     // (read_file, list_directory, …) plus whatever's on this run's allowlist.
     // Advertising e.g. run_command when it will always be auto-denied just
     // wastes a round on a dead-on-arrival call — and previously let a session
     // "complete" having accomplished nothing (see hadDeniedToolCalls below).
-    tools: getHeadlessDefaultTools().filter((t) => !t.requiresApproval || allowlist.includes(t.name)),
+    tools: [...getHeadlessDefaultTools(), ...(opts.extraTools ?? [])].filter(
+      (t) => !t.requiresApproval || allowlist.includes(t.name),
+    ),
     agentBuildMode: opts.agentBuildMode ?? true,
     autoApproveAll: false,
     toolsSupported: true,
@@ -261,6 +275,7 @@ export async function runHeadlessTask(opts: HeadlessTaskOpts): Promise<HeadlessT
     steps,
     roundsUsed,
     hadSideEffects,
+    workflowId: opts.workflowId,
   };
 
   useSessionResultsStore.getState().addResult(record);

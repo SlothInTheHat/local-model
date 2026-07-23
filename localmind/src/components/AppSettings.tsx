@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Eye, EyeOff, CheckCircle2, XCircle, RefreshCw, Settings, User, GitBranch, Globe, Plug, Clock, Trash2, Lightbulb, Check, Monitor, Keyboard, FolderOpen, Cpu, Sparkles, Copy, Network, Layers, Mic } from "lucide-react";
+import { Eye, EyeOff, CheckCircle2, XCircle, RefreshCw, Settings, User, GitBranch, Globe, Plug, Clock, Trash2, Lightbulb, Check, Monitor, Keyboard, FolderOpen, Cpu, Sparkles, Copy, Network, Layers, Mic, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { Card, CardContent } from "./ui/card";
@@ -23,6 +23,7 @@ import { ModelSelector } from "./ModelSelector";
 import { McpSettings } from "./McpSettings";
 import { describeSchedule, parseJobSpec } from "../lib/scheduler";
 import { loadImprovements, setImprovementStatus, deleteImprovement, type Improvement } from "../lib/improvements";
+import { TOOL_DEFINITIONS, type ToolDef } from "../lib/tools";
 
 // ─── Tauri invoke shim (mirrors the pattern used in src/lib/tools.ts) ────────
 
@@ -161,7 +162,7 @@ function GitHubSection() {
               : "Test connection"}
           </Button>
           {testStatus === "ok" && (
-            <span className="flex items-center gap-1 text-xs text-green-600">
+            <span className="flex items-center gap-1 text-xs text-success">
               <CheckCircle2 className="size-3.5" /> Connected as @{testUser}
             </span>
           )}
@@ -173,7 +174,7 @@ function GitHubSection() {
         </div>
 
         {githubToken && (
-          <p className="text-[11px] text-green-600 flex items-center gap-1">
+          <p className="text-[11px] text-success flex items-center gap-1">
             <CheckCircle2 className="size-3" /> Token saved — git clone/push over HTTPS will authenticate automatically.
           </p>
         )}
@@ -223,7 +224,7 @@ function GitLabSection() {
           Save
         </Button>
         {gitlabToken && (
-          <p className="text-[11px] text-green-600 flex items-center gap-1">
+          <p className="text-[11px] text-success flex items-center gap-1">
             <CheckCircle2 className="size-3" /> Token saved — git operations on {gitlabHost} will authenticate automatically.
           </p>
         )}
@@ -533,9 +534,9 @@ function FeatureProposalsSection() {
                     <p className="text-[11px] text-muted-foreground truncate" title={it.motivation}>{it.motivation}</p>
                     <div className="flex items-center gap-1.5 mt-1">
                       <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${
-                        it.status === "approved" ? "bg-green-500/15 text-green-600 dark:text-green-400"
+                        it.status === "approved" ? "bg-success/15 text-success"
                         : it.status === "done" ? "bg-muted text-muted-foreground"
-                        : "bg-amber-500/15 text-amber-600 dark:text-amber-400"
+                        : "bg-warning/15 text-warning"
                       }`}>{it.status}</span>
                       <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground">{SIZE_LABEL[it.size_guess]}</span>
                     </div>
@@ -598,7 +599,8 @@ function FeatureProposalsSection() {
 const IPC_ENDPOINT = "http://127.0.0.1:41777";
 
 function DesktopIntegrationSection() {
-  const { closeToTray, setCloseToTray, whisperModel, setWhisperModel } = useSettingsStore();
+  const { closeToTray, setCloseToTray, whisperModel, setWhisperModel, dictationEngine, setDictationEngine } =
+    useSettingsStore();
   const [autostartOn, setAutostartOn] = useState(false);
   const [autostartBusy, setAutostartBusy] = useState(false);
   const [ipcToken, setIpcToken] = useState<string | null>(null);
@@ -691,9 +693,24 @@ function DesktopIntegrationSection() {
               Voice dictation
             </div>
             <p className="text-[11px] text-muted-foreground">
-              The mic button in chat records locally and transcribes offline via faster-whisper — no audio ever
-              leaves this machine. Nothing to configure beyond the model size below.
+              The mic button in chat turns speech into text. Whisper runs fully offline; the experimental browser
+              engine streams words in real time (faster feel) but may need an internet connection.
             </p>
+            <Field label="Dictation engine">
+              <select
+                value={dictationEngine}
+                onChange={(e) => setDictationEngine(e.target.value as typeof dictationEngine)}
+                className="w-full text-sm px-3 py-1.5 rounded-md border border-border bg-background text-foreground outline-none focus:ring-2 focus:ring-ring"
+              >
+                <option value="whisper">Whisper — offline, accurate (records, then transcribes)</option>
+                <option value="browser">Browser speech — real-time, experimental (may need internet)</option>
+              </select>
+              <p className="text-[11px] text-muted-foreground">
+                Try “Browser speech” if Whisper feels slow: it types words as you talk instead of waiting until you
+                stop. If your system has no speech recognition it silently falls back to Whisper. Applies to the chat
+                mic and the Ctrl+Shift+K overlay.
+              </p>
+            </Field>
             <Field label="Whisper model">
               <select
                 value={whisperModel}
@@ -828,7 +845,7 @@ function ModelRolesSection() {
                   <option key={m} value={m}>{m}</option>
                 ))}
               </select>
-              <p className={cn("text-[11px]", model ? "text-muted-foreground" : "text-amber-600")}>{text}</p>
+              <p className={cn("text-[11px]", model ? "text-muted-foreground" : "text-warning")}>{text}</p>
             </Field>
           );
         })}
@@ -861,13 +878,127 @@ function ModelRolesSection() {
   );
 }
 
+// ─── Privacy & Security ───────────────────────────────────────────────────────
+//
+// Previously there was no durable, discoverable place to answer "what can
+// the agent access, and what leaves my machine" — per-tool enable/disable
+// lived only in AgentToolbar.tsx (a chat-view toolbar, easy to miss) and,
+// worse, reset on every app restart since useAgentStore wasn't persisted.
+// That store now persists toolsEnabled directly (see store/agent.ts); this
+// section is the durable, visible home for reviewing/changing it, plus the
+// data-egress and confinement disclosures the tab audit flagged as missing.
+
+const TOOL_GROUP_LABELS: Record<string, string> = {
+  files: "Files",
+  shell: "Shell",
+  git: "Git",
+  web: "Web",
+  media: "Media & devices",
+  state: "App state & automation",
+  app: "Desktop & OS",
+  external: "External (MCP)",
+};
+
+function PrivacySecuritySection() {
+  const { toolsEnabled, setToolEnabled, workspacePath } = useAgentStore();
+
+  const groups = new Map<string, ToolDef[]>();
+  for (const def of TOOL_DEFINITIONS) {
+    const key = def.group ?? "state";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(def);
+  }
+  const groupOrder = ["files", "shell", "git", "web", "media", "app", "state", "external"];
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardContent className="p-4 space-y-1.5">
+          <p className="text-xs font-medium text-foreground flex items-center gap-1.5">
+            <FolderOpen className="size-3.5" /> Workspace confinement
+          </p>
+          {workspacePath ? (
+            <p className="text-[11px] text-muted-foreground leading-relaxed">
+              File and shell tools (<code>read_file</code>/<code>write_file</code>/<code>run_command</code>/etc.) are
+              confined to <code className="text-foreground">{workspacePath}</code> — the Rust side refuses any
+              resolved path outside it. The Terminal tab's confinement is the same for its starting directory, but
+              once a shell command is running, the command itself can still touch absolute paths elsewhere on
+              disk or the network — confinement bounds where tools start, not everything a shell command could do.
+            </p>
+          ) : (
+            <p className="text-[11px] text-muted-foreground leading-relaxed">
+              No workspace is open, so file and shell tools have nothing to confine to and will refuse to run.
+              Open one from the Workspace section above.
+            </p>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardContent className="p-4 space-y-1.5">
+          <p className="text-xs font-medium text-foreground flex items-center gap-1.5">
+            <Globe className="size-3.5" /> Data leaving this machine
+          </p>
+          <ul className="text-[11px] text-muted-foreground leading-relaxed list-disc pl-4 space-y-1">
+            <li><code className="text-foreground">web_search</code> sends your query text to DuckDuckGo.</li>
+            <li><code className="text-foreground">web_fetch</code> sends a request to whatever URL it's given.</li>
+            <li>
+              If a non-Ollama provider is configured under AI Providers above, prompts sent to that model go to
+              that provider's servers, not just your machine.
+            </li>
+            <li>
+              Enabled MCP servers (Settings → Integrations) can each make their own network calls per their own
+              purpose (e.g. a Gmail MCP server talks to Google) — review what you've connected there.
+            </li>
+            <li>Everything else — file reads/writes, shell commands, local model inference — stays on this machine.</li>
+          </ul>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardContent className="p-4 space-y-3">
+          <p className="text-xs font-medium text-foreground">Tool permissions</p>
+          <p className="text-[11px] text-muted-foreground -mt-2">
+            Disabling a tool here applies everywhere (chat, Code tab, subagents) and persists across restarts —
+            this is the same list as the toolbar's per-session toggles, just durable.
+          </p>
+          {groupOrder.filter((g) => groups.has(g)).map((groupKey) => (
+            <div key={groupKey} className="space-y-1 pt-1 first:pt-0">
+              <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                {TOOL_GROUP_LABELS[groupKey] ?? groupKey}
+              </p>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                {groups.get(groupKey)!.map((def) => (
+                  <label
+                    key={def.name}
+                    title={def.description}
+                    className="flex items-center gap-1.5 text-xs text-foreground py-0.5 cursor-pointer"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={toolsEnabled[def.name as keyof typeof toolsEnabled] ?? true}
+                      onChange={(e) => setToolEnabled(def.name as never, e.target.checked)}
+                      className="accent-primary"
+                    />
+                    <span className="font-mono truncate">{def.name}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
 // ─── Main component ───────────────────────────────────────────────────────────
 
 export function AppSettings() {
   const { gitName, gitEmail, setGitIdentity } = useProfileStore();
   const {
-    defaultSystemPrompt, agentAutoApproveReads, theme, numCtxOverride, featureIdeasSteering, ollamaBaseUrl,
-    setDefaultSystemPrompt, setAgentAutoApproveReads, setTheme, setNumCtxOverride, setFeatureIdeasSteering, setOllamaBaseUrl,
+    defaultSystemPrompt, theme, numCtxOverride, featureIdeasSteering, ollamaBaseUrl,
+    setDefaultSystemPrompt, setTheme, setNumCtxOverride, setFeatureIdeasSteering, setOllamaBaseUrl,
   } = useSettingsStore();
   const { hardware, vramOverride } = useModelStore();
   const { selectedModel, setSelectedModel } = useModelSelectionStore();
@@ -932,8 +1063,8 @@ export function AppSettings() {
                       className={cn(
                         "text-[10px] font-medium px-1.5 py-0.5 rounded-full",
                         supportsNativeTools(selectedModel)
-                          ? "bg-green-100 text-green-700"
-                          : "bg-amber-100 text-amber-700"
+                          ? "bg-success/15 text-success"
+                          : "bg-warning/15 text-warning"
                       )}
                     >
                       {supportsNativeTools(selectedModel) ? "tools on" : "no tools"}
@@ -1098,22 +1229,6 @@ export function AppSettings() {
                   </div>
                 </Field>
 
-                {/* Auto-approve reads */}
-                <Field label="Agent behavior">
-                  <label className="flex items-center gap-2.5 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={agentAutoApproveReads}
-                      onChange={(e) => setAgentAutoApproveReads(e.target.checked)}
-                      className="size-4 rounded"
-                    />
-                    <span className="text-sm text-foreground">Auto-approve read-only tool calls</span>
-                  </label>
-                  <p className="text-[11px] text-muted-foreground pl-6">
-                    Skips the confirmation dialog for read_file, list_directory, grep_files, find_files, git_status, git_log, and web_search.
-                  </p>
-                </Field>
-
                 {/* Default system prompt */}
                 <Field label="Default system prompt" hint="Used for new conversations. Individual chats can override this.">
                   <textarea
@@ -1195,6 +1310,13 @@ export function AppSettings() {
           {/* ── Desktop integration (WP5.1) ── */}
           <Section icon={<Monitor className="size-4 text-muted-foreground" />} title="Desktop Integration">
             <DesktopIntegrationSection />
+          </Section>
+
+          <Separator />
+
+          {/* ── Privacy & Security ── */}
+          <Section icon={<ShieldCheck className="size-4 text-muted-foreground" />} title="Privacy & Security">
+            <PrivacySecuritySection />
           </Section>
         </div>
       </ScrollArea>

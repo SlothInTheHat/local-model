@@ -6,18 +6,10 @@ import {
 import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
-import { streamChat } from "../lib/ollama";
+import { streamChatForModel } from "../lib/chatProvider";
 import { openWorkspace } from "../lib/fileSystem";
 import { useAgentStore } from "../store/agent";
-
-interface BenchmarkDef {
-  name: string;
-  prompt: string;
-  keywords: string[];
-  min_matches: number;
-  timeout_seconds: number;
-  filename: string;
-}
+import { type BenchmarkDef, loadBenchmarks, saveBenchmark } from "../lib/benchmarks";
 
 interface BenchmarkResult {
   name: string;
@@ -39,66 +31,6 @@ keywords:
   - view
 min_matches: 2
 timeout_seconds: 60`;
-
-// Minimal YAML parser for benchmark files
-function parseBenchmarkYaml(raw: string, filename: string): BenchmarkDef | null {
-  try {
-    const lines = raw.split("\n");
-    const get = (key: string): string => {
-      const line = lines.find((l) => l.trimStart().startsWith(`${key}:`));
-      return line ? line.split(":").slice(1).join(":").trim().replace(/^["']|["']$/g, "") : "";
-    };
-    const name = get("name") || filename.replace(/\.yaml$/i, "");
-    const prompt = get("prompt");
-    const minMatches = parseInt(get("min_matches") || "1", 10);
-    const timeout = parseInt(get("timeout_seconds") || "60", 10);
-    // Parse keywords list
-    const kStart = lines.findIndex((l) => l.trimStart().startsWith("keywords:"));
-    const keywords: string[] = [];
-    if (kStart !== -1) {
-      for (let i = kStart + 1; i < lines.length; i++) {
-        const l = lines[i];
-        if (!l.trimStart().startsWith("-")) break;
-        keywords.push(l.replace(/^\s*-\s*/, "").trim().replace(/^["']|["']$/g, ""));
-      }
-    }
-    if (!prompt) return null;
-    return { name, prompt, keywords, min_matches: minMatches, timeout_seconds: timeout, filename };
-  } catch {
-    return null;
-  }
-}
-
-async function loadBenchmarks(dirHandle: FileSystemDirectoryHandle): Promise<BenchmarkDef[]> {
-  const defs: BenchmarkDef[] = [];
-  try {
-    const lmDir = await dirHandle.getDirectoryHandle(".localmind", { create: false });
-    const bmDir = await lmDir.getDirectoryHandle("benchmarks", { create: false });
-    for await (const [name, entry] of bmDir.entries()) {
-      if (entry.kind !== "file" || !name.endsWith(".yaml")) continue;
-      try {
-        const file = await (entry as FileSystemFileHandle).getFile();
-        const text = await file.text();
-        const def = parseBenchmarkYaml(text, name);
-        if (def) defs.push(def);
-      } catch { /* skip */ }
-    }
-  } catch { /* no benchmarks dir */ }
-  return defs;
-}
-
-async function saveBenchmark(
-  dirHandle: FileSystemDirectoryHandle,
-  def: BenchmarkDef,
-): Promise<void> {
-  const lmDir = await dirHandle.getDirectoryHandle(".localmind", { create: true });
-  const bmDir = await lmDir.getDirectoryHandle("benchmarks", { create: true });
-  const yaml = `name: "${def.name}"\nprompt: "${def.prompt.replace(/"/g, '\\"')}"\nkeywords:\n${
-    def.keywords.map((k) => `  - "${k}"`).join("\n")
-  }\nmin_matches: ${def.min_matches}\ntimeout_seconds: ${def.timeout_seconds}\n`;
-  const fh = await bmDir.getFileHandle(def.filename, { create: true });
-  const w = await fh.createWritable(); await w.write(yaml); await w.close();
-}
 
 async function saveResults(
   dirHandle: FileSystemDirectoryHandle,
@@ -156,7 +88,7 @@ export function BenchmarkRunner({ selectedModel }: Props) {
 
     try {
       const timer = setTimeout(() => ctrl.abort(), def.timeout_seconds * 1000);
-      for await (const chunk of streamChat(
+      for await (const chunk of streamChatForModel(
         selectedModel,
         [{ role: "user", content: def.prompt }],
         ctrl.signal,
@@ -372,8 +304,8 @@ export function BenchmarkRunner({ selectedModel }: Props) {
                           <span key={kw} className={`text-[10px] px-1.5 py-0.5 rounded border ${
                             result
                               ? result.response.toLowerCase().includes(kw.toLowerCase())
-                                ? "bg-green-50 border-green-200 text-green-700"
-                                : "bg-red-50 border-red-200 text-red-600"
+                                ? "bg-success/10 border-success/30 text-success"
+                                : "bg-destructive/10 border-destructive/30 text-destructive"
                               : "bg-muted border-border text-muted-foreground"
                           }`}>{kw}</span>
                         ))}
@@ -384,11 +316,11 @@ export function BenchmarkRunner({ selectedModel }: Props) {
                     </td>
                     <td className="px-4 py-3 text-center">
                       {isRunning ? (
-                        <span className="inline-flex items-center gap-1 text-[10px] text-blue-600">
+                        <span className="inline-flex items-center gap-1 text-[10px] text-info">
                           <RefreshCw className="size-3 animate-spin" /> Running
                         </span>
                       ) : result ? (
-                        <span className={`inline-flex items-center gap-1 text-[10px] font-medium ${result.passed ? "text-green-600" : "text-red-600"}`}>
+                        <span className={`inline-flex items-center gap-1 text-[10px] font-medium ${result.passed ? "text-success" : "text-destructive"}`}>
                           {result.passed ? <CheckCircle className="size-3" /> : <XCircle className="size-3" />}
                           {result.passed ? "PASS" : "FAIL"}
                           <span className="text-muted-foreground font-normal ml-1">{result.score}/{def.keywords.length}</span>
@@ -432,7 +364,7 @@ export function BenchmarkRunner({ selectedModel }: Props) {
           <span className="text-xs font-medium">{passCount}/{totalRan} passed</span>
           <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden">
             <div
-              className="h-full bg-green-500 rounded-full transition-all"
+              className="h-full bg-success rounded-full transition-all"
               style={{ width: `${(passCount / totalRan) * 100}%` }}
             />
           </div>

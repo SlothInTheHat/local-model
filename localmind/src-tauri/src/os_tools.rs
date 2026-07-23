@@ -29,6 +29,31 @@ pub fn open_application(name: String) -> Result<String, String> {
         return Err("Application name is empty".to_string());
     }
 
+    // Before falling back to the raw shell lookup below (which only resolves
+    // PATH executables, registered app names, and file/URL associations —
+    // exactly what the caller typed, nothing looser), try matching `name`
+    // fuzzily against the user's installed Start Menu apps. This is what lets
+    // "photoshop" find "Adobe Photoshop 2024" or "vscode" find "Visual Studio
+    // Code" without the model having to already know the underlying
+    // executable name. Any failure here (PowerShell unavailable, no match
+    // good enough, launch itself fails) just falls through to the unchanged
+    // legacy path further down.
+    #[cfg(target_os = "windows")]
+    {
+        if let Some((matched_name, app_id)) = windows_impl::resolve_start_app(&name) {
+            if let Ok(out) = Command::new("explorer")
+                .arg(format!("shell:AppsFolder\\{app_id}"))
+                .output()
+            {
+                if out.status.success() {
+                    return Ok(format!(
+                        "Launched '{matched_name}' (matched from '{name}' against installed Start Menu apps)."
+                    ));
+                }
+            }
+        }
+    }
+
     #[cfg(target_os = "windows")]
     let output = {
         // `start` is a cmd builtin, not an exe, so it must run through cmd.exe.
@@ -302,6 +327,98 @@ mod windows_impl {
         EnumWindows, GetSystemMetrics, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
         SetForegroundWindow, ShowWindow, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE,
     };
+
+    // ─── Fuzzy Start Menu app resolution (open_application) ────────────────
+
+    #[derive(serde::Deserialize)]
+    struct StartApp {
+        #[serde(rename = "Name")]
+        name: String,
+        #[serde(rename = "AppID")]
+        app_id: String,
+    }
+
+    /// Lowercase, alphanumeric-only projection used for matching — collapses
+    /// away punctuation/spacing differences ("Visual Studio Code" vs.
+    /// "vs code" vs. "VSCode") that would otherwise defeat a naive compare.
+    fn normalize(s: &str) -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(|c| c.to_lowercase())
+            .collect()
+    }
+
+    /// Find the best Start Menu app match for a user-typed name, returning its
+    /// display name and AppID (the identifier `shell:AppsFolder\<AppID>`
+    /// expects) if one is close enough to be confident about. Shells out to
+    /// `Get-StartApps`, the same source Windows Search itself resolves
+    /// display names against, so this recognizes the same names a human
+    /// typing into the Start menu would expect to work — not just PATH
+    /// executables or exact registered names.
+    ///
+    /// Requires at least a substring match either direction (query contains
+    /// the app name, or vice versa) after normalization; anything looser
+    /// risks silently launching an unrelated app the user never asked for, so
+    /// it returns `None` instead and lets the caller fall back to the plain
+    /// shell lookup.
+    pub fn resolve_start_app(query: &str) -> Option<(String, String)> {
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-StartApps | ConvertTo-Json -Compress",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let trimmed = stdout.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        // Get-StartApps | ConvertTo-Json emits a bare object, not a
+        // single-element array, when exactly one app is found — try the
+        // array shape first (the overwhelmingly common case) and fall back
+        // to wrapping a lone object.
+        let apps: Vec<StartApp> = serde_json::from_str(trimmed)
+            .or_else(|_| serde_json::from_str::<StartApp>(trimmed).map(|a| vec![a]))
+            .ok()?;
+
+        let query_norm = normalize(query);
+        if query_norm.is_empty() {
+            return None;
+        }
+
+        let mut best: Option<(i32, &StartApp)> = None;
+        for app in &apps {
+            let name_norm = normalize(&app.name);
+            if name_norm.is_empty() {
+                continue;
+            }
+            let score = if name_norm == query_norm {
+                100
+            } else if name_norm.starts_with(&query_norm) || query_norm.starts_with(&name_norm) {
+                90
+            } else if name_norm.contains(&query_norm) || query_norm.contains(&name_norm) {
+                70
+            } else {
+                continue;
+            };
+            let better = match &best {
+                Some((b, _)) => score > *b,
+                None => true,
+            };
+            if better {
+                best = Some((score, app));
+            }
+        }
+
+        best.map(|(_, app)| (app.name.clone(), app.app_id.clone()))
+    }
 
     // ─── Window enumeration / focus ─────────────────────────────────────────
 

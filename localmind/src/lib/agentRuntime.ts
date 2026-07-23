@@ -1,9 +1,9 @@
 import type { ChatMessage } from "./ollama";
 import type { ToolDef, ToolCall, ToolResult } from "./tools";
-import { executeTool, normalizeSubPath, canonicalToolName, TOOL_DEFINITIONS } from "./tools";
+import { executeTool, normalizeSubPath, canonicalToolName, TOOL_DEFINITIONS, resolvePathParts } from "./tools";
 import { runAgentTurnForModel, streamChatForModel } from "./chatProvider";
 import { resolveNumCtx, compactHistoryIfOverBudget, capToolOutput } from "./contextSize";
-import { fileExists, listDirectory } from "./fileSystem";
+import { fileExists, listDirectory, readFileFromHandle } from "./fileSystem";
 import type { FileEntry } from "./fileSystem";
 import type { HardwareInfo } from "./hardware";
 import { formatMemoryForContext, readProjectMemory } from "./projectMemory";
@@ -17,11 +17,15 @@ import { buildCapabilityBlock } from "./capabilityRegistry";
 import type { AppView } from "../types/app";
 import { useTaskQueueStore } from "../store/taskQueue";
 import { usePendingSkillsStore } from "../store/pendingSkills";
+import { commitAfterToolCall } from "./shadowGit";
 
 export const DEFAULT_MAX_ROUNDS = 50;
 
 /** How many times a no-tool-call round can trigger a completion review before the session ends regardless. */
 const MAX_COMPLETION_CHECKS = 2;
+
+/** How many times findMissingReferencedFiles can nudge before giving up and falling through to the normal completion check — a safety valve so a check bug can't hang a session forever. */
+const MAX_MISSING_REF_NUDGES = 2;
 
 export interface TodoItem {
   id: string;
@@ -65,10 +69,31 @@ export interface AgentRuntimeConfig {
   workspaceName: string | null;
   /** The tab this agent session is running in — used to surface tasks queued for this tab via send_task_to_tab. */
   currentView: AppView;
+  /** Human-readable surface name for shadow-git commit messages (e.g. "chat", "code",
+   *  or a headless origin like "scheduler"/"task-queue"/"subagent"/"workflow"). Falls
+   *  back to currentView when omitted — set explicitly by headless callers, whose
+   *  origin isn't an AppView. */
+  surfaceLabel?: string;
 
   tools: ToolDef[];
-  agentBuildMode: boolean;
-  autoApproveAll: boolean;
+  /**
+   * Plan/Build mode and the Full-Auto toggle. Accept either a plain boolean
+   * (headless/scheduler/task-queue/subagent callers, which have no live UI
+   * toggle to track) or a getter — interactive callers (CodeEditor.tsx) pass
+   * `() => ref.current` so a mid-session toggle takes effect on this
+   * session's very NEXT tool call instead of only the next message. Read via
+   * liveFlag() at every check site, never accessed directly, since a plain
+   * boolean check against a function value is always true.
+   *
+   * Root cause this fixes: previously a plain boolean baked into this config
+   * object at session start stayed frozen for the whole multi-round loop
+   * (up to maxRounds), so toggling Full Auto mid-response had no effect
+   * until the NEXT message — this is what a user flipping the toggle while
+   * a response was already streaming would experience as "I turned Full
+   * Auto on but it still asked me."
+   */
+  agentBuildMode: boolean | (() => boolean);
+  autoApproveAll: boolean | (() => boolean);
   toolsSupported: boolean;
   maxRounds: number;
   /**
@@ -113,6 +138,16 @@ export interface AgentRuntimeConfig {
   onTextReplace?: (cleanText: string) => void;
   onToolCallStart?: (call: ToolCall, label: string) => void;
   onApprovalNeeded: (call: ToolCall) => Promise<boolean>;
+  /**
+   * Fired when a mutating tool call is denied by Plan mode — this happens
+   * BEFORE the approval gate, so onApprovalNeeded never runs for it. Without
+   * this, a user with Full Auto on but Plan mode also on sees nothing:
+   * the call is silently denied and reads as the agent simply not acting,
+   * indistinguishable from Full Auto "still not working." Interactive
+   * callers (CodeEditor.tsx) surface a one-line explanation the first time
+   * this fires per session.
+   */
+  onPlanModeDenial?: (call: ToolCall) => void;
   onToolCallResolved?: (call: ToolCall, label: string, result: ToolResult, summary: string, toolContent: string) => void;
   onRoundStart?: (round: number, maxRounds: number) => void;
   onTodosChanged?: (todos: TodoItem[]) => void;
@@ -136,6 +171,11 @@ export interface AgentRuntimeResult {
    * trusting the model's own "done" text after a silent denial.
    */
   hadDeniedToolCalls: boolean;
+}
+
+/** Resolves a config flag that may be a plain boolean or a live getter (see AgentRuntimeConfig.agentBuildMode/autoApproveAll's doc comment). */
+function liveFlag(v: boolean | (() => boolean)): boolean {
+  return typeof v === "function" ? v() : v;
 }
 
 /** Shared "Runtime: model=..., OS=..., GPU=..., workspace=..." line used by both the agent system prompt and normal-chat identity prompt. */
@@ -220,14 +260,14 @@ function buildConversationalSystemPrompt(config: AgentRuntimeConfig): string {
 function buildSystemPrompt(config: AgentRuntimeConfig): string {
   if (config.conversational) return buildConversationalSystemPrompt(config);
 
-  const modeTag = config.agentBuildMode ? "BUILD" : "PLAN";
+  const modeTag = liveFlag(config.agentBuildMode) ? "BUILD" : "PLAN";
   const lines: string[] = [];
 
   const runtimeLine = buildRuntimeLine(config.modelRef, config.hardware, config.workspaceName, config.workspacePath);
 
   lines.push(
     `You are a coding agent operating in ${modeTag} MODE.`,
-    config.agentBuildMode
+    liveFlag(config.agentBuildMode)
       ? "BUILD MODE: full access — read, write, patch, run commands, manage todos."
       : "PLAN MODE (read-only): you may read files, search, and call todo_write. write_file/patch_file/apply_patch/delete_file/run_command/install_deps/git_add/git_commit are denied — explore and plan; the user will switch to Build mode to execute.",
     "",
@@ -256,6 +296,7 @@ function buildSystemPrompt(config: AgentRuntimeConfig): string {
     "- If a task needs today's real current date/time (e.g. appending a timestamp to a file), call get_current_datetime — NEVER guess a date, use a date from training, or web_search/web_fetch an external \"current time\" API (no such reachable API exists here; it will fail with a DNS/CORS error and waste the whole task).",
     "- Never simulate actions in text (writing out 'Todos: ... (completed)', pasting code instead of writing it, describing a command instead of running it). Every action is a real tool call. A response with no tool call ends the task.",
     "- TAKE INITIATIVE. When the user asks you to do something actionable, DO IT immediately by emitting the real tool call — do NOT write the call as prose or pseudo-code (e.g. typing `schedule_task(\"...\", 120, ...)` as text is NOT calling it), and do NOT ask 'would you like me to…' or 'should I…'. The user's request is your go-ahead; any tool that needs confirmation already shows the user an approval card, so you never need to ask permission in text. Act first, then briefly say what you did. Only ask a question if you are genuinely blocked on information the tools can't give you.",
+    "- If the user's message says you already have enough information, already found/identified something, or to just proceed/act/move on — do NOT perform another read_file/grep_files/list_directory/find_files/web_search call first. Act immediately with what you already have; re-investigating after being explicitly told to stop and act ignores the user's instruction.",
     "- If your change adds, removes, or materially changes a feature, tool, or tab, update FEATURES.md in the workspace root to match.",
     "- If a tool reports a path as not found, check the File tree in 'Current state' for the correct nested path (e.g. project files may live inside a subfolder like \"my-app/src/...\", not at the workspace root) before retrying — don't repeat a path that just failed.",
     "- Only ever call tools that appear under 'Tools available this session' below. If no listed tool fits, accomplish the goal with the tools you DO have — never invent a tool name (there is no 'create-skill', 'generate-dashboard', 'create-local-mind-skill', etc.); calling a non-existent tool just fails and wastes the turn.",
@@ -355,6 +396,56 @@ function buildCompletionReviewPrompt(taskQuery: string, changedFiles: Set<string
     "Only stop with plain text if either (a) everything is correct and complete (brief summary, no tool call needed), or (b) you are genuinely blocked on information only the user has (e.g. a missing credential or a choice between equally valid approaches) — in that case ask one specific question.",
   );
   return lines.join("\n");
+}
+
+/** Matches src="..."/href="..." attribute values in written HTML. */
+const LOCAL_REF_RE = /(?:src|href)\s*=\s*["']([^"'#][^"']*)["']/gi;
+
+function isLocalRef(ref: string): boolean {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(ref) && !/^[a-z]:[\\/]/i.test(ref)) return false; // any URL scheme (http:, data:, mailto:, javascript:, ...) except a Windows drive letter
+  if (ref.startsWith("//")) return false; // protocol-relative
+  return true;
+}
+
+/**
+ * Scans this session's written HTML files for local src="…"/href="…"
+ * references (script/link/img tags) and returns any that don't actually
+ * exist on disk — confirmed real failure pattern from session logs: the
+ * agent wrote index.html referencing app.js, never wrote app.js, and the
+ * session still ended reporting success. Best-effort: any read/parse
+ * failure just skips that file rather than throwing.
+ */
+async function findMissingReferencedFiles(
+  dirHandle: FileSystemDirectoryHandle,
+  changedFiles: Set<string>,
+): Promise<string[]> {
+  const missing = new Set<string>();
+  for (const filePath of changedFiles) {
+    if (!/\.html?$/i.test(filePath)) continue;
+    let content: string;
+    try {
+      content = await readFileFromHandle(dirHandle, filePath);
+    } catch {
+      continue;
+    }
+    const dir = filePath.includes("/") ? filePath.slice(0, filePath.lastIndexOf("/")) : "";
+    LOCAL_REF_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = LOCAL_REF_RE.exec(content))) {
+      const ref = m[1].trim();
+      if (!ref || !isLocalRef(ref)) continue;
+      const joined = dir ? `${dir}/${ref}` : ref;
+      let resolved: string;
+      try {
+        resolved = resolvePathParts(joined).join("/");
+      } catch {
+        continue;
+      }
+      if (!resolved || (await fileExists(dirHandle, resolved))) continue;
+      missing.add(resolved);
+    }
+  }
+  return [...missing];
 }
 
 async function buildCurrentStateBlock(
@@ -577,7 +668,8 @@ async function executeToolGuarded(
   const def = config.tools.find((t) => t.name === call.name);
   const policy = resolveToolPolicy(call, def);
 
-  if (!policy.planModeAllowed && !config.agentBuildMode) {
+  if (!policy.planModeAllowed && !liveFlag(config.agentBuildMode)) {
+    config.onPlanModeDenial?.(call);
     return {
       result: { toolCallId: call.id, name: call.name, output: "", error: "Denied (Plan mode)" },
       toolContent: "DENIED: You are in Plan mode (read-only). You may read files, search, and call todo_write. The user must switch to Build mode before write/patch/run/install/git-write tools (or other mutating/external/unrecognized tools) can run.",
@@ -587,7 +679,7 @@ async function executeToolGuarded(
   }
 
   // 2. Approval gate
-  if (policy.requiresApproval && !config.autoApproveAll) {
+  if (policy.requiresApproval && !liveFlag(config.autoApproveAll)) {
     const approved = await config.onApprovalNeeded(call);
     if (!approved) {
       return {
@@ -672,6 +764,17 @@ async function executeToolGuarded(
 
   const sideEffect = !result.error && SIDE_EFFECT_TOOLS.has(call.name);
 
+  // Shadow-git auto-commit (coding-agent overhaul, workstream 4): an
+  // automatic, model-invisible safety net, not a tool the model calls or
+  // that goes through approval — this is why it fires here unconditionally
+  // for every successful mutating call, regardless of headless/scheduler
+  // context, unlike git_add/git_commit (which stay excluded from unattended
+  // runs by design, since THOSE touch the user's own real repo on request).
+  // Fire-and-forget: never awaited, never allowed to affect the agent loop.
+  if (sideEffect && config.workspacePath) {
+    void commitAfterToolCall(config.workspacePath, call.name, pathsFromCall(call), config.surfaceLabel ?? config.currentView);
+  }
+
   return { result, toolContent, blocked: false, sideEffect };
 }
 
@@ -705,6 +808,7 @@ export async function runAgentSession(
   let anyToolCallsThisSession = false;
   let completionCheckCount = 0;
   let inactionNudgeCount = 0;
+  let missingRefNudgeCount = 0;
   let hadDeniedToolCalls = false;
   // expectSideEffects sessions (scheduler/task-queue) get a 2nd inaction nudge —
   // observed live: a single distraction (e.g. a stray management-tool call) or
@@ -858,7 +962,7 @@ export async function runAgentSession(
         // as a text-only one, and there's no human here to notice either way
         // — observed live, this exact case (nudge already spent, next round
         // comes back empty) let a scheduled run end with zero side effects.
-        const shouldNudgeInaction = config.agentBuildMode
+        const shouldNudgeInaction = liveFlag(config.agentBuildMode)
           && (!anyToolCallsThisSession || madeInfoCallsButNoMutation)
           && inactionNudgeCount < maxInactionNudges
           && (trimmed.length > 0 || config.expectSideEffects) && round < config.maxRounds;
@@ -871,7 +975,31 @@ export async function runAgentSession(
           continue;
         }
 
-        const canRecheck = config.agentBuildMode && hadSideEffects && completionCheckCount < MAX_COMPLETION_CHECKS
+        // 2i: before allowing a clean stop, check whether a written HTML file
+        // references a local script/stylesheet that was never actually
+        // created — a model can otherwise mark the task "done" while a
+        // <script src="app.js"> points at nothing (confirmed real failure,
+        // see findMissingReferencedFiles' doc comment).
+        if (
+          liveFlag(config.agentBuildMode) && config.dirHandle && hadSideEffects &&
+          missingRefNudgeCount < MAX_MISSING_REF_NUDGES && round < config.maxRounds
+        ) {
+          const missing = await findMissingReferencedFiles(config.dirHandle, state.changedFiles).catch(() => [] as string[]);
+          if (missing.length > 0) {
+            missingRefNudgeCount++;
+            const missingList = missing.map((p) => `"${p}"`).join(", ");
+            history = [
+              ...history,
+              {
+                role: "user",
+                content: `A file you wrote references ${missingList}, but ${missing.length === 1 ? "that file doesn't" : "those files don't"} actually exist on disk. Create ${missing.length === 1 ? "it" : "them"} now with write_file before doing anything else — do not just describe it or mark the task done.`,
+              },
+            ];
+            continue;
+          }
+        }
+
+        const canRecheck = liveFlag(config.agentBuildMode) && hadSideEffects && completionCheckCount < MAX_COMPLETION_CHECKS
           && trimmed.length > 0 && !looksLikeQuestion && round < config.maxRounds;
         if (canRecheck) {
           completionCheckCount++;
@@ -901,7 +1029,7 @@ export async function runAgentSession(
     if (
       config.toolsSupported &&
       !config.conversational &&
-      config.agentBuildMode &&
+      liveFlag(config.agentBuildMode) &&
       hadSideEffects &&
       !wasAborted &&
       toolCallCount >= 5
@@ -925,7 +1053,7 @@ export async function runAgentSession(
     if (
       config.toolsSupported &&
       !config.conversational &&
-      config.agentBuildMode &&
+      liveFlag(config.agentBuildMode) &&
       !config.suppressStaleProjectState &&
       !wasAborted &&
       toolCallCount >= 3
@@ -951,7 +1079,19 @@ function parseSkillJson(raw: string): { name?: string; tags?: unknown; content?:
   }
 }
 
-/** One-shot digest: summarize the just-finished session into a candidate skill. */
+/** One-shot digest: summarize the just-finished session into a candidate skill.
+ *
+ *  Two failure modes this guards against (both observed in practice — see the
+ *  skill registry after a few weeks of real use): (1) the model has no idea
+ *  what skills already exist, so every session touching a similar task (e.g.
+ *  "append a timestamp to a file") mints a brand-new near-duplicate instead of
+ *  reusing/updating one; (2) with no explicit instruction to generalize, the
+ *  model bakes in this session's literal specifics (an exact filename like
+ *  `game.py`) instead of writing a procedure that actually transfers to a
+ *  different file/project next time. Both are addressed by showing the model
+ *  what's already saved and asking it to either name an EXISTING skill (which
+ *  saveSkill's create-or-overwrite-by-slug behavior turns into an update) or
+ *  explicitly skip. */
 async function distillSkillFromSession(
   config: AgentRuntimeConfig,
   state: RuntimeState,
@@ -964,14 +1104,30 @@ async function distillSkillFromSession(
     .filter(Boolean)
     .slice(0, 20);
 
+  const existingSkills = config.dirHandle ? await loadSkills(config.dirHandle).catch(() => []) : [];
+  // Cap defensively (skill sets are small in practice, but this is a
+  // best-effort background digest that must never blow up the prompt) — full
+  // content, not just names, because approving a "merge" writes `content` as
+  // a full file replacement (saveSkill overwrites by slug); the model needs
+  // to see what's already there to fold it in rather than clobbering it.
+  const existingSkillsList = existingSkills
+    .slice(0, 25)
+    .map((s) => `### "${s.name}" (tags: ${s.tags.join(", ") || "none"})\n${s.content.slice(0, 500)}`)
+    .join("\n\n");
+
   const prompt = [
-    "You just completed a multi-step coding task. Distill it into a REUSABLE skill document so it can be reused next time.",
+    "You just completed a multi-step coding task. Decide whether it's worth turning into a REUSABLE skill document for next time.",
     `Original task: ${state.taskQuery}`,
     changed.length ? `Files changed: ${changed.join(", ")}` : "",
     toolSummaries.length ? `Actions taken:\n- ${toolSummaries.join("\n- ")}` : "",
     "",
-    'Respond with ONLY a JSON object: {"name": "<short skill name>", "tags": ["..."], "content": "<markdown: when to use, the procedure/steps, key commands, known gotchas, and how to verify>"}.',
-    "If the task was trivial or not worth remembering, respond with {}.",
+    existingSkillsList
+      ? `Skills already saved in this workspace:\n\n${existingSkillsList}\n`
+      : "No skills are saved in this workspace yet.\n",
+    "GENERALIZE — this is the most important rule. Write the skill as a procedure that transfers to a DIFFERENT file/project next time, never a transcript of exactly what happened this session. Strip out this session's specific literal details: replace an exact filename like `game.py` with 'the target file' or 'your entry-point file', replace a hardcoded value with a description of how to derive it, etc. If you can't describe the task without naming this session's specific file/value, it's too narrow to be a skill — respond with {} instead.",
+    "AVOID DUPLICATES — check the existing skills above first. If this task's underlying procedure is already covered by one of them (even if this session used different literal specifics), respond using that skill's EXACT existing name, and make `content` the FULL replacement text for it: keep everything from its existing content shown above that's still accurate, and fold in anything new this session revealed. Only propose a genuinely new name when no existing skill covers this procedure.",
+    'Respond with ONLY a JSON object: {"name": "<short, generic skill name — reuse an existing name from the list above if this overlaps with it>", "tags": ["..."], "content": "<markdown: when to use, the procedure/steps, key commands, known gotchas, and how to verify>"}.',
+    "If the task was trivial, a one-off that won't recur, or already fully covered by an existing skill with nothing new to add, respond with {}.",
   ].filter(Boolean).join("\n");
 
   let out = "";

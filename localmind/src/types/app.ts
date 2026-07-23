@@ -1,9 +1,9 @@
-export type AppView = "chat" | "code" | "docs" | "models" | "terminal" | "agents" | "research" | "study" | "settings" | "image" | "skills" | "benchmarks" | "compare" | "memory" | "logs";
+export type AppView = "chat" | "code" | "docs" | "models" | "terminal" | "agents" | "research" | "study" | "settings" | "image" | "skills" | "benchmarks" | "compare" | "memory" | "logs" | "workflows" | "history";
 
 /** All top-level UI tabs/views, used for switch_view / send_task_to_tab validation and prompt rendering. */
 export const APP_VIEWS: AppView[] = [
   "chat", "code", "docs", "models", "terminal", "agents", "research",
-  "study", "settings", "image", "skills", "benchmarks", "compare", "memory", "logs",
+  "study", "settings", "image", "skills", "benchmarks", "compare", "memory", "logs", "workflows", "history",
 ];
 
 /**
@@ -21,6 +21,8 @@ export const VIEW_WIDTH: Record<AppView, "narrow" | "wide"> = {
   study: "wide",
   skills: "narrow",
   agents: "narrow",
+  workflows: "narrow",
+  history: "narrow",
   // Settings is the densest screen in the app (workspace, hardware, model,
   // providers, MCP, desktop integration, scheduled jobs, feature proposals);
   // its forms and two-column rows clip at the narrow width.
@@ -56,4 +58,8 @@ export const VIEW_DESCRIPTIONS: Record<AppView, string> = {
   memory:
     "global cross-project memory browser (semantic search over notes saved with save_global_memory or from this tab — shared by every project, unlike per-project .localmind/memory.md)",
   logs: "agent session logs",
+  workflows:
+    "chat-created automations (saved via save_workflow) — dashboard to run on demand, view schedule/history, and delete",
+  history:
+    "cross-surface change history — every agent-made file change (chat, Code tab, scheduled/workflow runs) is auto-committed to a workspace-local shadow git repo (separate from the workspace's own .git, if any); browse diffs and restore individual files or the whole workspace to a prior point",
 };

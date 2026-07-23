@@ -10,7 +10,7 @@ import { ScrollArea } from "./ui/scroll-area";
 import { Separator } from "./ui/separator";
 import { runResearch } from "../lib/research";
 import { useResearchStore } from "../store/research";
-import { streamChat } from "../lib/ollama";
+import { streamChatForModel } from "../lib/chatProvider";
 
 interface Props { selectedModel: string; }
 
@@ -80,7 +80,7 @@ function ProgressView({ phase, queriesCompleted, queriesTotal }: { phase: string
           <div key={step.label} className="flex items-center">
             <div className={`flex flex-col items-center gap-1 w-20 ${i <= stepIndex ? "opacity-100" : "opacity-30"}`}>
               <div className={`size-8 rounded-full flex items-center justify-center border-2 transition-all ${
-                i < stepIndex ? "bg-green-500 border-green-500 text-white"
+                i < stepIndex ? "bg-success border-success text-success-foreground"
                 : i === stepIndex ? "bg-primary border-primary text-primary-foreground animate-pulse"
                 : "bg-background border-border text-muted-foreground"
               }`}>
@@ -89,7 +89,7 @@ function ProgressView({ phase, queriesCompleted, queriesTotal }: { phase: string
               <span className="text-[10px] text-center text-muted-foreground leading-tight">{step.label}</span>
             </div>
             {i < steps.length - 1 && (
-              <div className={`w-6 h-0.5 mb-4 ${i < stepIndex ? "bg-green-500" : "bg-border"}`} />
+              <div className={`w-6 h-0.5 mb-4 ${i < stepIndex ? "bg-success" : "bg-border"}`} />
             )}
           </div>
         ))}
@@ -170,7 +170,7 @@ Answer questions thoroughly, citing specific evidence from the research. If aske
     ];
 
     try {
-      for await (const chunk of streamChat(selectedModel, history, abortRef.current.signal)) {
+      for await (const chunk of streamChatForModel(selectedModel, history, abortRef.current.signal)) {
         appendToLastChat(reportId, chunk);
       }
     } catch (e) {
@@ -368,7 +368,7 @@ export function DeepResearch({ selectedModel }: Props) {
               <button key={r.id} onClick={() => selectReport(r.id)}
                 className={`w-full text-left px-2 py-2 rounded text-xs transition-colors flex items-start gap-1.5 group ${r.id === activeReportId ? "bg-accent text-accent-foreground" : "hover:bg-accent text-foreground/70 hover:text-foreground"}`}>
                 {r.status === "generating"
-                  ? <Loader2 className="size-3 shrink-0 mt-0.5 animate-spin text-amber-500" />
+                  ? <Loader2 className="size-3 shrink-0 mt-0.5 animate-spin text-warning" />
                   : r.status === "error"
                   ? <span className="text-destructive font-bold text-xs shrink-0">!</span>
                   : <FileText className="size-3 shrink-0 mt-0.5 text-primary" />}
@@ -392,7 +392,7 @@ export function DeepResearch({ selectedModel }: Props) {
             : <Button size="sm" className="w-full h-7 text-xs gap-1" onClick={() => void startResearch()} disabled={!topic.trim() || !selectedModel}>
                 <Search className="size-3" /> Research
               </Button>}
-          {!selectedModel && <p className="text-[10px] text-amber-600">Select a model first</p>}
+          {!selectedModel && <p className="text-[10px] text-warning">Select a model first</p>}
         </div>
       </aside>
 
@@ -428,7 +428,7 @@ export function DeepResearch({ selectedModel }: Props) {
                   {isGenerating && <Loader2 className="size-4 animate-spin text-primary shrink-0" />}
                   <h2 className="text-sm font-semibold truncate">{activeReport.topic}</h2>
                   {activeReport.status === "done" && (
-                    <span className="text-[10px] text-green-600 shrink-0 border border-green-200 bg-green-50 px-1.5 py-0.5 rounded-full">
+                    <span className="text-[10px] text-success shrink-0 border border-success/30 bg-success/10 px-1.5 py-0.5 rounded-full">
                       {activeReport.queriesCompleted} sources
                     </span>
                   )}

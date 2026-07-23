@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { emit } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow, LogicalPosition } from "@tauri-apps/api/window";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Mic, Loader2, Pencil } from "lucide-react";
 // src/lib/dictation.ts is the ONE exception to the "nothing from ../lib" rule
 // below (WP7.2). It was audited before importing: no module-level state, no
@@ -105,6 +105,21 @@ function readWhisperModelSetting(): string | undefined {
   }
 }
 
+/** Same defensive localStorage read as readWhisperModelSetting, for the
+ *  "Dictation engine" setting — "browser" routes the mic through the Web
+ *  Speech API (real-time), anything else (or any read failure) uses the local
+ *  whisper pipeline. */
+function readDictationEngineSetting(): "whisper" | "browser" {
+  try {
+    const raw = localStorage.getItem("localmind-settings");
+    if (!raw) return "whisper";
+    const parsed = JSON.parse(raw) as { state?: { dictationEngine?: unknown } };
+    return parsed?.state?.dictationEngine === "browser" ? "browser" : "whisper";
+  } catch {
+    return "whisper";
+  }
+}
+
 export function QuickInvoke() {
   const [text, setText] = useState("");
   // True once the current session has at least one drawn point — drives the
@@ -121,6 +136,8 @@ export function QuickInvoke() {
   const [micError, setMicError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const dictationSessionRef = useRef<DictationSession | null>(null);
+  // Web Speech recognizer, when the "Browser speech" dictation engine is on.
+  const recognitionRef = useRef<{ stop: () => void } | null>(null);
 
   // Every point of every stroke drawn this session. Padded/clamped/DPR-scaled
   // into a capture rect at SUBMIT time (see submitWithRegion below) — there
@@ -142,14 +159,18 @@ export function QuickInvoke() {
   // checks this at the start of each frame.
   const renderActiveRef = useRef(true);
 
-  // Dragging the input bar itself. Store the grab position and the window's
-  // position at grab-time so subsequent move events can compute the delta and
-  // reposition the window without reading back (which would be async).
+  // Dragging the input bar itself. This window is a FULLSCREEN transparent HUD
+  // covering the whole monitor, so moving the *window* would just shift the
+  // whole overlay partly off-screen — pointless, and why the bar felt
+  // "undraggable". Instead we move the BAR within the window via a CSS offset
+  // (barOffset), applied on top of its centered resting position. dragRef holds
+  // the grab point plus the offset at grab-time so each move computes a delta.
+  const [barOffset, setBarOffset] = useState({ x: 0, y: 0 });
   const dragRef = useRef<{
     startX: number;
     startY: number;
-    windowX: number;
-    windowY: number;
+    offsetX: number;
+    offsetY: number;
   } | null>(null);
   // Guards against a second Enter (key repeat, or a stray keydown while the
   // first submit's awaits are still in flight) re-running the whole
@@ -175,6 +196,8 @@ export function QuickInvoke() {
     return () => {
       cancelDictation(dictationSessionRef.current);
       dictationSessionRef.current = null;
+      recognitionRef.current?.stop();
+      recognitionRef.current = null;
     };
   }, []);
 
@@ -224,6 +247,8 @@ export function QuickInvoke() {
     // already-stopped sessions.
     cancelDictation(dictationSessionRef.current);
     dictationSessionRef.current = null;
+    recognitionRef.current?.stop();
+    recognitionRef.current = null;
     setMicState("idle");
     setMicError(null);
     setDrawMode(false);
@@ -235,11 +260,11 @@ export function QuickInvoke() {
   useEffect(() => {
     function onMouseMove(e: MouseEvent): void {
       if (!dragRef.current) return;
+      // Move the bar within the fullscreen window (client-px delta added to the
+      // grab-time offset), not the window itself — see dragRef's doc comment.
       const deltaX = e.clientX - dragRef.current.startX;
       const deltaY = e.clientY - dragRef.current.startY;
-      const newX = dragRef.current.windowX + deltaX;
-      const newY = dragRef.current.windowY + deltaY;
-      void getCurrentWindow().setPosition(new LogicalPosition(newX, newY));
+      setBarOffset({ x: dragRef.current.offsetX + deltaX, y: dragRef.current.offsetY + deltaY });
     }
     function onMouseUp(): void {
       dragRef.current = null;
@@ -288,6 +313,13 @@ export function QuickInvoke() {
    *  disturbing over a failed mic click. */
   async function toggleDictation(): Promise<void> {
     if (micState === "transcribing") return; // ignore clicks/Ctrl+M mid-transcription
+
+    // "Browser speech" engine: stream words in real time via the Web Speech
+    // API instead of the record-then-transcribe whisper path.
+    if (readDictationEngineSetting() === "browser") {
+      toggleWebSpeechDictation();
+      return;
+    }
 
     if (micState === "recording") {
       await stopDictationAndInsert();
@@ -349,6 +381,59 @@ export function QuickInvoke() {
     } finally {
       setMicState("idle");
     }
+  }
+
+  /** "Browser speech" engine (see readDictationEngineSetting): streams interim
+   *  results into the input as the user speaks, appended to whatever's already
+   *  typed. Click/Ctrl+M again to stop; text stays in the box. No SpeechRecognition
+   *  on this platform → a one-line error and no-op (Whisper stays the default). */
+  function toggleWebSpeechDictation(): void {
+    if (micState === "recording") {
+      recognitionRef.current?.stop();
+      return; // state cleared in onend
+    }
+    setMicError(null);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const w = window as any;
+    const SR = w.SpeechRecognition ?? w.webkitSpeechRecognition;
+    if (!SR) {
+      setMicError("Real-time dictation isn't available here — set Dictation engine to Whisper in Settings.");
+      return;
+    }
+    const rec = new SR();
+    rec.continuous = true;
+    rec.interimResults = true;
+    const baseText = text.trim();
+    let finalChunk = "";
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    rec.onresult = (e: any) => {
+      let interim = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const r = e.results[i];
+        if (r.isFinal) finalChunk += r[0].transcript;
+        else interim += r[0].transcript;
+      }
+      const spoken = (finalChunk + interim).trim();
+      setText([baseText, spoken].filter(Boolean).join(" "));
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    rec.onerror = (e: any) => {
+      setMicState("idle");
+      if (e?.error === "not-allowed" || e?.error === "service-not-allowed") {
+        setMicError("Microphone access was denied for browser dictation.");
+      } else if (e?.error && e.error !== "aborted" && e.error !== "no-speech") {
+        setMicError(`Browser dictation error: ${e.error}`);
+      }
+    };
+    rec.onend = () => setMicState("idle");
+    try {
+      rec.start();
+    } catch {
+      setMicState("idle");
+      return;
+    }
+    recognitionRef.current = rec;
+    setMicState("recording");
   }
 
   // (An earlier `cancelDictationOnEscape` lived here, for an Escape ladder
@@ -428,6 +513,9 @@ export function QuickInvoke() {
         // and always opens ready to TYPE rather than ready to draw.
         clearStrokes();
         setDrawMode(false);
+        // Re-center the bar each time the overlay opens, so a spot the user
+        // dragged it to last time doesn't carry over to the next invocation.
+        setBarOffset({ x: 0, y: 0 });
         inputRef.current?.focus();
         // Resume the render loop (see below for pause logic).
         renderActiveRef.current = true;
@@ -810,7 +898,12 @@ export function QuickInvoke() {
       {/* Prompt bar — floats centered near the bottom so it never sits on
           top of whatever the user is circling higher up the screen. */}
       <div
-        className="absolute left-1/2 -translate-x-1/2 bottom-[14%] w-[620px] max-w-[90vw] z-10"
+        className="absolute left-1/2 bottom-[14%] w-[620px] max-w-[90vw] z-10"
+        // The horizontal -50% centering that used to be Tailwind's
+        // `-translate-x-1/2` is folded into this transform so the drag offset
+        // (barOffset) can be added to it — dragging the bar moves it within the
+        // fullscreen window rather than moving the window (see dragRef above).
+        style={{ transform: `translate(calc(-50% + ${barOffset.x}px), ${barOffset.y}px)` }}
         // See the "Drawing input" comment above: without this, a pointerdown
         // on the card itself would bubble up to the root's handler and start
         // an ink stroke underneath it.
@@ -835,23 +928,17 @@ export function QuickInvoke() {
             boxShadow: "0 8px 60px rgba(0,0,0,0.1), 0 2px 8px rgba(0,0,0,0.05)",
             cursor: dragRef.current ? "grabbing" : "grab",
           }}
-          onMouseDown={async (e) => {
+          onMouseDown={(e) => {
             // Only start a drag from the bar itself, not from buttons or the input.
             const target = e.target as HTMLElement;
             if (target.tagName === "BUTTON" || target.tagName === "INPUT") return;
             if (dragRef.current) return; // already dragging
-            const win = getCurrentWindow();
-            try {
-              const pos = await win.outerPosition();
-              dragRef.current = {
-                startX: e.clientX,
-                startY: e.clientY,
-                windowX: pos.x,
-                windowY: pos.y,
-              };
-            } catch {
-              // window position API unavailable in this context; dragging silently fails
-            }
+            dragRef.current = {
+              startX: e.clientX,
+              startY: e.clientY,
+              offsetX: barOffset.x,
+              offsetY: barOffset.y,
+            };
           }}
         >
           {/* Draw. onMouseDown preventDefault keeps the caret in the text

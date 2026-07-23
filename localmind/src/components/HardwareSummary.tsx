@@ -69,7 +69,7 @@ export function HardwareSummary() {
               <Zap className="size-3.5" />
               VRAM
               {vramOverride !== null && (
-                <span className="ml-auto text-[10px] text-amber-600 font-medium">override</span>
+                <span className="ml-auto text-[10px] text-warning font-medium">override</span>
               )}
             </div>
             {editingVram ? (
@@ -103,7 +103,7 @@ export function HardwareSummary() {
         <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
           {effectiveVram === 0 && (
             <>
-              <AlertCircle className="size-3.5 text-amber-500" />
+              <AlertCircle className="size-3.5 text-warning" />
               VRAM unknown — click the VRAM card to set it manually
             </>
           )}

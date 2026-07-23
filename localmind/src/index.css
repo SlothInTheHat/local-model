@@ -1,6 +1,11 @@
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
-@custom-variant dark (&:is(.dark *));
+/* Matches the data-theme attribute App.tsx stamps onto <html> from
+   store/settings.ts's theme toggle (see App.tsx's theme-effect hook) — not a
+   `.dark` class, so this is the single toggle mechanism for both Tailwind's
+   `dark:` variant utilities and the `:root[data-theme="dark"]` custom
+   property overrides used throughout this file. */
+@custom-variant dark (&:is([data-theme="dark"] *));
 
 @theme {
   --font-sans: 'DM Sans Variable', 'DM Sans', system-ui, sans-serif;
@@ -29,6 +34,16 @@
   --accent-foreground: #0A0A0A;
   --destructive: #d4183d;
   --destructive-foreground: #ffffff;
+  /* Semantic status colors — success/warning/info, alongside --destructive
+     above. Added so status chips (tool results, connection states, badges)
+     have a token to reach for instead of a raw Tailwind palette color with
+     no dark-mode counterpart (see the dark block below for those). */
+  --success: #16a34a;
+  --success-foreground: #ffffff;
+  --warning: #d97706;
+  --warning-foreground: #ffffff;
+  --info: #2563eb;
+  --info-foreground: #ffffff;
   --border: rgba(0, 0, 0, 0.07);
   --input: transparent;
   --input-background: #F5F3EE;
@@ -65,6 +80,12 @@
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-input-background: var(--input-background);
@@ -82,6 +103,57 @@
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-ring: var(--sidebar-ring);
+}
+
+/* ─── Dark theme ─────────────────────────────────────────────────────────────
+   Applied via `data-theme="dark"` on the document root, stamped by
+   store/settings.ts's theme setting (see App.tsx's theme-effect hook) —
+   previously this attribute was only ever read by the concept-graph's
+   category colors further down this file; the app-wide tokens below had no
+   dark counterpart at all, so toggling "Dark" in Settings visibly did
+   nothing. A warm dark palette (not a generic near-black one) to stay in the
+   spirit of the light "warm paper" palette above. `--primary` is a warm gold
+   accent rather than a near-white invert — a stark white primary button
+   read as "too bright"/glaring against the dark background in practice
+   (e.g. Models tab's "Use in Chat" button), even though a near-black
+   primary (the light theme's choice) would have vanished into it. */
+:root[data-theme="dark"] {
+  --background: #1c1a17;
+  --foreground: #f0ede7;
+  --card: #262320;
+  --card-foreground: #f0ede7;
+  --bubble: #2f2b27;
+  --popover: #262320;
+  --popover-foreground: #f0ede7;
+  --primary: #d9a954;
+  --primary-foreground: #1a1410;
+  --secondary: #34302b;
+  --secondary-foreground: #f0ede7;
+  --muted: #2a2622;
+  --muted-foreground: #a39c92;
+  --accent: #3a3530;
+  --accent-foreground: #f0ede7;
+  --destructive: #f04458;
+  --destructive-foreground: #ffffff;
+  --success: #22c55e;
+  --success-foreground: #ffffff;
+  --warning: #f59e0b;
+  --warning-foreground: #0a0a0a;
+  --info: #3b82f6;
+  --info-foreground: #ffffff;
+  --border: rgba(255, 255, 255, 0.08);
+  --input: transparent;
+  --input-background: #29251f;
+  --switch-background: #4a4640;
+  --ring: oklch(0.708 0 0);
+  --sidebar: #201d19;
+  --sidebar-foreground: #f0ede7;
+  --sidebar-primary: #d9a954;
+  --sidebar-primary-foreground: #1a1410;
+  --sidebar-accent: #3a3530;
+  --sidebar-accent-foreground: #f0ede7;
+  --sidebar-border: rgba(255, 255, 255, 0.08);
+  --sidebar-ring: oklch(0.708 0 0);
 }
 
 @layer base {
@@ -174,4 +246,71 @@
 
 .km-citation:hover {
   text-decoration: underline;
+}
+
+/* ─── KM4b concept-graph cluster coloring (ConceptGraph.tsx) ────────────────
+   detectCommunities() (graphLayout.ts) groups related concepts via label
+   propagation; ConceptGraph.tsx ranks the resulting communities by size and
+   assigns the top 8 (largest first) to these fixed slots IN ORDER — never
+   cycled/reused past 8. Every community past the 8th, and every trivial
+   size-1 singleton (even if it happens to rank in the top 8 by a fluke of
+   there being few communities at all), falls back to the app's existing
+   --muted-foreground token instead of one of these ("Other"). This is the
+   validated (colorblind-checked) categorical palette from this work's spec,
+   with light values here and dark-mode-appropriate steps below — provided
+   under both a `prefers-color-scheme` media query and this app's own
+   `data-theme` attribute scope, since store/settings.ts already models a
+   light/dark toggle even though nothing currently stamps `data-theme` onto
+   the document (see that store) — this CSS is ready for whichever the app
+   wires up first, and prefers-color-scheme covers OS-level dark mode today.
+   Node/edge colors (fill/stroke) reference these via `var(--kb-cat-N)`
+   exactly like the app's other theme tokens (e.g. `var(--border)` on edges)
+   — label TEXT is never colored by cluster, it stays var(--foreground)
+   (ink), same as every other label in the app. */
+:root {
+  --kb-cat-1: #2a78d6; /* blue */
+  --kb-cat-2: #eb6834; /* orange */
+  --kb-cat-3: #1baf7a; /* aqua */
+  --kb-cat-4: #eda100; /* yellow */
+  --kb-cat-5: #e87ba4; /* magenta */
+  --kb-cat-6: #008300; /* green */
+  --kb-cat-7: #4a3aa7; /* violet */
+  --kb-cat-8: #e34948; /* red */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --kb-cat-1: #3987e5;
+    --kb-cat-2: #d95926;
+    --kb-cat-3: #199e70;
+    --kb-cat-4: #c98500;
+    --kb-cat-5: #d55181;
+    --kb-cat-6: #008300;
+    --kb-cat-7: #9085e9;
+    --kb-cat-8: #e66767;
+  }
+}
+
+:root[data-theme="dark"] {
+  --kb-cat-1: #3987e5;
+  --kb-cat-2: #d95926;
+  --kb-cat-3: #199e70;
+  --kb-cat-4: #c98500;
+  --kb-cat-5: #d55181;
+  --kb-cat-6: #008300;
+  --kb-cat-7: #9085e9;
+  --kb-cat-8: #e66767;
+}
+
+/* Explicit light override so a `data-theme="light"` attribute always wins
+   over an OS-level dark preference (see the shared pattern note above). */
+:root[data-theme="light"] {
+  --kb-cat-1: #2a78d6;
+  --kb-cat-2: #eb6834;
+  --kb-cat-3: #1baf7a;
+  --kb-cat-4: #eda100;
+  --kb-cat-5: #e87ba4;
+  --kb-cat-6: #008300;
+  --kb-cat-7: #4a3aa7;
+  --kb-cat-8: #e34948;
 }

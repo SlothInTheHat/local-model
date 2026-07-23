@@ -113,6 +113,22 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             chunk_refs TEXT,
             created_at INTEGER
         );
+
+        -- KM4c: plain-English, textbook-page-style summary of a concept node
+        -- and how it connects to its neighbors, generated on demand (or eagerly
+        -- for high-degree nodes right after a graph build) by the same local
+        -- `digest` model role used for extraction. Deliberately a SEPARATE
+        -- table from kb_nodes rather than a column on it: kb_replace_graph
+        -- (below) does a wholesale DELETE+INSERT of kb_nodes on every rebuild,
+        -- which would silently wipe a `summary` column every time the concept
+        -- map is rebuilt. node_id is deterministic per collection+concept name
+        -- (see graph.ts), so a summary here survives a rebuild as long as the
+        -- concept's normalized name is unchanged.
+        CREATE TABLE IF NOT EXISTS kb_node_summaries (
+            node_id TEXT PRIMARY KEY,
+            summary TEXT,
+            generated_at INTEGER
+        );
         ",
     )
     .map_err(|e| format!("Schema init failed: {e}"))?;
@@ -422,6 +438,13 @@ pub fn collection_delete(app: tauri::AppHandle, id: String) -> Result<(), String
     let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
     conn.execute("DELETE FROM memories WHERE collection = ?1", params![id])
         .map_err(|e| e.to_string())?;
+    // Must run before the kb_nodes delete below — it's a subquery against
+    // kb_nodes.collection, which would find nothing once those rows are gone.
+    conn.execute(
+        "DELETE FROM kb_node_summaries WHERE node_id IN (SELECT id FROM kb_nodes WHERE collection = ?1)",
+        params![id],
+    )
+    .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM kb_nodes WHERE collection = ?1", params![id])
         .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM kb_edges WHERE collection = ?1", params![id])
@@ -638,11 +661,73 @@ pub fn kb_get_graph(app: tauri::AppHandle, collection: String) -> Result<KbGraph
 pub fn kb_delete_graph(app: tauri::AppHandle, collection: String) -> Result<(), String> {
     let db = get_db(&app)?;
     let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
+    // Must run before the kb_nodes delete below — it's a subquery against
+    // kb_nodes.collection, which would find nothing once those rows are gone.
+    conn.execute(
+        "DELETE FROM kb_node_summaries WHERE node_id IN (SELECT id FROM kb_nodes WHERE collection = ?1)",
+        params![collection],
+    )
+    .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM kb_nodes WHERE collection = ?1", params![collection])
         .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM kb_edges WHERE collection = ?1", params![collection])
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[derive(Serialize)]
+pub struct KbNodeSummaryRow {
+    pub node_id: String,
+    pub summary: String,
+    pub generated_at: i64,
+}
+
+/// Upsert the generated plain-English summary for one concept node (KM4c).
+/// Idempotent by design — the caller is expected to check kb_get_node_summaries
+/// first and skip generation entirely if a summary already exists, so this is
+/// only ever called once per node in practice, but INSERT OR REPLACE here too
+/// as a defensive backstop against a caller (or a future retry path) calling
+/// it twice.
+#[tauri::command]
+pub fn kb_set_node_summary(app: tauri::AppHandle, node_id: String, summary: String) -> Result<(), String> {
+    let db = get_db(&app)?;
+    let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO kb_node_summaries (node_id, summary, generated_at) VALUES (?1, ?2, ?3)",
+        params![node_id, summary, now_ms()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Fetch every generated summary for nodes belonging to `collection` — joined
+/// against kb_nodes rather than taking an explicit node-id list, so the
+/// frontend can hydrate its whole per-collection cache in one round trip
+/// when the concept graph view mounts.
+#[tauri::command]
+pub fn kb_get_node_summaries(app: tauri::AppHandle, collection: String) -> Result<Vec<KbNodeSummaryRow>, String> {
+    let db = get_db(&app)?;
+    let conn = db.lock().map_err(|_| "db lock poisoned".to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.node_id, s.summary, s.generated_at FROM kb_node_summaries s \
+             JOIN kb_nodes n ON n.id = s.node_id WHERE n.collection = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![collection], |row| {
+            Ok(KbNodeSummaryRow {
+                node_id: row.get(0)?,
+                summary: row.get(1)?,
+                generated_at: row.get(2)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
 }
 
 /// Delete a memory by id. Not an error if the id doesn't exist.

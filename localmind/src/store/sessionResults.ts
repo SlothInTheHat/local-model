@@ -28,6 +28,9 @@ export interface SessionResult {
   steps: string[];
   roundsUsed: number;
   hadSideEffects: boolean;
+  /** The Workflow.id (src/store/workflows.ts) this run belongs to, if any — lets the
+   *  Workflows dashboard filter run history per workflow. Absent for every other origin. */
+  workflowId?: string;
 }
 
 interface SessionResultsState {

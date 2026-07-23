@@ -1,4 +1,4 @@
-import { FolderOpen, Calculator, Globe, Pencil, List, Search, FileSearch, TerminalSquare, Info, Trash2, GitBranch, Plug, BookMarked, Sparkles, LayoutGrid, Send } from "lucide-react";
+import { FolderOpen, Calculator, Globe, Pencil, List, Search, FileSearch, TerminalSquare, Info, Trash2, GitBranch, Plug, BookMarked, Sparkles, LayoutGrid, Send, ListTodo, FilePenLine } from "lucide-react";
 import { Button } from "./ui/button";
 import { Card, CardContent } from "./ui/card";
 import { cn } from "./ui/utils";
@@ -10,16 +10,19 @@ interface Props {
   onDeny: () => void;
 }
 
-function ToolIcon({ name, className }: { name: string; className?: string }) {
+export function ToolIcon({ name, className }: { name: string; className?: string }) {
   const cls = cn("size-4 shrink-0", className);
   if (name.includes("__")) return <Plug className={cls} />;
   switch (name) {
     case "read_file": return <FolderOpen className={cls} />;
     case "write_file": return <Pencil className={cls} />;
+    case "patch_file":
+    case "apply_patch": return <FilePenLine className={cls} />;
     case "delete_file": return <Trash2 className={cls} />;
     case "list_directory": return <List className={cls} />;
     case "grep_files": return <Search className={cls} />;
     case "find_files": return <FileSearch className={cls} />;
+    case "todo_write": return <ListTodo className={cls} />;
     case "calculator": return <Calculator className={cls} />;
     case "web_search": return <Globe className={cls} />;
     case "run_command": return <TerminalSquare className={cls} />;
@@ -67,11 +70,11 @@ export function ToolCallCard({ call, onApprove, onDeny }: Props) {
   const label = TOOL_LABELS[call.name] ?? call.name.replace(/__/g, " › ");
 
   return (
-    <Card className="border-amber-200 bg-amber-50/50">
+    <Card className="border-warning/30 bg-warning/5">
       <CardContent className="p-3 space-y-2">
         <div className="flex items-center gap-2">
-          <div className="size-6 rounded bg-amber-100 flex items-center justify-center shrink-0">
-            <ToolIcon name={call.name} className="size-3.5 text-amber-700" />
+          <div className="size-6 rounded bg-warning/15 flex items-center justify-center shrink-0">
+            <ToolIcon name={call.name} className="size-3.5 text-warning" />
           </div>
           <span className="text-sm font-medium text-foreground">{label}</span>
           <span className="text-xs text-muted-foreground font-mono ml-auto truncate max-w-[120px]">
@@ -84,7 +87,7 @@ export function ToolCallCard({ call, onApprove, onDeny }: Props) {
         </pre>
 
         <div className="flex gap-2">
-          <Button size="sm" className="flex-1 bg-green-600 hover:bg-green-700 text-white" onClick={onApprove}>
+          <Button size="sm" className="flex-1 bg-success hover:bg-success/90 text-success-foreground" onClick={onApprove}>
             Approve
           </Button>
           <Button size="sm" variant="outline" className="flex-1 border-destructive text-destructive hover:bg-destructive/10" onClick={onDeny}>

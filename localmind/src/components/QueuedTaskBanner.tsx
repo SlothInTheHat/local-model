@@ -13,11 +13,11 @@ interface Props {
 }
 
 const STATUS_CARD_CLASS: Record<QueuedTask["status"], string> = {
-  pending: "border-blue-200 bg-blue-50/50",
-  in_progress: "border-blue-200 bg-blue-50/50",
-  running: "border-amber-200 bg-amber-50/50",
-  done: "border-green-200 bg-green-50/50",
-  error: "border-red-200 bg-red-50/50",
+  pending: "border-info/30 bg-info/5",
+  in_progress: "border-info/30 bg-info/5",
+  running: "border-warning/30 bg-warning/5",
+  done: "border-success/30 bg-success/5",
+  error: "border-destructive/30 bg-destructive/5",
 };
 
 const STATUS_LABEL: Record<QueuedTask["status"], string> = {
@@ -30,11 +30,11 @@ const STATUS_LABEL: Record<QueuedTask["status"], string> = {
 
 function StatusIcon({ status }: { status: QueuedTask["status"] }) {
   if (status === "running" || status === "in_progress") {
-    return <Loader2 className="size-4 shrink-0 text-amber-600 animate-spin" />;
+    return <Loader2 className="size-4 shrink-0 text-warning animate-spin" />;
   }
-  if (status === "done") return <CheckCircle2 className="size-4 shrink-0 text-green-600" />;
-  if (status === "error") return <AlertCircle className="size-4 shrink-0 text-red-600" />;
-  return <Inbox className="size-4 shrink-0 text-blue-600" />;
+  if (status === "done") return <CheckCircle2 className="size-4 shrink-0 text-success" />;
+  if (status === "error") return <AlertCircle className="size-4 shrink-0 text-destructive" />;
+  return <Inbox className="size-4 shrink-0 text-info" />;
 }
 
 export function QueuedTaskBanner({ view, onStart }: Props) {

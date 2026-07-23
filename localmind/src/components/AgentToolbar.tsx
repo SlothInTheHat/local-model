@@ -120,7 +120,7 @@ export function AgentToolbar({ enabled, onToggle, dirHandle, onOpenDir }: Props)
                 {mcpServers.map((srv) => (
                   <span
                     key={srv.id}
-                    className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-violet-100 text-violet-700 border border-violet-200"
+                    className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-violet-100 text-violet-700 border border-violet-200 dark:bg-violet-950 dark:text-violet-300 dark:border-violet-800"
                     title={`${srv.tools.length} tools from ${srv.label}`}
                   >
                     <Plug className="size-3" />

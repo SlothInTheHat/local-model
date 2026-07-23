@@ -7,7 +7,7 @@ import {
 import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
-import { streamChat } from "../lib/ollama";
+import { streamChatForModel } from "../lib/chatProvider";
 import type { ChatMessage } from "../lib/ollama";
 import { isVisionModel } from "../lib/modelCapabilities";
 
@@ -379,7 +379,7 @@ export function ImageEditor({ selectedModel }: Props) {
         ...aiMessages.map((m) => ({ role: m.role, content: m.content }) as ChatMessage),
         { role: "user", content: prompt, ...(b64 ? { images: [b64] } : {}) } as ChatMessage,
       ];
-      for await (const chunk of streamChat(selectedModel, history, abortRef.current.signal)) {
+      for await (const chunk of streamChatForModel(selectedModel, history, abortRef.current.signal)) {
         setAiMessages((prev) => {
           const msgs = [...prev];
           const last = msgs[msgs.length - 1];
@@ -499,7 +499,7 @@ export function ImageEditor({ selectedModel }: Props) {
               </Button>
             </div>
             <Button size="sm" variant="outline"
-              className="w-full text-xs h-7 gap-1 text-red-600 border-red-200 hover:bg-red-50"
+              className="w-full text-xs h-7 gap-1 text-destructive border-destructive/30 hover:bg-destructive/10"
               onClick={clearDrawing} disabled={!hasImage}>
               <Trash2 className="size-3" /> Clear drawing
             </Button>
@@ -585,8 +585,8 @@ export function ImageEditor({ selectedModel }: Props) {
           <span>AI Assistant</span>
           {selectedModel && (
             isVisionModel(selectedModel)
-              ? <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-100 text-green-700 border border-green-200">vision on</span>
-              : <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-200">no vision</span>
+              ? <span className="text-[10px] px-1.5 py-0.5 rounded bg-success/15 text-success border border-success/30">vision on</span>
+              : <span className="text-[10px] px-1.5 py-0.5 rounded bg-warning/15 text-warning border border-warning/30">no vision</span>
           )}
         </div>
 
@@ -653,7 +653,7 @@ export function ImageEditor({ selectedModel }: Props) {
           <div className="flex items-center justify-between">
             <p className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">Generate</p>
             <span className={`text-[10px] px-1.5 py-0.5 rounded border ${
-              sdOnline === true ? "bg-green-50 text-green-700 border-green-200" : "bg-muted text-muted-foreground border-border"
+              sdOnline === true ? "bg-success/10 text-success border-success/30" : "bg-muted text-muted-foreground border-border"
             }`}>
               {sdOnline === true ? "SD online" : sdOnline === false ? "SD offline" : "…"}
             </span>

@@ -44,6 +44,11 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 tiny_http = "0.12"
 getrandom = "0.2"
 
+# Shadow git version control (coding-agent overhaul, workstream 4): vendors
+# its own libgit2 build (bundled feature), so no external git binary is
+# required — consistent with rusqlite's bundled sqlite above.
+git2 = { version = "0.19", features = ["vendored-libgit2"] }
+
 # Window control + screen capture (WP5.2b) are Windows-only; other targets
 # compile without this crate and return a runtime "unsupported" Err instead.
 [target.'cfg(windows)'.dependencies]

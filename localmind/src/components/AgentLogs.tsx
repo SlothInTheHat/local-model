@@ -6,6 +6,7 @@ import { getAllSessions, deleteSession, formatSessionForAnalysis } from "../lib/
 import type { AgentSession, LoggedEvent } from "../lib/agentLogger";
 import { useSessionResultsStore } from "../store/sessionResults";
 import type { SessionResult } from "../store/sessionResults";
+import { useAppViewStore } from "../store/appView";
 
 function relativeTime(ts: number): string {
   const diff = Date.now() - ts;
@@ -18,15 +19,17 @@ function relativeTime(ts: number): string {
   return "just now";
 }
 
+// Categorical per-tool-type coloring (not a status), so these stay literal
+// palette colors with dark: pairings rather than the semantic status tokens.
 function toolColor(name: string): string {
-  if (name === "read_file") return "text-blue-600";
-  if (name === "write_file") return "text-green-600";
-  if (name === "delete_file") return "text-red-600";
-  if (name === "list_directory") return "text-slate-500";
-  if (name === "grep_files" || name === "find_files") return "text-indigo-600";
-  if (name === "web_search") return "text-violet-600";
-  if (name === "run_command") return "text-orange-600";
-  if (name?.startsWith("git_")) return "text-yellow-600";
+  if (name === "read_file") return "text-blue-600 dark:text-blue-400";
+  if (name === "write_file") return "text-green-600 dark:text-green-400";
+  if (name === "delete_file") return "text-red-600 dark:text-red-400";
+  if (name === "list_directory") return "text-slate-500 dark:text-slate-400";
+  if (name === "grep_files" || name === "find_files") return "text-indigo-600 dark:text-indigo-400";
+  if (name === "web_search") return "text-violet-600 dark:text-violet-400";
+  if (name === "run_command") return "text-orange-600 dark:text-orange-400";
+  if (name?.startsWith("git_")) return "text-yellow-600 dark:text-yellow-400";
   return "text-muted-foreground";
 }
 
@@ -55,7 +58,7 @@ function EventLine({ ev }: { ev: LoggedEvent }) {
   if (d.type === "tool_result") {
     if (d.error) {
       return (
-        <div className="text-[10px] font-mono text-red-500 pl-3">
+        <div className="text-[10px] font-mono text-destructive pl-3">
           ✗ error: {d.error} [{d.durationMs}ms]
         </div>
       );
@@ -116,12 +119,12 @@ function SessionRow({ session, onDelete }: { session: AgentSession; onDelete: ()
             <span className="text-[10px] text-muted-foreground">{dur}</span>
             <span className="text-[10px] text-muted-foreground">{toolCallCount} tool{toolCallCount !== 1 ? "s" : ""}</span>
             {errorCount > 0 && (
-              <span className="text-[10px] text-red-500">{errorCount} error{errorCount !== 1 ? "s" : ""}</span>
+              <span className="text-[10px] text-destructive">{errorCount} error{errorCount !== 1 ? "s" : ""}</span>
             )}
             {session.workspace && (
               <span className="text-[10px] text-muted-foreground">📁 {session.workspace}</span>
             )}
-            <span className={`text-[10px] font-medium ${session.completed ? "text-green-600" : "text-amber-500"}`}>
+            <span className={`text-[10px] font-medium ${session.completed ? "text-success" : "text-warning"}`}>
               {session.completed ? "✓ done" : "◌ incomplete"}
             </span>
           </div>
@@ -158,10 +161,10 @@ function SessionRow({ session, onDelete }: { session: AgentSession; onDelete: ()
 
 function outcomeBadge(outcome: SessionResult["outcome"]): { label: string; className: string } {
   switch (outcome) {
-    case "completed": return { label: "✓ done", className: "text-green-600" };
-    case "error": return { label: "✗ failed", className: "text-red-500" };
+    case "completed": return { label: "✓ done", className: "text-success" };
+    case "error": return { label: "✗ failed", className: "text-destructive" };
     case "aborted": return { label: "aborted", className: "text-muted-foreground" };
-    case "hit_round_limit": return { label: "round limit", className: "text-amber-500" };
+    case "hit_round_limit": return { label: "round limit", className: "text-warning" };
   }
 }
 
@@ -221,6 +224,7 @@ function UnattendedRunRow({ result }: { result: SessionResult }) {
 
 function UnattendedRunsSection() {
   const { results, clear } = useSessionResultsStore();
+  const setView = useAppViewStore((s) => s.setView);
   const sorted = [...results].sort((a, b) => b.startedAt - a.startedAt);
 
   return (
@@ -229,6 +233,13 @@ function UnattendedRunsSection() {
         <Clock className="size-3.5 text-muted-foreground" />
         <h3 className="text-xs font-medium">Unattended runs</h3>
         <span className="text-[10px] text-muted-foreground">{sorted.length} (scheduler / task queue / subagents)</span>
+        <button
+          type="button"
+          onClick={() => setView("agents")}
+          className="text-[10px] text-muted-foreground hover:text-foreground underline-offset-2 hover:underline transition-colors"
+        >
+          Spawn a subagent →
+        </button>
         {sorted.length > 0 && (
           <Button size="sm" variant="outline" className="ml-auto h-6 text-[10px] text-destructive hover:bg-destructive/10" onClick={clear}>
             Clear

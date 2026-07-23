@@ -210,10 +210,10 @@ export function MemoryView() {
                         ))}
                         <span className="text-[10px] text-muted-foreground">{relativeTime(entry.createdAt)}</span>
                         {entry.source === "agent" && (
-                          <span className="text-[10px] px-1 py-0.5 rounded bg-blue-50 text-blue-600 border border-blue-100">agent</span>
+                          <span className="text-[10px] px-1 py-0.5 rounded bg-info/10 text-info border border-info/20">agent</span>
                         )}
                         {result && (
-                          <span className="text-[10px] text-green-600">
+                          <span className="text-[10px] text-success">
                             {Math.round(result.score * 100)}% match
                           </span>
                         )}

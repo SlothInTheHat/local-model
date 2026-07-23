@@ -57,6 +57,7 @@ export function ChatInput({
   const recognitionRef = useRef<{ stop: () => void } | null>(null);
   const dictationSessionRef = useRef<DictationSession | null>(null);
   const whisperModel = useSettingsStore((s) => s.whisperModel);
+  const dictationEngine = useSettingsStore((s) => s.dictationEngine);
 
   // If this component unmounts mid-recording (e.g. the user navigates away),
   // make sure the mic is released rather than left hot with no UI left to
@@ -65,6 +66,8 @@ export function ChatInput({
     return () => {
       cancelDictation(dictationSessionRef.current);
       dictationSessionRef.current = null;
+      recognitionRef.current?.stop();
+      recognitionRef.current = null;
     };
   }, []);
 
@@ -145,39 +148,70 @@ export function ChatInput({
     }
   }
 
-  /** Browser dev-mode fallback: unchanged Web Speech API behavior (cloud-based,
-   * auto-sends on result). Only used when NOT running inside Tauri. */
+  /** Web Speech API path — the "Browser speech" dictation engine (and the
+   *  non-Tauri browser-dev default). Unlike the whisper path, this streams
+   *  interim results in real time, so we insert them straight into the composer
+   *  as the user speaks (rather than auto-sending) — the same read-then-edit
+   *  contract as whisper, just live. Click again to stop; the text stays in the
+   *  box. Falls back with a toast if the platform exposes no SpeechRecognition. */
   function toggleWebSpeechMic() {
     if (micState === "recording") {
       recognitionRef.current?.stop();
-      setMicState("idle");
+      // state is cleared in onend below
       return;
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const win = window as any;
-    const SR: (new () => { continuous: boolean; interimResults: boolean; onresult: ((e: any) => void) | null; onerror: (() => void) | null; onend: (() => void) | null; start: () => void; stop: () => void }) | undefined
+    const SR: (new () => { continuous: boolean; interimResults: boolean; onresult: ((e: any) => void) | null; onerror: ((e: any) => void) | null; onend: (() => void) | null; start: () => void; stop: () => void }) | undefined
       = win.SpeechRecognition ?? win.webkitSpeechRecognition;
-    if (!SR) return;
+    if (!SR) {
+      toast.error("Real-time browser dictation isn't available in this build — set Dictation engine to Whisper in Settings.");
+      return;
+    }
     const rec = new SR();
-    rec.continuous = false;
-    rec.interimResults = false;
+    rec.continuous = true;
+    rec.interimResults = true;
+    // Snapshot whatever's already typed so streamed words append to it rather
+    // than clobber it. finalChunk accumulates across onresult events; interim
+    // is the still-changing tail, replaced each event.
+    const baseText = text.trim();
+    let finalChunk = "";
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     rec.onresult = (e: any) => {
-      const transcript = String(e.results[0][0].transcript).trim();
+      let interim = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const r = e.results[i];
+        if (r.isFinal) finalChunk += r[0].transcript;
+        else interim += r[0].transcript;
+      }
+      const spoken = (finalChunk + interim).trim();
+      setText([baseText, spoken].filter(Boolean).join(" "));
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    rec.onerror = (e: any) => {
       setMicState("idle");
-      if (transcript && !isStreaming && !isSearching && !disabled) {
-        onSend(transcript);
+      if (e?.error === "not-allowed" || e?.error === "service-not-allowed") {
+        toast.error("Microphone access was denied for browser dictation. Grant mic permission and try again.");
+      } else if (e?.error && e.error !== "aborted" && e.error !== "no-speech") {
+        toast.error(`Browser dictation error: ${e.error}`);
       }
     };
-    rec.onerror = () => setMicState("idle");
     rec.onend = () => setMicState("idle");
-    rec.start();
+    try {
+      rec.start();
+    } catch {
+      setMicState("idle");
+      return;
+    }
     recognitionRef.current = rec;
     setMicState("recording");
   }
 
   function toggleMic() {
-    if (isTauriEnv()) {
+    // "Browser speech" engine uses Web Speech even inside Tauri; otherwise the
+    // Tauri build uses local whisper. Plain browser dev has no whisper backend,
+    // so it always uses Web Speech regardless of the setting.
+    if (isTauriEnv() && dictationEngine === "whisper") {
       void toggleTauriDictation();
     } else {
       toggleWebSpeechMic();

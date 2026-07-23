@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { listen, emit } from "@tauri-apps/api/event";
-import { getCurrentWindow, LogicalPosition } from "@tauri-apps/api/window";
+import { getCurrentWindow, PhysicalPosition } from "@tauri-apps/api/window";
 import { Markdown } from "../components/Markdown";
 
 // NOTE: no `cn()` import, despite it being the house style — every className
@@ -119,11 +119,19 @@ export function ResultWidget() {
   useEffect(() => {
     function onMouseMove(e: MouseEvent): void {
       if (!dragRef.current) return;
-      const deltaX = e.clientX - dragRef.current.startX;
-      const deltaY = e.clientY - dragRef.current.startY;
-      const newX = dragRef.current.windowX + deltaX;
-      const newY = dragRef.current.windowY + deltaY;
-      void getCurrentWindow().setPosition(new LogicalPosition(newX, newY));
+      // `windowX/Y` come from `outerPosition()`, which is PHYSICAL pixels, but
+      // mouse `clientX/Y` deltas are CSS (logical) pixels — so the delta must
+      // be scaled by devicePixelRatio and the result set as a PhysicalPosition.
+      // Mixing the two (the previous `new LogicalPosition(physicalOrigin + logicalDelta)`)
+      // made the window jump instead of track the cursor on any display that
+      // isn't at 100% scale — which is exactly the "undraggable" symptom on a
+      // 125%/150%-scaled Windows monitor.
+      const dpr = window.devicePixelRatio || 1;
+      const deltaX = (e.clientX - dragRef.current.startX) * dpr;
+      const deltaY = (e.clientY - dragRef.current.startY) * dpr;
+      const newX = Math.round(dragRef.current.windowX + deltaX);
+      const newY = Math.round(dragRef.current.windowY + deltaY);
+      void getCurrentWindow().setPosition(new PhysicalPosition(newX, newY));
     }
     function onMouseUp(): void {
       dragRef.current = null;

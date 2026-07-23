@@ -115,7 +115,7 @@ export function WorkspaceSelector() {
         )}
 
         {!workspacePath && (
-          <p className="text-[10px] text-amber-600">
+          <p className="text-[10px] text-warning">
             Browser mode — terminal sandbox inactive
           </p>
         )}

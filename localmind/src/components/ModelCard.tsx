@@ -113,7 +113,7 @@ export function ModelCard({ spec, compat, isInstalled, pull, onInstall, onDelete
             </Button>
           ) : isInstalled ? (
             <div className="flex items-center gap-2 w-full">
-              <div className="flex items-center gap-1 text-xs text-green-600">
+              <div className="flex items-center gap-1 text-xs text-success">
                 <CheckCircle className="size-3" />
                 Installed
               </div>

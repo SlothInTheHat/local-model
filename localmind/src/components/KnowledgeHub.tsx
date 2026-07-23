@@ -25,6 +25,7 @@ import { openSourceFile } from "../lib/openFile";
 import type { MemoryEntry } from "../store/memory";
 import type { IngestProgress } from "../lib/knowledge/types";
 import type { ChunkRef, GraphProgress, KbEdge, KbNode } from "../lib/knowledge/graph";
+import { pregenerateHighValueSummaries } from "../lib/knowledge/graph";
 
 type SearchResult = { entry: MemoryEntry; score: number; rawScore: number };
 
@@ -248,6 +249,13 @@ export function KnowledgeHub() {
         toast(`Build cancelled — kept ${result.nodes} concepts, ${result.edges} relations extracted so far`);
       } else {
         toast.success(`Concept map built — ${result.nodes} concepts, ${result.edges} relations`);
+      }
+      // KM4c: best-effort, not awaited — pre-generate plain-English summaries
+      // for the most-connected nodes in the background while the user looks
+      // at the freshly-built graph. Never blocks the "build done" toast above.
+      if (!controller.signal.aborted) {
+        const { nodes, edges } = await getGraph(selectedId);
+        void pregenerateHighValueSummaries(selectedId, nodes, edges);
       }
     } catch (err) {
       toast.error(`Could not build concept map: ${(err as Error).message}`);
@@ -509,6 +517,7 @@ export function KnowledgeHub() {
           ) : (
             <ConceptMapPanel
               collectionId={selected.id}
+              collectionLabel={selected.label}
               nodes={kbNodes}
               edges={kbEdges}
               loading={kbLoading}
@@ -538,6 +547,7 @@ export function KnowledgeHub() {
 
 interface ConceptMapPanelProps {
   collectionId: string;
+  collectionLabel: string;
   nodes: KbNode[];
   edges: KbEdge[];
   loading: boolean;
@@ -556,7 +566,7 @@ interface ConceptMapPanelProps {
 const COLLAPSED_CITATION_LIMIT = 3;
 
 function ConceptMapPanel({
-  collectionId, nodes, edges, loading, building, progress,
+  collectionId, collectionLabel, nodes, edges, loading, building, progress,
   expandedNodeId, onToggleExpand, onBuild, onCancel, view, onViewChange,
 }: ConceptMapPanelProps) {
   const nodeById = new Map(nodes.map((n) => [n.id, n]));
@@ -615,7 +625,7 @@ function ConceptMapPanel({
 
           {view === "graph" ? (
             <div className="flex-1 min-h-0">
-              <ConceptGraph collectionId={collectionId} nodes={nodes} edges={edges} />
+              <ConceptGraph collectionId={collectionId} collectionLabel={collectionLabel} nodes={nodes} edges={edges} />
             </div>
           ) : (
           <div className="flex-1 min-h-0 overflow-y-auto space-y-1.5">

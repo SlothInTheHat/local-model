@@ -7,6 +7,8 @@ import { useSettingsStore } from "../store/settings";
 import { useSessionResultsStore } from "../store/sessionResults";
 import type { SessionResult } from "../store/sessionResults";
 import { runHeadlessTask } from "./headlessRunner";
+import { runWorkflow } from "./workflowRunner";
+import { useWorkflowStore } from "../store/workflows";
 import { notifyOs } from "./osNotify";
 import { isGenerationBusy } from "./generationGate";
 
@@ -33,6 +35,11 @@ import { isGenerationBusy } from "./generationGate";
 export interface JobSpec {
   task: string;
   schedule: string;
+  /** Workflow.id (src/store/workflows.ts), when this job was created by
+   *  save_workflow rather than the raw schedule_task tool. When present,
+   *  handleJobDue runs the live workflow (its own tool allowlist/MCP opt-ins/
+   *  output file) instead of the raw task text below. */
+  workflowId?: string;
 }
 
 /** Row shape emitted by the Rust `job-due` event (mirrors db::JobRow). */
@@ -81,17 +88,21 @@ export const SAFE_SCHED_ALLOWLIST: string[] = [
 ];
 
 /** Build the opaque `spec` JSON string stored in the jobs table. */
-export function buildJobSpec(task: string, schedule: string): string {
-  const spec: JobSpec = { task, schedule };
+export function buildJobSpec(task: string, schedule: string, workflowId?: string): string {
+  const spec: JobSpec = workflowId ? { task, schedule, workflowId } : { task, schedule };
   return JSON.stringify(spec);
 }
 
-/** Parse a job's `spec` JSON string back into { task, schedule }. Returns null on malformed JSON. */
+/** Parse a job's `spec` JSON string back into { task, schedule, workflowId? }. Returns null on malformed JSON. */
 export function parseJobSpec(spec: string): JobSpec | null {
   try {
     const parsed = JSON.parse(spec) as Partial<JobSpec>;
     if (typeof parsed.task !== "string" || typeof parsed.schedule !== "string") return null;
-    return { task: parsed.task, schedule: parsed.schedule };
+    return {
+      task: parsed.task,
+      schedule: parsed.schedule,
+      ...(typeof parsed.workflowId === "string" ? { workflowId: parsed.workflowId } : {}),
+    };
   } catch {
     return null;
   }
@@ -234,23 +245,42 @@ async function handleJobDue(job: JobDuePayload): Promise<void> {
 
   const label = jobLabel(parsed.task);
   try {
+    // Jobs created by save_workflow (src/lib/tools.ts) carry a workflowId —
+    // route those through runWorkflow so the run gets that workflow's own
+    // tool allowlist, opted-in MCP servers, and output-file dedup
+    // instructions, instead of the bare SAFE_SCHED_ALLOWLIST path below. A
+    // workflowId present but no longer resolving to a workflow (deleted
+    // without its job row being cleaned up) falls back to the raw path, with
+    // the summary tagged so it reads as "orphaned job", not a normal-but-poor
+    // run, in the Logs tab.
+    const workflow = parsed.workflowId
+      ? useWorkflowStore.getState().workflows.find((w) => w.id === parsed.workflowId)
+      : undefined;
+    if (parsed.workflowId && !workflow) {
+      console.error(`[scheduler] job ${job.id} references missing workflow ${parsed.workflowId} — falling back to raw task text`);
+    }
+
     const modelRef = useModelSelectionStore.getState().selectedModel;
     const hardware = useModelStore.getState().hardware;
     const numCtxOverride = useSettingsStore.getState().numCtxOverride;
 
     const runOnce = () =>
-      runHeadlessTask({
-        workspacePath,
-        modelRef,
-        task: parsed.task,
-        hardware,
-        numCtxOverride,
-        currentView: "chat",
-        origin: "scheduler",
-        agentBuildMode: true,
-        toolAllowlist: SAFE_SCHED_ALLOWLIST,
-        expectSideEffects: true,
-      });
+      workflow
+        ? runWorkflow(workflow, { origin: "scheduler" })
+        : runHeadlessTask({
+            workspacePath,
+            modelRef,
+            task: parsed.workflowId
+              ? `[workflow record missing — ran raw task text] ${parsed.task}`
+              : parsed.task,
+            hardware,
+            numCtxOverride,
+            currentView: "chat",
+            origin: "scheduler",
+            agentBuildMode: true,
+            toolAllowlist: SAFE_SCHED_ALLOWLIST,
+            expectSideEffects: true,
+          });
 
     // Small local models are stochastic on these runs (harness-measured:
     // qwen2.5:7b occasionally returns an empty response and stops, ~60-100%
@@ -277,8 +307,11 @@ async function handleJobDue(job: JobDuePayload): Promise<void> {
       toast.error(`Scheduled task failed: ${label}`, { description: record.summary.slice(0, 150) });
       void notifyOs(`Scheduled task failed: ${label}`, record.summary.slice(0, 150));
     } else {
-      toast.success(`Scheduled task done: ${label}`);
-      void notifyOs(`Scheduled task done: ${label}`);
+      // Surface what the run actually found/did, not just that it finished —
+      // an unattended run's whole value is telling the user something they'd
+      // otherwise have to go check for themselves.
+      toast.success(`Scheduled task done: ${label}`, { description: record.summary.slice(0, 150) });
+      void notifyOs(`Scheduled task done: ${label}`, record.summary.slice(0, 150));
     }
   } catch (err) {
     const message = (err as Error)?.message ?? String(err);

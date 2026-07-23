@@ -172,7 +172,7 @@ export function ModelManager({ onUseModel }: Props) {
       <div className="h-14 border-b bg-card px-6 flex items-center justify-between">
         <h2 className="text-sm font-medium">Model Library</h2>
         <div className="text-[10px] text-muted-foreground flex items-center gap-3">
-          <span>Installed list: <span className="text-green-600 font-medium">live from Ollama</span></span>
+          <span>Installed list: <span className="text-success font-medium">live from Ollama</span></span>
           <span>Catalog: curated · updated {LIBRARY_UPDATED}</span>
         </div>
       </div>
@@ -230,7 +230,7 @@ export function ModelManager({ onUseModel }: Props) {
               className={cn(
                 "flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors shrink-0",
                 toolsOnly
-                  ? "bg-green-100 text-green-700 border-green-300"
+                  ? "bg-success/15 text-success border-success/40"
                   : "bg-background text-muted-foreground border-border hover:text-foreground"
               )}
               title="Filter to models that support native tool/function calling"

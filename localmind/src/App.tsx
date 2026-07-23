@@ -26,6 +26,7 @@ import { useWorkspacesStore } from "./store/workspaces";
 import { useAppViewStore } from "./store/appView";
 import { useModelSelectionStore } from "./store/modelSelection";
 import { useSessionResultsStore } from "./store/sessionResults";
+import { useChatSeedStore } from "./store/chatSeed";
 import { startTaskRunner, SAFE_QUEUE_ALLOWLIST } from "./lib/taskRunner";
 import { initScheduler } from "./lib/scheduler";
 import { initMcpAutoConnect } from "./lib/mcpAutoConnect";
@@ -42,6 +43,8 @@ import { ModelManager } from "./components/ModelManager";
 import { AgentToolbar } from "./components/AgentToolbar";
 import { ToolCallCard } from "./components/ToolCallCard";
 import { SystemPromptDialog } from "./components/SystemPromptDialog";
+import { Onboarding } from "./components/Onboarding";
+import { useOnboardingStore } from "./store/onboarding";
 import { FileTree } from "./components/FileTree";
 import { FilePreviewPanel } from "./components/FilePreviewPanel";
 import { lazy, Suspense } from "react";
@@ -72,6 +75,12 @@ const ImageEditor = lazy(() =>
 );
 const SkillRegistry = lazy(() =>
   import("./components/SkillRegistry").then((m) => ({ default: m.SkillRegistry }))
+);
+const Workflows = lazy(() =>
+  import("./components/Workflows").then((m) => ({ default: m.Workflows }))
+);
+const HistoryView = lazy(() =>
+  import("./components/HistoryView").then((m) => ({ default: m.HistoryView }))
 );
 const BenchmarkRunner = lazy(() =>
   import("./components/BenchmarkRunner").then((m) => ({ default: m.BenchmarkRunner }))
@@ -250,6 +259,7 @@ export default function App() {
     setLastMessageContent,
     setStreaming,
     updateTitle,
+    updateSystemPrompt,
   } = useChatStore();
 
   const {
@@ -264,7 +274,8 @@ export default function App() {
   } = useAgentStore();
 
   const { hardware, vramOverride } = useModelStore();
-  const { numCtxOverride, featureIdeasSteering } = useSettingsStore();
+  const { numCtxOverride, featureIdeasSteering, theme } = useSettingsStore();
+  const { hasCompletedOnboarding } = useOnboardingStore();
 
   const { view, mountedViews, setView } = useAppViewStore();
   const { selectedModel, setSelectedModel } = useModelSelectionStore();
@@ -297,6 +308,14 @@ export default function App() {
       clearTimeout(t2);
     };
   }, []);
+
+  // Applies the Settings theme toggle to the actual document — previously
+  // `theme` was only ever persisted in store/settings.ts and never written
+  // anywhere the CSS (index.css's `:root[data-theme="dark"]` block) could see
+  // it, so switching to Dark changed stored state but nothing visible.
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
 
   const isIslandExpanded = pillState === "expanded";
   const isIslandCompact = pillState === "compact";
@@ -759,6 +778,26 @@ export default function App() {
     // question entirely.
     void handleSendRef.current?.(followUp, false, false, convId);
   }
+
+  // KM4d: "Ask about this in chat" from the Study tab's concept graph (and any
+  // future similar entry point) — see store/chatSeed.ts's doc comment for why
+  // this is a store-watched effect rather than a prop threaded down through
+  // KnowledgeHub/ConceptGraph. Mirrors handleQuickFollowup just above: fresh
+  // conversation, explicit convId (not the closured activeId), forceAgentMode
+  // true so the model can actually call search_knowledge rather than just
+  // streaming plain text.
+  const pendingChatSeed = useChatSeedStore((s) => s.pending);
+  useEffect(() => {
+    if (!pendingChatSeed) return;
+    const { systemPrompt, question } = pendingChatSeed;
+    useChatSeedStore.getState().clearSeed();
+    const model = useModelSelectionStore.getState().selectedModel;
+    const convId = newConversation(model);
+    updateSystemPrompt(convId, systemPrompt);
+    setView("chat");
+    void handleSendRef.current?.(question, true, false, convId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingChatSeed]);
 
   // Best-effort wrapper around invoke("show_result_widget"): this crosses the
   // Rust boundary (a missing capability permission would reject), and left
@@ -1573,6 +1612,14 @@ export default function App() {
                     <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
                       <SkillRegistry />
                     </Suspense>
+                  ) : view === "workflows" ? (
+                    <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
+                      <Workflows />
+                    </Suspense>
+                  ) : view === "history" ? (
+                    <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
+                      <HistoryView />
+                    </Suspense>
                   ) : view === "benchmarks" ? (
                     <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
                       <BenchmarkRunner selectedModel={selectedModel} />
@@ -1618,6 +1665,11 @@ export default function App() {
           convId={activeId}
         />
       )}
+
+      {/* First-run welcome — explains the workspace concept and tab set,
+          since a brand-new user otherwise lands in an empty chat view with
+          no orientation at all. */}
+      {!hasCompletedOnboarding && <Onboarding ollamaError={ollamaError} />}
     </div>
   );
 }

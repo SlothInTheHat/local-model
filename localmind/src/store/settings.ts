@@ -4,8 +4,13 @@ import type { ModelRole } from "../lib/modelRoles";
 
 interface Settings {
   defaultSystemPrompt: string;
-  agentAutoApproveReads: boolean;
   theme: "light" | "dark";
+  /** Monaco editor theme in the Code tab — independent of the app-wide `theme`
+   *  above (Monaco can't read CSS custom properties, and users may prefer a
+   *  dark editor regardless of the app's light/dark chrome). Defaults to
+   *  "dark" — the editor's long-standing look before theme-following was
+   *  briefly tried and reverted per user feedback. */
+  codeEditorTheme: "light" | "dark";
   /** Manual override for the agent's Ollama num_ctx. null = auto (based on detected hardware). */
   numCtxOverride: number | null;
   /** Free-text steering used by the "Research feature ideas" action to guide what the agent looks for. */
@@ -29,12 +34,23 @@ interface Settings {
    * `transcribe_audio_base64` / `transcribe_video` Tauri commands.
    */
   whisperModel: "tiny" | "base" | "small" | "medium";
+  /**
+   * Which engine the mic button uses to turn speech into text.
+   * - "whisper": local offline faster-whisper (accurate, but records-then-
+   *   transcribes, so there's a wait after you stop talking).
+   * - "browser": the platform Web Speech API — streams words in real time as
+   *   you speak (feels much faster), but is experimental in the desktop
+   *   webview and may require an internet connection. Offered as a toggle so
+   *   the user can try it and compare. Falls back to whisper if the platform
+   *   has no SpeechRecognition.
+   */
+  dictationEngine: "whisper" | "browser";
 }
 
 interface SettingsState extends Settings {
   setDefaultSystemPrompt: (prompt: string) => void;
-  setAgentAutoApproveReads: (val: boolean) => void;
   setTheme: (theme: "light" | "dark") => void;
+  setCodeEditorTheme: (theme: "light" | "dark") => void;
   setNumCtxOverride: (val: number | null) => void;
   setFeatureIdeasSteering: (val: string) => void;
   setOllamaBaseUrl: (url: string) => void;
@@ -42,6 +58,7 @@ interface SettingsState extends Settings {
   /** Pin a model to a role, or pass `null` to clear the pin (fall back to auto). */
   setModelRole: (role: ModelRole, modelRef: string | null) => void;
   setWhisperModel: (model: Settings["whisperModel"]) => void;
+  setDictationEngine: (engine: Settings["dictationEngine"]) => void;
 }
 
 export const DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434";
@@ -51,18 +68,19 @@ export const useSettingsStore = create<SettingsState>()(
     (set) => ({
       defaultSystemPrompt:
         "You are a helpful, precise AI assistant running locally via Ollama. Be concise and accurate.",
-      agentAutoApproveReads: false,
       theme: "light",
+      codeEditorTheme: "dark",
       numCtxOverride: null,
       featureIdeasSteering: "",
       ollamaBaseUrl: DEFAULT_OLLAMA_BASE_URL,
       closeToTray: true,
       modelRoles: {},
       whisperModel: "base",
+      dictationEngine: "whisper",
 
       setDefaultSystemPrompt: (prompt) => set({ defaultSystemPrompt: prompt }),
-      setAgentAutoApproveReads: (val) => set({ agentAutoApproveReads: val }),
       setTheme: (theme) => set({ theme }),
+      setCodeEditorTheme: (theme) => set({ codeEditorTheme: theme }),
       setNumCtxOverride: (val) => set({ numCtxOverride: val }),
       setFeatureIdeasSteering: (val) => set({ featureIdeasSteering: val }),
       setOllamaBaseUrl: (url) => set({ ollamaBaseUrl: url }),
@@ -75,6 +93,7 @@ export const useSettingsStore = create<SettingsState>()(
           return { modelRoles: next };
         }),
       setWhisperModel: (model) => set({ whisperModel: model }),
+      setDictationEngine: (engine) => set({ dictationEngine: engine }),
     }),
     { name: "localmind-settings" }
   )

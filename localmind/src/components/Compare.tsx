@@ -1,11 +1,14 @@
 import { useRef, useState } from "react";
-import { Eye, EyeOff, Send, Square, RotateCcw } from "lucide-react";
+import { Eye, EyeOff, Send, Square, RotateCcw, BarChart2 } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { cn } from "./ui/utils";
 import { useChatStore } from "../store/chat";
+import { useAgentStore } from "../store/agent";
 import { streamChatForModel, providerLabel, isOllamaModel } from "../lib/chatProvider";
 import { supportsNativeTools } from "../lib/modelCapabilities";
+import { loadBenchmarks, saveBenchmark, slugifyBenchmarkFilename } from "../lib/benchmarks";
 
 interface PanelState {
   model: string;
@@ -22,7 +25,7 @@ const PANEL_LABELS = ["A", "B", "C", "D"];
 function ModelBadge({ model }: { model: string }) {
   if (isOllamaModel(model)) return null;
   return (
-    <span className="text-[9px] px-1 py-0.5 rounded bg-violet-100 text-violet-700 border border-violet-200">
+    <span className="text-[9px] px-1 py-0.5 rounded bg-violet-100 text-violet-700 border border-violet-200 dark:bg-violet-950 dark:text-violet-300 dark:border-violet-800">
       {providerLabel(model)}
     </span>
   );
@@ -30,6 +33,7 @@ function ModelBadge({ model }: { model: string }) {
 
 export function Compare() {
   const { availableModels } = useChatStore();
+  const { dirHandle } = useAgentStore();
   const [panelCount, setPanelCount] = useState(2);
   const [blind, setBlind] = useState(false);
   const [revealed, setRevealed] = useState(false);
@@ -127,6 +131,32 @@ export function Compare() {
     setPanels((prev) => prev.map((p) => ({ ...p, streaming: false })));
   }
 
+  // Bridge to the Benchmarks tab: turns this ad-hoc prompt into a saved,
+  // re-runnable regression check. Keywords are left blank — the model
+  // responses here are for taste comparison, not keyword scoring, so
+  // there's nothing meaningful to prefill; the user fills those in from
+  // the Benchmarks tab's own editor if they want pass/fail scoring.
+  async function saveAsBenchmark() {
+    if (!dirHandle || !prompt.trim()) return;
+    const name = window.prompt("Name this benchmark:", prompt.trim().slice(0, 40));
+    if (!name?.trim()) return;
+    try {
+      const existing = await loadBenchmarks(dirHandle);
+      const filename = slugifyBenchmarkFilename(name, existing);
+      await saveBenchmark(dirHandle, {
+        name: name.trim(),
+        prompt: prompt.trim(),
+        keywords: [],
+        min_matches: 0,
+        timeout_seconds: 60,
+        filename,
+      });
+      toast.success(`Saved as benchmark: ${name.trim()} — add keywords in the Benchmarks tab to score it`);
+    } catch (err) {
+      toast.error(`Could not save benchmark: ${(err as Error).message}`);
+    }
+  }
+
   function reset() {
     stop();
     setPanels((prev) => prev.map((p) => ({ ...p, response: "", done: false, error: null, durationMs: null })));
@@ -215,7 +245,7 @@ export function Compare() {
                 </select>
                 <ModelBadge model={panel.model} />
                 {supportsNativeTools(panel.model) && (
-                  <span className="text-[9px] px-1 py-0.5 rounded bg-green-100 text-green-700 border border-green-200">tools</span>
+                  <span className="text-[9px] px-1 py-0.5 rounded bg-success/15 text-success border border-success/30">tools</span>
                 )}
               </>
             )}
@@ -229,7 +259,7 @@ export function Compare() {
           <div key={i} className={cn("flex flex-col min-h-0 overflow-hidden", i > 0 && "border-l")}>
             <div className="flex-1 min-h-0 overflow-y-auto p-3">
               {panel.error ? (
-                <p className="text-xs text-red-500">{panel.error}</p>
+                <p className="text-xs text-destructive">{panel.error}</p>
               ) : panel.response ? (
                 <pre className="text-xs font-mono whitespace-pre-wrap text-foreground leading-relaxed">
                   {panel.response}
@@ -261,7 +291,7 @@ export function Compare() {
                     </button>
                   )}
                   {voted === i && (
-                    <span className="text-[10px] text-green-600 font-medium">✓ Winner</span>
+                    <span className="text-[10px] text-success font-medium">✓ Winner</span>
                   )}
                 </div>
               </div>
@@ -286,6 +316,16 @@ export function Compare() {
           rows={2}
           disabled={isRunning}
         />
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => void saveAsBenchmark()}
+          disabled={!prompt.trim() || !dirHandle}
+          className="shrink-0"
+          title={dirHandle ? "Save this prompt to the Benchmarks tab" : "Open a workspace first"}
+        >
+          <BarChart2 className="size-3.5 mr-1" /> Save as benchmark
+        </Button>
         {isRunning ? (
           <Button size="sm" variant="outline" onClick={stop} className="shrink-0">
             <Square className="size-3.5 mr-1" /> Stop

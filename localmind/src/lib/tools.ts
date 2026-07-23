@@ -1,6 +1,6 @@
 import { evaluate } from "mathjs";
 import { searchWeb } from "./search";
-import { fileExists, backupFile, readFileFromHandle } from "./fileSystem";
+import { fileExists } from "./fileSystem";
 import { mcpCallTool } from "./mcp";
 import { useMcpStore } from "../store/mcp";
 import { injectGitCredentials, sanitizeOutput } from "../store/profile";
@@ -18,6 +18,8 @@ import { useAppViewStore } from "../store/appView";
 import { useTaskQueueStore } from "../store/taskQueue";
 import { useAgentStore } from "../store/agent";
 import { useModelStore } from "../store/models";
+import { useWorkflowStore } from "../store/workflows";
+import type { Workflow } from "../store/workflows";
 import { buildJobSpec, computeInitialNextRun, describeSchedule, normalizeSchedule, parseJobSpec } from "./scheduler";
 import { searchSessions } from "./sessionSearch";
 import { isTauriEnv } from "./fileSystem";
@@ -90,7 +92,11 @@ export type ToolName =
   | "open_application"
   | "list_windows"
   | "focus_window"
-  | "take_screenshot";
+  | "take_screenshot"
+  | "save_workflow"
+  | "list_workflows"
+  | "run_workflow"
+  | "delete_workflow";
 
 export interface ToolDef {
   // string allows MCP tools with dynamic "serverId__toolName" names
@@ -109,13 +115,21 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
   {
     name: "read_file",
     description:
-      "Read the text content of a file from the current workspace directory.",
+      "Read the text content of a file from the current workspace directory. For large files, use offset/limit to page through sections instead of re-reading from the start — do not fall back to grep_files just to see content further into a file.",
     parameters: {
       type: "object",
       properties: {
         path: {
           type: "string",
           description: "Relative path to the file within the workspace (e.g. 'src/main.ts').",
+        },
+        offset: {
+          type: "number",
+          description: "1-based line number to start reading from. Omit to start at line 1.",
+        },
+        limit: {
+          type: "number",
+          description: "Max number of lines to return. Omit to read to end of file (capped at 2000 lines to protect context — use offset to page through longer files).",
         },
       },
       required: ["path"],
@@ -287,7 +301,7 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
         },
         path: {
           type: "string",
-          description: "Directory to search in, relative to workspace root. Defaults to root.",
+          description: "Directory (not a file) to search in, relative to workspace root. Defaults to root — omit rather than pointing this at a single file.",
         },
         file_pattern: {
           type: "string",
@@ -337,7 +351,7 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
         },
         path: {
           type: "string",
-          description: "Directory to search in, relative to workspace root. Defaults to root.",
+          description: "Directory (not a file) to search in, relative to workspace root. Defaults to root — omit rather than pointing this at a single file.",
         },
       },
       required: ["pattern"],
@@ -350,7 +364,7 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
   {
     name: "run_command",
     description:
-      "Execute a shell command on the user's machine and return its stdout/stderr output. Use for running scripts, compiling code, checking git status, installing packages, etc. Requires Tauri desktop mode.",
+      "Execute a shell command on the user's machine and return its stdout/stderr output. Use for running scripts, compiling code, checking git status, installing packages, etc. Requires Tauri desktop mode. On Windows this runs in PowerShell, not bash — avoid one-liners with embedded double quotes (e.g. `node -e \"...\"`), PowerShell's quoting breaks them; write a small script file with write_file and run that instead of fighting with inline quoting.",
     parameters: {
       type: "object",
       properties: {
@@ -428,7 +442,7 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
   },
   {
     name: "open_application",
-    description: "Launch an application, file, or URL by name/path using the OS shell (like typing it into Start/Spotlight). Does not resolve or validate the name — the OS handles lookup. On Windows, the display name in the Start menu is often NOT the executable name: use 'mspaint' for Paint, 'calc' for Calculator, 'cmd' for Command Prompt, 'notepad' for Notepad, 'explorer' for File Explorer. If a call fails or the app doesn't appear, retry once with the likely executable name — do not go searching the workspace filesystem for it.",
+    description: "Launch an application, file, or URL by name/path (like typing it into Start/Spotlight). On Windows this first tries a fuzzy match against installed Start Menu apps (so a display name like 'Photoshop' or 'VS Code' works even if it's not the executable name), then falls back to the raw OS shell lookup, which only resolves PATH executables, registered app names, or file/URL associations — e.g. 'mspaint' for Paint, 'calc' for Calculator, 'cmd' for Command Prompt, 'notepad' for Notepad, 'explorer' for File Explorer. If a call still fails, retry once with the likely executable name — do not go searching the workspace filesystem for it.",
     parameters: {
       type: "object",
       properties: {
@@ -884,6 +898,79 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
     requiresApproval: true,
   },
   {
+    name: "save_workflow",
+    description:
+      "Save a named, reusable automation the user can re-run manually or on a schedule — e.g. 'watch these internship sites and keep a running list' or 'check these stock prices every morning'. This is DIFFERENT from schedule_task: a workflow is named, shows up in the Workflows tab, keeps its own accumulating output file, and can optionally use specific MCP integrations for unattended runs. IMPORTANT — do not call this on the first ask. Have a real conversation first: if the goal names a category rather than concrete sources ('top internship sites', 'my usual news sites'), ask the user which specific sites/URLs to use — you cannot reliably discover 'the top N' sites yourself, and a wrong guess makes every future unattended run silently useless. If the goal implies pages web_search/web_fetch can't reach (JS-heavy job boards, login-gated pages), ask whether to opt this workflow into a connected MCP tool (e.g. a Browser/Playwright server) — only offer servers that are actually connected right now (see the Integrations (MCP) status in your context), never one that isn't. Confirm the output format/location expectation and how often it should run (or that it's manual-only) before calling this tool. Only call it once the goal is concrete enough that a headless run with no further back-and-forth could actually succeed.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Short name for this workflow, e.g. 'Internship Tracker'." },
+        description: { type: "string", description: "One-sentence summary of what this workflow does." },
+        instruction: {
+          type: "string",
+          description: "The natural-language goal to run each time, in plain English — never shell code. This is combined automatically with instructions to read/update this workflow's output file without duplicating entries, so just describe the goal itself (e.g. 'Search for new remote software engineering internship postings on <specific sites the user named>').",
+        },
+        schedule: {
+          type: "string",
+          description: "Optional. Omit entirely for a manual-only workflow (the user runs it themselves whenever they want). Otherwise same format as schedule_task: 'interval:<seconds>', 'cron:<5-field-expr>', or 'once:<unix_seconds>'.",
+        },
+        mcp_servers: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional. Labels (not ids) of currently-connected MCP servers this workflow may use during UNATTENDED (scheduled) runs, e.g. ['Browser']. Only include a server the user has explicitly agreed this workflow should use, and only if it shows as connected in your context right now.",
+        },
+      },
+      required: ["name", "description", "instruction"],
+    },
+    group: "state",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "list_workflows",
+    description: "List all saved workflows, including each one's name, description, schedule, output file, and last run outcome/time.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "run_workflow",
+    description: "Run a saved workflow right now, regardless of its schedule. Use list_workflows first to find the id or exact name.",
+    parameters: {
+      type: "object",
+      properties: {
+        id_or_name: { type: "string", description: "The workflow's id (from list_workflows) or its exact name." },
+      },
+      required: ["id_or_name"],
+    },
+    group: "state",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "delete_workflow",
+    description: "Permanently delete a saved workflow and cancel its schedule (if any). Does NOT delete the workflow's accumulated output file — that stays on disk. Use list_workflows first to find the id or exact name.",
+    parameters: {
+      type: "object",
+      properties: {
+        id_or_name: { type: "string", description: "The workflow's id (from list_workflows) or its exact name." },
+      },
+      required: ["id_or_name"],
+    },
+    group: "state",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
     name: "spawn_subagent",
     description:
       "Delegate a sub-task to a separate, autonomous headless agent session that runs against the current workspace and reports back its result. Use this to fan out an independent chunk of work (e.g. 'summarize this directory', 'analyze src/ and report structure') without consuming your own context on it. The subagent gets read-only tools (read_file, list_directory, grep_files, find_files, web_search, web_fetch, get_system_info, git_status, git_diff, git_log, list_skills, calculator) — it can investigate but cannot write/delete files or run shell commands, and it cannot spawn further subagents. Requires an open workspace.",
@@ -1016,6 +1103,14 @@ function argStr(val: unknown): string {
   return String(val);
 }
 
+/** Same defensiveness as argStr, for array args — accepts a real array, or a
+ *  comma-separated string (weak models sometimes emit that instead). */
+function argStrArray(val: unknown): string[] {
+  if (Array.isArray(val)) return val.map((v) => argStr(v)).filter(Boolean);
+  const s = argStr(val);
+  return s ? s.split(",").map((x) => x.trim()).filter(Boolean) : [];
+}
+
 function noWorkspace(call: ToolCall): ToolResult {
   return {
     toolCallId: call.id,
@@ -1100,6 +1195,48 @@ export function normalizeSubPath(p: string): string {
   return resolvePathParts(trimmed).join("/");
 }
 
+/** Matches a Windows drive-letter path ("C:/...", "C:\\...") or a POSIX absolute path ("/..."). */
+const ABSOLUTE_PATH_RE = /^(?:[a-zA-Z]:[\\/]|[\\/])/;
+
+/**
+ * Resolves a model-supplied path (relative OR absolute) to workspace-relative
+ * path segments, for the FSA-`dirHandle`-based tools (read_file/write_file/
+ * patch_file/delete_file/list_directory/grep_files/find_files/apply_patch).
+ *
+ * Confirmed bug this fixes: resolvePathParts alone has no concept of an
+ * absolute path — given "C:/Users/.../workspace/foo.txt" it just splits on
+ * "/" and walks every segment (including the literal "C:") as a nested
+ * subfolder NAME relative to the already-workspace-scoped dirHandle. That
+ * silently resolves to the wrong (nonexistent) nested location instead of
+ * the real file — unlike create_folder, which goes through a real OS path
+ * via the Rust fs_mkdir command and already special-cases absolute paths
+ * correctly. A model passing the identical absolute path to write_file then
+ * read_file previously got inconsistent behavior (write "succeeding" at the
+ * wrong spot, then read failing with "Directory not found").
+ */
+export function resolveWorkspaceRelativeParts(rawPath: string, workspacePath: string | null | undefined): string[] {
+  if (!ABSOLUTE_PATH_RE.test(rawPath)) {
+    return resolvePathParts(rawPath);
+  }
+  if (!workspacePath) {
+    throw new Error(`Absolute path "${rawPath}" given but no workspace root is known — use a relative path instead.`);
+  }
+  const normWorkspace = workspacePath.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  const normRaw = rawPath.replace(/\\/g, "/");
+  if (normRaw.toLowerCase() !== normWorkspace && !normRaw.toLowerCase().startsWith(normWorkspace + "/")) {
+    throw new Error(`Absolute path "${rawPath}" is outside the current workspace root ("${workspacePath}") — use a relative path instead.`);
+  }
+  const rel = normRaw.slice(normWorkspace.length).replace(/^\/+/, "");
+  return resolvePathParts(rel);
+}
+
+/** Same as normalizeSubPath, but rebases an absolute path onto workspacePath first (see resolveWorkspaceRelativeParts). */
+export function normalizeWorkspaceRelativeSubPath(p: string, workspacePath: string | null | undefined): string {
+  const trimmed = p.trim();
+  if (!trimmed) return "";
+  return resolveWorkspaceRelativeParts(trimmed, workspacePath).join("/");
+}
+
 async function resolveDirHandle(
   root: FileSystemDirectoryHandle,
   parts: string[]
@@ -1113,6 +1250,31 @@ async function resolveDirHandle(
     }
   }
   return handle;
+}
+
+/**
+ * Builds a clear error for when resolveDirHandle fails against `root`/`parts` —
+ * distinguishes "that path is a file, not a directory" (a model passed
+ * e.g. grep_files' path at a specific *.html file instead of its containing
+ * folder) from a genuinely missing path, since the two look identical from
+ * resolveDirHandle's plain null return and a model can't self-correct from an
+ * ambiguous "Directory not found" alone.
+ */
+async function describeDirResolutionFailure(root: FileSystemDirectoryHandle, searchPath: string, parts: string[]): Promise<string> {
+  if (parts.length > 0) {
+    const parentParts = parts.slice(0, -1);
+    const last = parts[parts.length - 1];
+    const parent = parentParts.length > 0 ? await resolveDirHandle(root, parentParts) : root;
+    if (parent) {
+      try {
+        await parent.getFileHandle(last, { create: false });
+        return `"${searchPath}" is a file, not a directory — path must name a folder to search within (omit it to search the whole workspace, or pass its containing folder instead).`;
+      } catch {
+        // not a file either — genuinely missing, fall through to the generic message
+      }
+    }
+  }
+  return `Directory not found: ${searchPath}`;
 }
 
 interface DirEntry {
@@ -1361,7 +1523,7 @@ export async function executeTool(
 
       case "list_directory": {
         if (!dirHandle) return noWorkspace(call);
-        const subPath = normalizeSubPath(argStr(call.args["path"]));
+        const subPath = normalizeWorkspaceRelativeSubPath(argStr(call.args["path"]), workspacePath);
         let targetHandle = dirHandle;
         if (subPath) {
           const parts = subPath.split("/").filter(Boolean);
@@ -1381,7 +1543,7 @@ export async function executeTool(
         if (!dirHandle) return noWorkspace(call);
         const path = argStr(call.args["path"]) || argStr(call.args["file_path"]) || argStr(call.args["filename"]);
         if (!path) throw new Error("Missing path argument");
-        const parts = resolvePathParts(path);
+        const parts = resolveWorkspaceRelativeParts(path, workspacePath);
         const fileName = parts.pop()!;
         let parentHandle = dirHandle;
         if (parts.length > 0) {
@@ -1392,10 +1554,30 @@ export async function executeTool(
         const fileHandle = await parentHandle.getFileHandle(fileName, { create: false });
         const file = await fileHandle.getFile();
         const text = await file.text();
+
+        // offset/limit: Ollama tool-call args can legitimately arrive as either
+        // JSON numbers or numeric strings depending on the model/backend —
+        // Number(...) handles both instead of silently ignoring a stringified arg.
+        const rawOffset = call.args["offset"];
+        const rawLimit = call.args["limit"];
+        const offsetNum = rawOffset != null ? Number(rawOffset) : NaN;
+        const limitNum = rawLimit != null ? Number(rawLimit) : NaN;
+        const offset = Number.isFinite(offsetNum) && offsetNum > 1 ? Math.floor(offsetNum) : 1;
+        const limit = Number.isFinite(limitNum) && limitNum > 0 ? Math.floor(limitNum) : 2000;
+
+        const lines = text.split("\n");
+        const start = offset - 1;
+        const slice = lines.slice(start, start + limit);
+        const output = slice.join("\n");
+        const truncationNote =
+          start + slice.length < lines.length
+            ? `\n\n[Showing lines ${offset}-${start + slice.length} of ${lines.length}. Pass offset=${start + slice.length + 1} to continue.]`
+            : "";
+
         return {
           toolCallId: call.id,
           name: call.name,
-          output: text,
+          output: output + truncationNote,
         };
       }
 
@@ -1405,16 +1587,14 @@ export async function executeTool(
         const path = argStr(call.args["path"]) || argStr(call.args["file_path"]) || argStr(call.args["filename"]);
         const content = argStr(call.args["content"]) || argStr(call.args["text"]) || argStr(call.args["code"]);
         if (!path) throw new Error("Missing path argument (expected 'path', 'file_path', or 'filename')");
-        const parts = resolvePathParts(path);
+        const parts = resolveWorkspaceRelativeParts(path, workspacePath);
         const normalizedPath = parts.join("/");
 
-        const isBackupPath = normalizedPath.startsWith(".localmind-backups/");
-        let backupPath: string | null = null;
+        // Overwriting an existing file is now recovered via shadow-git
+        // history (every mutating tool call is auto-committed after it
+        // runs) rather than the old per-write sibling-folder backup.
+        const overwritingExisting = await fileExists(dirHandle, normalizedPath);
 
-        if (!isBackupPath && await fileExists(dirHandle, normalizedPath)) {
-          const existing = await readFileFromHandle(dirHandle, normalizedPath);
-          backupPath = await backupFile(dirHandle, normalizedPath, existing);
-        }
         const fileName = parts.pop()!;
         let parentHandle = dirHandle;
         if (parts.length > 0) {
@@ -1429,16 +1609,15 @@ export async function executeTool(
         await writable.write(content);
         await writable.close();
 
-        const verb = backupPath ? "File written" : "File created";
-        const backupNote = backupPath ? `\nBackup saved to: ${backupPath}` : "";
+        const verb = overwritingExisting ? "File written" : "File created";
         // When overwriting an existing file, remind the model that patch_file is preferred for future edits.
-        const overwriteHint = backupPath
+        const overwriteHint = overwritingExisting
           ? `\nNote: You overwrote an existing file. For future fixes use patch_file — it edits only the changed lines and is less likely to introduce new bugs.`
           : "";
         return {
           toolCallId: call.id,
           name: call.name,
-          output: `${verb}: ${path}${backupNote}${overwriteHint}`,
+          output: `${verb}: ${path}${overwriteHint}`,
         };
       }
 
@@ -1452,7 +1631,7 @@ export async function executeTool(
         if (!path) throw new Error("Missing path argument");
         if (oldString === null) throw new Error("Missing old_string argument");
 
-        const patchParts = resolvePathParts(path);
+        const patchParts = resolveWorkspaceRelativeParts(path, workspacePath);
         const patchFileName = patchParts.pop()!;
         let patchParent = dirHandle;
         if (patchParts.length > 0) {
@@ -1508,7 +1687,7 @@ export async function executeTool(
         if (!dirHandle) return noWorkspace(call);
         const pattern = argStr(call.args["pattern"]);
         if (!pattern) throw new Error("Missing pattern argument");
-        const searchPath = normalizeSubPath(argStr(call.args["path"]));
+        const searchPath = normalizeWorkspaceRelativeSubPath(argStr(call.args["path"]), workspacePath);
         const fileGlob = argStr(call.args["file_pattern"]) || "*";
         const caseSensitive = (call.args["case_sensitive"] as boolean | undefined) ?? false;
 
@@ -1516,7 +1695,7 @@ export async function executeTool(
         if (searchPath) {
           const parts = searchPath.split("/").filter(Boolean);
           const resolved = await resolveDirHandle(dirHandle, parts);
-          if (!resolved) throw new Error(`Directory not found: ${searchPath}`);
+          if (!resolved) throw new Error(await describeDirResolutionFailure(dirHandle, searchPath, parts));
           targetHandle = resolved;
         }
 
@@ -1545,13 +1724,13 @@ export async function executeTool(
         if (!dirHandle) return noWorkspace(call);
         const pattern = argStr(call.args["pattern"]);
         if (!pattern) throw new Error("Missing pattern argument");
-        const searchPath = normalizeSubPath(argStr(call.args["path"]));
+        const searchPath = normalizeWorkspaceRelativeSubPath(argStr(call.args["path"]), workspacePath);
 
         let targetHandle = dirHandle;
         if (searchPath) {
           const parts = searchPath.split("/").filter(Boolean);
           const resolved = await resolveDirHandle(dirHandle, parts);
-          if (!resolved) throw new Error(`Directory not found: ${searchPath}`);
+          if (!resolved) throw new Error(await describeDirResolutionFailure(dirHandle, searchPath, parts));
           targetHandle = resolved;
         }
 
@@ -1572,7 +1751,7 @@ export async function executeTool(
         if (!dirHandle) return noWorkspace(call);
         const path = argStr(call.args["path"]);
         if (!path) throw new Error("Missing path argument");
-        const parts = resolvePathParts(path);
+        const parts = resolveWorkspaceRelativeParts(path, workspacePath);
         const fileName = parts.pop()!;
         let parentHandle = dirHandle;
         if (parts.length > 0) {
@@ -1893,7 +2072,7 @@ export async function executeTool(
 
         const results: string[] = [];
         for (const op of patchOps) {
-          const opParts = resolvePathParts(op.path);
+          const opParts = resolveWorkspaceRelativeParts(op.path, workspacePath);
           const opFile = opParts.pop()!;
           let opParent = dirHandle;
           if (opParts.length > 0) {
@@ -2160,6 +2339,147 @@ export async function executeTool(
         if (!id) throw new Error("Missing id argument");
         await tauriInvoke("jobs_cancel", { id });
         return { toolCallId: call.id, name: call.name, output: `Cancelled scheduled job: ${id}` };
+      }
+
+      case "save_workflow": {
+        const name = argStr(call.args["name"]);
+        const description = argStr(call.args["description"]);
+        const instruction = argStr(call.args["instruction"]);
+        if (!name) throw new Error("Missing name argument");
+        if (!description) throw new Error("Missing description argument");
+        if (!instruction) throw new Error("Missing instruction argument");
+
+        // Name-based idempotency: unlike schedule_task's identical-spec check,
+        // each workflow gets a fresh random id every call, so an identical-spec
+        // check would never match — dedupe by name instead, and hand back the
+        // existing workflow rather than creating a near-duplicate if a weak
+        // model re-emits this call across rounds.
+        const existing = useWorkflowStore.getState().workflows.find(
+          (w) => w.name.toLowerCase() === name.toLowerCase(),
+        );
+        if (existing) {
+          return {
+            toolCallId: call.id,
+            name: call.name,
+            output: `A workflow named "${existing.name}" already exists (id ${existing.id}, output file ${existing.outputFile}). No duplicate was created — this task is done.`,
+          };
+        }
+
+        const rawSchedule = argStr(call.args["schedule"]);
+        const schedule = rawSchedule ? normalizeSchedule(rawSchedule) : null;
+
+        const mcpLabels = argStrArray(call.args["mcp_servers"]);
+        const mcpServerIds: string[] = [];
+        for (const label of mcpLabels) {
+          const server = useMcpStore.getState().servers.find((s) => s.label.toLowerCase() === label.toLowerCase());
+          if (!server || !server.enabled || server.status !== "connected") {
+            throw new Error(
+              `MCP server "${label}" is not currently connected — the user must add and connect it under Settings → MCP servers before this workflow can use it unattended.`,
+            );
+          }
+          mcpServerIds.push(server.id);
+        }
+
+        const slug =
+          name
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "-")
+            .replace(/^-|-$/g, "") || "workflow";
+        const outputFile = `.localmind/workflows/${slug}/output.md`;
+
+        const id = crypto.randomUUID();
+        const now = Date.now();
+        let jobId: string | null = null;
+        if (schedule) {
+          const spec = buildJobSpec(instruction, schedule, id);
+          const nextRunAt = computeInitialNextRun(schedule);
+          jobId = crypto.randomUUID();
+          await tauriInvoke("jobs_insert", { id: jobId, spec, nextRunAt, status: "active" });
+        }
+
+        const workflow: Workflow = {
+          id,
+          name,
+          description,
+          instruction,
+          toolAllowlist: [],
+          mcpServerIds,
+          outputFile,
+          schedule,
+          jobId,
+          createdAt: now,
+          updatedAt: now,
+          lastRunAt: null,
+          lastRunOutcome: null,
+          runCount: 0,
+        };
+        useWorkflowStore.getState().addWorkflow(workflow);
+
+        const scheduleText = schedule
+          ? describeSchedule(schedule)
+          : "manual — run it anytime from the Workflows tab or by asking me";
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Saved workflow "${name}" (id ${id}). Output file: ${outputFile}. Schedule: ${scheduleText}.`,
+        };
+      }
+
+      case "list_workflows": {
+        const workflows = useWorkflowStore.getState().workflows;
+        if (workflows.length === 0) {
+          return { toolCallId: call.id, name: call.name, output: "No saved workflows." };
+        }
+        const lines = workflows.map((w) => {
+          const scheduleText = w.schedule ? describeSchedule(w.schedule) : "manual";
+          const lastRun = w.lastRunAt
+            ? `${w.lastRunOutcome ?? "?"} at ${new Date(w.lastRunAt).toLocaleString()}`
+            : "never run";
+          return `- ${w.id}: "${w.name}" — ${w.description} — ${scheduleText} — output: ${w.outputFile} — last run: ${lastRun}`;
+        });
+        return { toolCallId: call.id, name: call.name, output: lines.join("\n") };
+      }
+
+      case "run_workflow": {
+        const idOrName = argStr(call.args["id_or_name"]);
+        if (!idOrName) throw new Error("Missing id_or_name argument");
+        const workflow = useWorkflowStore
+          .getState()
+          .workflows.find((w) => w.id === idOrName || w.name.toLowerCase() === idOrName.toLowerCase());
+        if (!workflow) throw new Error(`No workflow found matching "${idOrName}". Use list_workflows first.`);
+
+        // Dynamic import avoids a static circular dependency (workflowRunner.ts
+        // imports headlessRunner.ts, which imports TOOL_DEFINITIONS from this file).
+        const { runWorkflow } = await import("./workflowRunner");
+        const { record, transcript } = await runWorkflow(workflow, { origin: "workflow" });
+
+        const trimmedTranscript = transcript.trim().slice(0, 4000);
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output:
+            `Workflow "${workflow.name}" finished — outcome: ${record.outcome}, ${record.roundsUsed} round(s).\n\n` +
+            `Summary: ${record.summary}\n\n` +
+            `Transcript:\n${trimmedTranscript}${transcript.trim().length > 4000 ? "\n\n…(truncated)" : ""}`,
+        };
+      }
+
+      case "delete_workflow": {
+        const idOrName = argStr(call.args["id_or_name"]);
+        if (!idOrName) throw new Error("Missing id_or_name argument");
+        const workflow = useWorkflowStore
+          .getState()
+          .workflows.find((w) => w.id === idOrName || w.name.toLowerCase() === idOrName.toLowerCase());
+        if (!workflow) throw new Error(`No workflow found matching "${idOrName}". Use list_workflows first.`);
+
+        const { deleteWorkflow } = await import("./workflowRunner");
+        await deleteWorkflow(workflow.id);
+
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Deleted workflow "${workflow.name}". Its output file (${workflow.outputFile}) was left in place.`,
+        };
       }
 
       case "spawn_subagent": {

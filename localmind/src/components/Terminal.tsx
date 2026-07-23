@@ -55,11 +55,16 @@ export function Terminal({ onRegisterRunner }: TerminalProps) {
   const [input, setInput] = useState("");
   const [cwd, setCwd] = useState<string>("");
   const [running, setRunning] = useState(false);
+  const [killing, setKilling] = useState(false);
   const [history, setHistory] = useState<string[]>([]);
   const historyIdxRef = useRef(-1);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const abortRef = useRef<AbortController | null>(null);
+  /** The current in-flight run_command's request_id, for the Kill button to
+   *  target via cancel_command — run_command is a synchronous Tauri invoke
+   *  with no built-in cancellation, so this is the only way Kill can do
+   *  anything real (see cancel_command in src-tauri/src/lib.rs). */
+  const currentRequestIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -91,14 +96,21 @@ export function Terminal({ onRegisterRunner }: TerminalProps) {
       return msg;
     }
 
+    // Explicitly hand off focus before disabling the input — leaving a
+    // *focused* element disabled in the same render can leave some Chromium
+    // webviews in a stuck state where the next click just re-focuses/selects
+    // instead of registering on whatever it landed on (reported as "can't
+    // click the Kill button" after submitting a command).
+    inputRef.current?.blur();
     setRunning(true);
-    abortRef.current = new AbortController();
+    const requestId = crypto.randomUUID();
+    currentRequestIdRef.current = requestId;
     try {
       const result = await tauriInvoke<{ stdout: string; stderr: string; cwd: string; sandbox_blocked: boolean }>(
         "run_command",
         // Confinement is enforced Rust-side against the registered workspace
         // root(s); the cwd must already sit inside one of them.
-        { cmd: cmd.trim(), cwd: cwd || undefined }
+        { cmd: cmd.trim(), cwd: cwd || undefined, requestId }
       );
       if (result.stdout) appendLine({ type: "output", text: sanitizeOutput(result.stdout) });
       if (result.stderr) appendLine({ type: "error", text: sanitizeOutput(result.stderr) });
@@ -111,9 +123,23 @@ export function Terminal({ onRegisterRunner }: TerminalProps) {
       return `Error: ${msg}`;
     } finally {
       setRunning(false);
-      abortRef.current = null;
+      setKilling(false);
+      currentRequestIdRef.current = null;
     }
   }, [cwd]);
+
+  async function handleKill() {
+    const requestId = currentRequestIdRef.current;
+    if (!requestId || killing) return;
+    setKilling(true);
+    try {
+      const killed = await tauriInvoke<boolean>("cancel_command", { requestId });
+      if (!killed) appendLine({ type: "info", text: "(already finished)" });
+    } catch (err) {
+      appendLine({ type: "error", text: `Kill failed: ${(err as Error).message ?? err}` });
+      setKilling(false);
+    }
+  }
 
   // Register the runner for external callers (agent tool)
   useEffect(() => {
@@ -162,9 +188,10 @@ export function Terminal({ onRegisterRunner }: TerminalProps) {
           <Button
             size="sm" variant="ghost"
             className="h-6 px-2 text-xs text-zinc-400 hover:text-red-400"
-            onClick={() => abortRef.current?.abort()}
+            onClick={() => void handleKill()}
+            disabled={killing}
           >
-            <Square className="size-3 mr-1" /> Kill
+            <Square className="size-3 mr-1" /> {killing ? "Killing…" : "Kill"}
           </Button>
         )}
         <Button

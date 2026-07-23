@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { persist } from "zustand/middleware";
 import type { ToolCall, ToolName } from "../lib/tools";
 
 /**
@@ -71,25 +72,48 @@ const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   list_windows: true,
   focus_window: true,
   take_screenshot: true,
+  save_workflow: true,
+  list_workflows: true,
+  run_workflow: true,
+  delete_workflow: true,
 };
 
-export const useAgentStore = create<AgentState>()((set) => ({
-  dirHandle: null,
-  workspacePath: null,
-  workspaceName: null,
-  toolsEnabled: { ...DEFAULT_TOOLS_ENABLED },
-  pendingToolCalls: [],
+export const useAgentStore = create<AgentState>()(
+  persist(
+    (set) => ({
+      dirHandle: null,
+      workspacePath: null,
+      workspaceName: null,
+      toolsEnabled: { ...DEFAULT_TOOLS_ENABLED },
+      pendingToolCalls: [],
 
-  setWorkspace: (handle, path, name) => {
-    // Register the real OS path with the Rust confinement layer before the rest
-    // of the app starts issuing fs_* / run_command calls against it.
-    if (path) registerWorkspaceRoot(path);
-    set({ dirHandle: handle, workspacePath: path, workspaceName: name });
-  },
+      setWorkspace: (handle, path, name) => {
+        // Register the real OS path with the Rust confinement layer before the rest
+        // of the app starts issuing fs_* / run_command calls against it.
+        if (path) registerWorkspaceRoot(path);
+        set({ dirHandle: handle, workspacePath: path, workspaceName: name });
+      },
 
-  setToolEnabled: (name, enabled) =>
-    set((s) => ({ toolsEnabled: { ...s.toolsEnabled, [name]: enabled } })),
+      setToolEnabled: (name, enabled) =>
+        set((s) => ({ toolsEnabled: { ...s.toolsEnabled, [name]: enabled } })),
 
-  setPendingToolCalls: (calls) => set({ pendingToolCalls: calls }),
-  clearPendingToolCalls: () => set({ pendingToolCalls: [] }),
-}));
+      setPendingToolCalls: (calls) => set({ pendingToolCalls: calls }),
+      clearPendingToolCalls: () => set({ pendingToolCalls: [] }),
+    }),
+    {
+      name: "localmind-agent-tools",
+      // Only toolsEnabled survives a restart — dirHandle isn't serializable
+      // (and wouldn't be valid after a relaunch anyway; the workspace gets
+      // re-opened by App.tsx's own restore-by-path flow instead), and
+      // pendingToolCalls is live in-flight approval state, not a preference.
+      partialize: (state) => ({ toolsEnabled: state.toolsEnabled }),
+      // New tools added after a user's last save shouldn't vanish from the
+      // record just because they're absent from what was persisted.
+      merge: (persisted, current) => ({
+        ...current,
+        ...(persisted as Partial<AgentState>),
+        toolsEnabled: { ...current.toolsEnabled, ...(persisted as Partial<AgentState>)?.toolsEnabled },
+      }),
+    }
+  )
+);

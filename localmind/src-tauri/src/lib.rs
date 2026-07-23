@@ -1,7 +1,7 @@
 use std::process::Command;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 use tauri::Emitter;
 
@@ -80,6 +80,56 @@ fn ensure_confined(path: &str) -> Result<PathBuf, String> {
             target.display()
         ))
     }
+}
+
+// ─── run_command cancellation ──────────────────────────────────────────────
+//
+// run_command is a synchronous, blocking Tauri command — there is no built-in
+// way to cancel an in-flight `invoke()` from the JS side once it's been sent.
+// To let the Terminal tab's "Kill" button do something real, the frontend
+// generates a request_id per run, run_command registers its child PID under
+// that id while it waits, and cancel_command below kills it on request (same
+// taskkill/kill mechanism run_command's own timeout path already uses).
+
+static RUNNING_COMMANDS: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+
+fn running_commands() -> &'static Mutex<HashMap<String, u32>> {
+    RUNNING_COMMANDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Removes this request's PID from the registry on drop — covers every exit
+/// path out of run_command's wait block (normal completion AND the early
+/// `return` on timeout) without duplicating cleanup code at each return site.
+struct RunningCommandGuard(String);
+impl Drop for RunningCommandGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = running_commands().lock() {
+            map.remove(&self.0);
+        }
+    }
+}
+
+/// Kill a command started via run_command, by the request_id the frontend
+/// passed it. Returns false (not an error) if the command already finished
+/// or no such request_id was ever registered — both are normal races, not
+/// failures, since the Kill button and the command finishing can cross paths.
+#[tauri::command]
+fn cancel_command(request_id: String) -> Result<bool, String> {
+    let pid = running_commands()
+        .lock()
+        .map_err(|_| "running-commands lock poisoned".to_string())?
+        .remove(&request_id);
+    let Some(pid) = pid else { return Ok(false) };
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = Command::new("kill").args(["-9", &format!("-{pid}")]).output();
+    }
+    Ok(true)
 }
 
 /// Register a workspace root the fs_* commands and run_command are allowed to
@@ -229,6 +279,7 @@ use db::{
     session_insert, session_search,
     collection_upsert, collections_all, collection_delete, collection_docs,
     kb_replace_graph, kb_get_graph, kb_delete_graph,
+    kb_set_node_summary, kb_get_node_summaries,
 };
 
 mod tray;
@@ -242,6 +293,12 @@ use os_tools::{
 
 mod ipc;
 use ipc::{get_ipc_token, ipc_report_task_result};
+
+mod git_shadow;
+use git_shadow::{
+    shadow_git_ensure_init, shadow_git_commit, shadow_git_log, shadow_git_show_file,
+    shadow_git_diff, shadow_git_restore_file, shadow_git_restore_all,
+};
 
 // ─── Generic HTTP fetch (used by the frontend for requests that would hit CORS
 // in the packaged webview, e.g. web search against DuckDuckGo) ────────────────
@@ -633,6 +690,7 @@ fn translate_and_for_powershell(cmd: &str) -> String {
 fn run_command(
     cmd: String,
     cwd: Option<String>,
+    request_id: Option<String>,
 ) -> Result<CommandResult, String> {
     // Default cwd to the first registered root when the model omits it.
     let default_root: Option<String> = registered_roots()
@@ -669,6 +727,10 @@ fn run_command(
             .map_err(|e| e.to_string())?;
 
         let pid = child.id();
+        let _cmd_guard = request_id.as_ref().map(|rid| {
+            if let Ok(mut map) = running_commands().lock() { map.insert(rid.clone(), pid); }
+            RunningCommandGuard(rid.clone())
+        });
         let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<std::process::Output>>();
         std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
 
@@ -709,6 +771,10 @@ fn run_command(
             .map_err(|e| e.to_string())?;
 
         let pid = child.id();
+        let _cmd_guard = request_id.as_ref().map(|rid| {
+            if let Ok(mut map) = running_commands().lock() { map.insert(rid.clone(), pid); }
+            RunningCommandGuard(rid.clone())
+        });
         let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<std::process::Output>>();
         std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
 
@@ -1219,6 +1285,7 @@ pub fn run() {
             open_workspace_dialog,
             register_workspace_root,
             run_command,
+            cancel_command,
             get_cwd,
             get_system_info,
             get_gpu_info,
@@ -1248,6 +1315,8 @@ pub fn run() {
             kb_replace_graph,
             kb_get_graph,
             kb_delete_graph,
+            kb_set_node_summary,
+            kb_get_node_summaries,
             jobs_insert,
             jobs_list,
             jobs_due,
@@ -1267,6 +1336,13 @@ pub fn run() {
             clear_pending_region,
             get_ipc_token,
             ipc_report_task_result,
+            shadow_git_ensure_init,
+            shadow_git_commit,
+            shadow_git_log,
+            shadow_git_show_file,
+            shadow_git_diff,
+            shadow_git_restore_file,
+            shadow_git_restore_all,
         ])
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,

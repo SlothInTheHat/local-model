@@ -10,6 +10,7 @@ import { useModelStore } from "../store/models";
 import { useChatStore } from "../store/chat";
 import { useAgentStore } from "../store/agent";
 import { useSessionResultsStore } from "../store/sessionResults";
+import { useAppViewStore } from "../store/appView";
 import { runHeadlessTask, HEADLESS_DEFAULT_ALLOWLIST } from "../lib/headlessRunner";
 import { MODEL_LIBRARY } from "../lib/modelLibrary";
 import type { ModelSpec } from "../lib/modelLibrary";
@@ -78,7 +79,7 @@ function VramBar({ total, used, pending }: { total: number; used: number; pendin
         )}
         {pendingPct > 0 && (
           <div
-            className="h-full bg-amber-400/60 transition-all"
+            className="h-full bg-warning/60 transition-all"
             style={{ width: `${pendingPct}%` }}
             title={`Selected model: ${pending} GB`}
           />
@@ -86,7 +87,7 @@ function VramBar({ total, used, pending }: { total: number; used: number; pendin
       </div>
       <div className="flex gap-3 text-[10px] text-muted-foreground">
         <span className="flex items-center gap-1"><span className="size-2 rounded-full bg-primary inline-block" /> Running</span>
-        <span className="flex items-center gap-1"><span className="size-2 rounded-full bg-amber-400/60 inline-block" /> Selected</span>
+        <span className="flex items-center gap-1"><span className="size-2 rounded-full bg-warning/60 inline-block" /> Selected</span>
         <span className="flex items-center gap-1"><span className="size-2 rounded-full bg-muted-foreground/30 inline-block" /> Free</span>
       </div>
     </div>
@@ -102,6 +103,7 @@ export function SubagentManager() {
   const sessionResultCount = useSessionResultsStore(
     (s) => s.results.filter((r) => r.origin === "subagent").length
   );
+  const setView = useAppViewStore((s) => s.setView);
 
   const totalVram = vramOverride ?? hardware?.vramGb ?? 0;
 
@@ -262,9 +264,14 @@ export function SubagentManager() {
         </div>
         <div className="flex-1" />
         {sessionResultCount > 0 && (
-          <span className="text-[11px] text-muted-foreground" title="Subagent runs persist in Session Results even after this view unmounts">
-            {sessionResultCount} persisted in Session Results
-          </span>
+          <button
+            type="button"
+            onClick={() => setView("logs")}
+            className="text-[11px] text-muted-foreground hover:text-foreground underline-offset-2 hover:underline transition-colors"
+            title="Full per-step traces for these runs live in the Logs tab's Unattended runs section"
+          >
+            {sessionResultCount} persisted in Session Results — view in Logs →
+          </button>
         )}
         {agents.some((a) => a.status === "done") && (
           <Button size="sm" variant="outline" className="text-xs h-7" onClick={combineOutputs}>
@@ -309,7 +316,7 @@ export function SubagentManager() {
               </span>
               <span className={cn(
                 "font-medium",
-                canFit ? "text-green-600" : "text-red-500"
+                canFit ? "text-success" : "text-destructive"
               )}>
                 {totalVram === 0 ? "budget unknown" : canFit ? "fits" : "may not fit"}
               </span>
@@ -431,9 +438,9 @@ function AgentCard({
     <div className={cn(
       "border rounded-lg bg-card overflow-hidden transition-all",
       agent.status === "error" && "border-destructive/40",
-      agent.status === "done" && "border-green-500/30",
+      agent.status === "done" && "border-success/30",
       agent.status === "running" && "border-primary/40",
-      agent.status === "queued" && "border-amber-400/40",
+      agent.status === "queued" && "border-warning/40",
     )}>
       {/* Card header */}
       <div
@@ -517,9 +524,9 @@ function StatusBadge({ status }: { status: AgentStatus }) {
       className={cn(
         "text-[10px] px-1.5 py-0 h-4 shrink-0",
         status === "running" && "bg-primary/20 text-primary animate-pulse",
-        status === "queued" && "bg-amber-100 text-amber-700",
-        status === "done" && "bg-green-100 text-green-700",
-        status === "error" && "bg-red-100 text-red-700",
+        status === "queued" && "bg-warning/15 text-warning",
+        status === "done" && "bg-success/15 text-success",
+        status === "error" && "bg-destructive/15 text-destructive",
         status === "idle" && "bg-muted text-muted-foreground",
       )}
     >

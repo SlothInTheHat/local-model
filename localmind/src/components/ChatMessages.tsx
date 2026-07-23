@@ -378,7 +378,7 @@ const MessageRow = memo(function MessageRow({
             "bg-bubble border border-border overflow-hidden",
             isThinking
               ? "px-4 py-3 inline-block"
-              : "px-4 py-2.5 prose prose-sm max-w-none prose-pre:bg-muted prose-pre:border prose-code:text-foreground prose-p:my-1.5 prose-headings:font-medium"
+              : "px-4 py-2.5 prose prose-sm dark:prose-invert max-w-none prose-pre:bg-muted prose-pre:border prose-code:text-foreground prose-p:my-1.5 prose-headings:font-medium"
           )}
         >
           {isThinking ? (
