@@ -10,7 +10,7 @@ import { useProfileStore } from "../store/profile";
 import { useSettingsStore, DEFAULT_OLLAMA_BASE_URL } from "../store/settings";
 import { useProvidersStore } from "../store/providers";
 import { useModelStore } from "../store/models";
-import { useAgentStore } from "../store/agent";
+import { useAgentStore, KNOWN_FOLDER_NAMES, type KnownFolderName } from "../store/agent";
 import { useModelSelectionStore } from "../store/modelSelection";
 import { useChatStore } from "../store/chat";
 import { useMemoryStore } from "../store/memory";
@@ -899,6 +899,48 @@ const TOOL_GROUP_LABELS: Record<string, string> = {
   external: "External (MCP)",
 };
 
+function KnownFolderToggle({ name }: { name: KnownFolderName }) {
+  const extraRoots = useAgentStore((s) => s.extraRoots);
+  const enableKnownFolder = useAgentStore((s) => s.enableKnownFolder);
+  const disableKnownFolder = useAgentStore((s) => s.disableKnownFolder);
+  const [busy, setBusy] = useState(false);
+  const path = extraRoots[name];
+  const enabled = !!path;
+
+  async function handleToggle(checked: boolean) {
+    if (!checked) {
+      disableKnownFolder(name);
+      return;
+    }
+    setBusy(true);
+    try {
+      await enableKnownFolder(name);
+    } catch (err) {
+      toast.error(`Couldn't enable ${name}: ${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <label className="flex items-center justify-between gap-2 py-1 text-xs cursor-pointer">
+      <span className="flex flex-col min-w-0">
+        <span className="font-medium text-foreground">{name}</span>
+        {enabled && (
+          <span className="text-[10px] text-muted-foreground font-mono truncate">{path}</span>
+        )}
+      </span>
+      <input
+        type="checkbox"
+        checked={enabled}
+        disabled={busy}
+        onChange={(e) => void handleToggle(e.target.checked)}
+        className="accent-primary shrink-0"
+      />
+    </label>
+  );
+}
+
 function PrivacySecuritySection() {
   const { toolsEnabled, setToolEnabled, workspacePath } = useAgentStore();
 
@@ -930,6 +972,27 @@ function PrivacySecuritySection() {
               No workspace is open, so file and shell tools have nothing to confine to and will refuse to run.
               Open one from the Workspace section above.
             </p>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardContent className="p-4 space-y-1.5">
+          <p className="text-xs font-medium text-foreground flex items-center gap-1.5">
+            <FolderOpen className="size-3.5" /> Known folder access
+          </p>
+          <p className="text-[11px] text-muted-foreground leading-relaxed">
+            File tools can also reach these well-known folders beyond the open workspace — off by default, and
+            each one you turn on here is registered with the confinement layer above just like a workspace.
+          </p>
+          {!isTauriEnv() ? (
+            <p className="text-[11px] text-muted-foreground italic">Only available in the desktop app.</p>
+          ) : (
+            <div className="grid grid-cols-2 gap-x-4">
+              {KNOWN_FOLDER_NAMES.map((name) => (
+                <KnownFolderToggle key={name} name={name} />
+              ))}
+            </div>
           )}
         </CardContent>
       </Card>

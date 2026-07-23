@@ -563,6 +563,17 @@ export default function App() {
     })();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Re-register any Settings > Privacy & Security "known folder" grants (Downloads,
+  // Desktop, etc.) with the Rust confinement layer on launch — REGISTERED_ROOTS is
+  // in-memory only and resets every process start, but the user's choice persists
+  // in useAgentStore, so this replays it silently rather than requiring re-toggling.
+  useEffect(() => {
+    if (!isTauriEnv()) return;
+    for (const path of Object.values(useAgentStore.getState().extraRoots)) {
+      if (path) void invoke("register_workspace_root", { path }).catch(() => {});
+    }
+  }, []);
+
   // ─── Quick-invoke overlay (WP5.3) + result widget (WP5.4) ─────────────────
   //
   // The overlay webview (src/overlay/QuickInvoke.tsx) is a dumb input box —

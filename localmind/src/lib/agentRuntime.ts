@@ -292,6 +292,7 @@ function buildSystemPrompt(config: AgentRuntimeConfig): string {
     "- run_command: pass cwd= for subdirectories, never 'cd dir && cmd'. Never start dev servers or other long-running/blocking processes (npm start, npm run dev, flask run, etc.) — they will be killed after 30s; use build/typecheck/test commands to verify instead.",
     "- run_command executes via PowerShell on Windows and sh on Mac/Linux (see OS= above) — use that shell's syntax. On Windows: 'Remove-Item -Recurse -Force' not 'rm -rf', 'New-Item -ItemType Directory' not 'mkdir -p', '$env:VAR' not '$VAR'.",
     "- 'up to date' / 'already satisfied' / 'already installed' in install output means the dependency is present — do not re-run the install, move on.",
+    "- A tool's own success result IS the verification — e.g. download_file reporting a byte count, write_file reporting the path, fs_move/fs_copy returning without an error. Do NOT follow up a successful tool call by writing a Python/Node/PowerShell script via run_command to independently re-check the file (magic bytes, CRCs, re-reading it back, etc.) 'just to be sure' — that is unnecessary work the user did not ask for. Only investigate further if the tool result ITSELF reported an error, a suspiciously small/zero size, or a truncation — and even then, re-run the original tool (e.g. download_file again), don't hand-roll a verification script.",
     "- web_search is capped at 4 calls this session — after 1-2 searches, commit to an approach.",
     "- If a task needs today's real current date/time (e.g. appending a timestamp to a file), call get_current_datetime — NEVER guess a date, use a date from training, or web_search/web_fetch an external \"current time\" API (no such reachable API exists here; it will fail with a DNS/CORS error and waste the whole task).",
     "- Never simulate actions in text (writing out 'Todos: ... (completed)', pasting code instead of writing it, describing a command instead of running it). Every action is a real tool call. A response with no tool call ends the task.",
@@ -615,14 +616,17 @@ function resolveToolPolicy(
   call: ToolCall,
   def: ToolDef | undefined,
 ): { planModeAllowed: boolean; requiresApproval: boolean } {
-  if (call.name.includes("__")) {
-    return { planModeAllowed: false, requiresApproval: true };
-  }
   // Read-only alias keys (tools.ts TOOL_ALIASES) normalize to a built-in read
   // tool before metadata lookup would otherwise miss them under their alias name.
   if (READ_ONLY_ALIASES.includes(call.name)) {
     return { planModeAllowed: true, requiresApproval: false };
   }
+  // MCP tools (serverId__toolName) get their policy from mcp.ts's
+  // classifyMcpToolRisk, stamped onto `def` when the server's tool list was
+  // fetched — a name-based read/write heuristic (list/get/search vs.
+  // send/delete/create/etc.) instead of gating every MCP call identically at
+  // max friction. Falls through to the safe default below if `def` is
+  // missing (e.g. a stale tool name from a server that's since disconnected).
   if (def && def.planModeAllowed !== undefined && def.requiresApproval !== undefined) {
     return { planModeAllowed: def.planModeAllowed, requiresApproval: def.requiresApproval };
   }

@@ -8,14 +8,22 @@ import type { ToolCall, ToolName } from "../lib/tools";
  * (browser mode, missing folder) just mean confinement stays as-is and the
  * fs_* commands will refuse access, which surfaces as a clear error to the user.
  */
-function registerWorkspaceRoot(path: string): void {
+function invokeTauri<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   const tauri = (window as unknown as Record<string, unknown>).__TAURI__ as
-    | { core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> } }
+    | { core?: { invoke?: (cmd: string, args?: unknown) => Promise<T> } }
     | undefined;
   const invoke = tauri?.core?.invoke;
-  if (typeof invoke !== "function") return; // browser mode — no confinement layer
-  void invoke("register_workspace_root", { path }).catch(() => {});
+  if (typeof invoke !== "function") return Promise.reject(new Error("Not in Tauri desktop mode"));
+  return invoke(cmd, args);
 }
+
+function registerWorkspaceRoot(path: string): void {
+  void invokeTauri("register_workspace_root", { path }).catch(() => {});
+}
+
+/** Well-known OS folder names offered in Settings > Privacy & Security. */
+export const KNOWN_FOLDER_NAMES = ["Downloads", "Desktop", "Documents", "Pictures", "Home"] as const;
+export type KnownFolderName = (typeof KNOWN_FOLDER_NAMES)[number];
 
 interface AgentState {
   dirHandle: FileSystemDirectoryHandle | null;
@@ -23,11 +31,18 @@ interface AgentState {
   workspaceName: string | null;   // display name (folder name)
   toolsEnabled: Record<ToolName, boolean>;
   pendingToolCalls: ToolCall[];
+  /** Well-known folders the user has opted into (name -> real OS path), letting
+   *  file tools reach outside the single open workspace. Re-registered with the
+   *  Rust confinement layer on every app start (see App.tsx) since REGISTERED_ROOTS
+   *  is in-memory only and resets per-process. */
+  extraRoots: Partial<Record<KnownFolderName, string>>;
 
   setWorkspace: (handle: FileSystemDirectoryHandle | null, path: string | null, name: string | null) => void;
   setToolEnabled: (name: ToolName, enabled: boolean) => void;
   setPendingToolCalls: (calls: ToolCall[]) => void;
   clearPendingToolCalls: () => void;
+  enableKnownFolder: (name: KnownFolderName) => Promise<void>;
+  disableKnownFolder: (name: KnownFolderName) => void;
 }
 
 const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
@@ -35,9 +50,30 @@ const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   write_file: true,
   patch_file: true,
   delete_file: true,
+  move_file: true,
+  copy_file: true,
+  rename_file: true,
   list_directory: true,
   grep_files: true,
   find_files: true,
+  get_known_folder: true,
+  download_file: true,
+  compress_files: true,
+  extract_archive: true,
+  convert_image: true,
+  remove_background: true,
+  pdf_merge: true,
+  pdf_to_text: true,
+  close_window: true,
+  minimize_window: true,
+  list_processes: true,
+  kill_process: true,
+  get_disk_usage: true,
+  empty_recycle_bin: true,
+  adjust_volume: true,
+  speak_text: true,
+  print_file: true,
+  remind_me: true,
   calculator: true,
   web_search: true,
   run_command: false,
@@ -86,6 +122,7 @@ export const useAgentStore = create<AgentState>()(
       workspaceName: null,
       toolsEnabled: { ...DEFAULT_TOOLS_ENABLED },
       pendingToolCalls: [],
+      extraRoots: {},
 
       setWorkspace: (handle, path, name) => {
         // Register the real OS path with the Rust confinement layer before the rest
@@ -99,20 +136,39 @@ export const useAgentStore = create<AgentState>()(
 
       setPendingToolCalls: (calls) => set({ pendingToolCalls: calls }),
       clearPendingToolCalls: () => set({ pendingToolCalls: [] }),
+
+      enableKnownFolder: async (name) => {
+        const path = await invokeTauri<string>("get_known_folder", { name });
+        await invokeTauri("register_workspace_root", { path });
+        set((s) => ({ extraRoots: { ...s.extraRoots, [name]: path } }));
+      },
+
+      disableKnownFolder: (name) => {
+        const path = useAgentStore.getState().extraRoots[name];
+        if (path) void invokeTauri("unregister_workspace_root", { path }).catch(() => {});
+        set((s) => {
+          const next = { ...s.extraRoots };
+          delete next[name];
+          return { extraRoots: next };
+        });
+      },
     }),
     {
       name: "localmind-agent-tools",
-      // Only toolsEnabled survives a restart — dirHandle isn't serializable
-      // (and wouldn't be valid after a relaunch anyway; the workspace gets
-      // re-opened by App.tsx's own restore-by-path flow instead), and
-      // pendingToolCalls is live in-flight approval state, not a preference.
-      partialize: (state) => ({ toolsEnabled: state.toolsEnabled }),
+      // toolsEnabled and extraRoots survive a restart; dirHandle isn't
+      // serializable (and wouldn't be valid after a relaunch anyway; the
+      // workspace gets re-opened by App.tsx's own restore-by-path flow
+      // instead — extraRoots gets the analogous re-registration, see
+      // App.tsx), and pendingToolCalls is live in-flight approval state,
+      // not a preference.
+      partialize: (state) => ({ toolsEnabled: state.toolsEnabled, extraRoots: state.extraRoots }),
       // New tools added after a user's last save shouldn't vanish from the
       // record just because they're absent from what was persisted.
       merge: (persisted, current) => ({
         ...current,
         ...(persisted as Partial<AgentState>),
         toolsEnabled: { ...current.toolsEnabled, ...(persisted as Partial<AgentState>)?.toolsEnabled },
+        extraRoots: { ...current.extraRoots, ...(persisted as Partial<AgentState>)?.extraRoots },
       }),
     }
   )

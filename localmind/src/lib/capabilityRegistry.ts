@@ -3,6 +3,7 @@ import { TOOL_DEFINITIONS, getToolDefinitions } from "./tools";
 import { APP_VIEWS, VIEW_DESCRIPTIONS } from "../types/app";
 import { MCP_PRESETS } from "./mcpPresets";
 import { useMcpStore } from "../store/mcp";
+import { useAgentStore } from "../store/agent";
 import { loadDynamicTools, toOllamaTool } from "./dynamicTools";
 
 /** Stable render order for the tool-group section — mirrors ToolDef["group"]. */
@@ -73,6 +74,26 @@ function renderMcpStatus(): string {
 }
 
 /**
+ * Lists which well-known OS folders (Downloads, Desktop, etc.) the user has
+ * enabled in Settings > Privacy & Security, with their real paths, so the
+ * model can pass those absolute paths directly to read_file/write_file/
+ * list_directory/etc. without a round-trip through get_known_folder first.
+ */
+function renderExtraRoots(): string {
+  const extraRoots = useAgentStore.getState().extraRoots;
+  const entries = Object.entries(extraRoots).filter(([, path]) => !!path);
+  if (entries.length === 0) {
+    return "No extra folders are enabled — file tools only reach the open workspace. If the user asks about Downloads/Desktop/etc., tell them to enable it in Settings > Privacy & Security first.";
+  }
+  const lines = entries.map(([name, path]) => `- ${name}: ${path}`);
+  return [
+    "Folders enabled for file access beyond the open workspace (Settings > Privacy & Security):",
+    ...lines,
+    "Pass these paths directly to file tools (read_file, write_file, list_directory, find_files, grep_files, delete_file, move_file, copy_file, rename_file, create_folder).",
+  ].join("\n");
+}
+
+/**
  * Composes the full "## About LocalMind" section injected into every system
  * prompt: the tab list, the tool inventory (grouped by ToolDef metadata),
  * live MCP status, and the load-bearing standing guidance paragraphs. This is
@@ -88,6 +109,10 @@ export function buildCapabilityBlock(sessionTools: ToolDef[], verbose = true): s
     // the UI ("go to the Settings tab") instead of acting. Build sessions need
     // to know their tools and act — not tour the app.
     const lean: string[] = ["## Your tools (call these to act)", renderToolGroups(sessionTools)];
+    const extraRoots = useAgentStore.getState().extraRoots;
+    if (Object.keys(extraRoots).length > 0) {
+      lean.push("", renderExtraRoots());
+    }
     const connected = useMcpStore.getState().servers.filter((s) => s.enabled && s.status === "connected");
     if (connected.length > 0) {
       lean.push("", `Connected integrations: ${connected.map((s) => s.label).join(", ")} (their tools appear above under "integrations (MCP)").`);
@@ -101,6 +126,8 @@ export function buildCapabilityBlock(sessionTools: ToolDef[], verbose = true): s
     "",
     "Tools available this session:",
     renderToolGroups(sessionTools),
+    "",
+    renderExtraRoots(),
     "",
     renderMcpStatus(),
     "",

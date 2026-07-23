@@ -24,6 +24,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hostname = "0.4"
 dunce = "1"
+# Resolves OS well-known folders (Downloads/Desktop/Documents/Pictures/Home)
+# for the agent's "known folder" file-access tools.
+dirs = "5"
 rfd = { version = "0.15", default-features = false }
 tokio = { version = "1", features = ["process", "io-util", "rt", "sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
@@ -35,7 +38,15 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-clipboard-manager = "2"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# zip/unzip for the agent's compress_files/extract_archive tools.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# PDF tools (pdf_merge/pdf_to_text): lopdf for low-level page/object merging,
+# pdf-extract for text extraction. Neither renders pages to images — that
+# needs a real PDF renderer (pdfium/poppler), deliberately out of scope for
+# now rather than shipping something fragile on machines without one installed.
+lopdf = "0.34"
+pdf-extract = "0.7"
 # WP5.4 local IPC listener (src/ipc.rs): tiny_http is a small blocking HTTP
 # server (no axum/hyper needed for two endpoints); getrandom is already
 # resolved transitively (uuid's v4 feature pulls a newer getrandom, but 0.2's
@@ -55,8 +66,11 @@ git2 = { version = "0.19", features = ["vendored-libgit2"] }
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Gdi",
     "Win32_System_Com",
+    "Win32_Storage_FileSystem",
     "Media_Ocr",
     "Graphics_Imaging",
     "Storage_Streams",

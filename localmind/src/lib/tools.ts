@@ -1,6 +1,7 @@
 import { evaluate } from "mathjs";
 import { searchWeb } from "./search";
 import { fileExists } from "./fileSystem";
+import { TauriDirectoryHandle } from "./tauriFs";
 import { mcpCallTool } from "./mcp";
 import { useMcpStore } from "../store/mcp";
 import { injectGitCredentials, sanitizeOutput } from "../store/profile";
@@ -38,6 +39,30 @@ async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
   return core.invoke(cmd, args);
 }
 
+function base64ToBlob(base64: string, mime: string): Blob {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      const base64 = result.split(",")[1];
+      if (!base64) {
+        reject(new Error("Failed to extract base64 data from blob"));
+        return;
+      }
+      resolve(base64);
+    };
+    reader.onerror = () => reject(reader.error ?? new Error("FileReader error"));
+    reader.readAsDataURL(blob);
+  });
+}
+
 // Exposed so App.tsx can pass hardware/model info into get_system_info results
 export let _systemInfoContext: {
   model?: string;
@@ -56,9 +81,30 @@ export type ToolName =
   | "write_file"
   | "patch_file"
   | "delete_file"
+  | "move_file"
+  | "copy_file"
+  | "rename_file"
   | "list_directory"
   | "grep_files"
   | "find_files"
+  | "get_known_folder"
+  | "download_file"
+  | "compress_files"
+  | "extract_archive"
+  | "convert_image"
+  | "remove_background"
+  | "pdf_merge"
+  | "pdf_to_text"
+  | "close_window"
+  | "minimize_window"
+  | "list_processes"
+  | "kill_process"
+  | "get_disk_usage"
+  | "empty_recycle_bin"
+  | "adjust_volume"
+  | "speak_text"
+  | "print_file"
+  | "remind_me"
   | "calculator"
   | "web_search"
   | "run_command"
@@ -111,6 +157,12 @@ export interface ToolDef {
   requiresApproval?: boolean;
 }
 
+/** Appended to file-tool path descriptions so the model knows absolute paths
+ *  into a Settings > Privacy & Security-enabled folder work too, not just
+ *  workspace-relative ones. */
+const EXTRA_ROOT_PATH_HINT =
+  " Absolute paths also work if they're inside a folder the user has enabled in Settings > Privacy & Security (e.g. Downloads, Desktop) — use get_known_folder to look one up.";
+
 export const TOOL_DEFINITIONS: ToolDef[] = [
   {
     name: "read_file",
@@ -121,7 +173,7 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       properties: {
         path: {
           type: "string",
-          description: "Relative path to the file within the workspace (e.g. 'src/main.ts').",
+          description: "Relative path to the file within the workspace (e.g. 'src/main.ts')." + EXTRA_ROOT_PATH_HINT,
         },
         offset: {
           type: "number",
@@ -146,7 +198,7 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Relative path to the file within the workspace." },
+        path: { type: "string", description: "Relative path to the file within the workspace." + EXTRA_ROOT_PATH_HINT },
         content: { type: "string", description: "The full text content to write." },
       },
       required: ["path", "content"],
@@ -195,10 +247,154 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       properties: {
         path: {
           type: "string",
-          description: "Optional sub-path within the workspace. Defaults to root.",
+          description: "Optional sub-path within the workspace. Defaults to root." + EXTRA_ROOT_PATH_HINT,
         },
       },
       required: [],
+    },
+    group: "files",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "get_known_folder",
+    description:
+      "Resolve a well-known OS folder (Downloads, Desktop, Documents, Pictures, Home) to its real absolute path on this computer. This only looks up the path — it does NOT grant access. Other file tools (read_file/write_file/list_directory/etc.) can only actually use that path if the user has enabled it in Settings > Privacy & Security first; if a subsequent file-tool call is refused, tell the user which folder to enable there rather than retrying.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "One of: downloads, desktop, documents, pictures, home.",
+        },
+      },
+      required: ["name"],
+    },
+    group: "files",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "download_file",
+    description:
+      "Download a URL's binary content (image, PDF, zip, etc.) straight to disk. Use this instead of web_fetch when you need the actual file bytes, not just page text — web_fetch strips HTML and returns text only." + EXTRA_ROOT_PATH_HINT,
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "The URL to download (must start with http:// or https://)." },
+        dest_path: { type: "string", description: "Where to save it. Relative paths resolve against the open workspace." },
+      },
+      required: ["url", "dest_path"],
+    },
+    group: "web",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "remove_background",
+    description:
+      "Remove the background from an image, producing a transparent PNG. Runs the same on-device model used by the Image tab's 'Remove background' button — no network call.",
+    parameters: {
+      type: "object",
+      properties: {
+        src_path: { type: "string", description: "Path to the source image." + EXTRA_ROOT_PATH_HINT },
+        dest_path: { type: "string", description: "Where to save the result (should end in .png — the output always has transparency)." },
+      },
+      required: ["src_path", "dest_path"],
+    },
+    group: "media",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "convert_image",
+    description:
+      "Convert an image's format and/or resize it (downscale only, aspect ratio preserved). Output format is inferred from dest_path's extension (.png/.jpg/.jpeg).",
+    parameters: {
+      type: "object",
+      properties: {
+        src_path: { type: "string", description: "Path to the source image." + EXTRA_ROOT_PATH_HINT },
+        dest_path: { type: "string", description: "Where to save the converted image — its extension determines the output format." },
+        max_width: { type: "number", description: "Optional max width in pixels. Omit to leave width unconstrained." },
+        max_height: { type: "number", description: "Optional max height in pixels. Omit to leave height unconstrained." },
+      },
+      required: ["src_path", "dest_path"],
+    },
+    group: "media",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "compress_files",
+    description: "Create a zip archive containing the given files and/or directories (directories are added recursively).",
+    parameters: {
+      type: "object",
+      properties: {
+        paths: {
+          type: "array",
+          items: { type: "string" },
+          description: "Files/directories to include." + EXTRA_ROOT_PATH_HINT,
+        },
+        dest_path: { type: "string", description: "Path for the resulting .zip file." },
+      },
+      required: ["paths", "dest_path"],
+    },
+    group: "files",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "extract_archive",
+    description: "Extract a zip archive's contents into a destination directory (created if it doesn't exist).",
+    parameters: {
+      type: "object",
+      properties: {
+        archive_path: { type: "string", description: "Path to the .zip file." + EXTRA_ROOT_PATH_HINT },
+        dest_dir: { type: "string", description: "Directory to extract into." },
+      },
+      required: ["archive_path", "dest_dir"],
+    },
+    group: "files",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "pdf_merge",
+    description: "Merge multiple PDF files into one, in the given order.",
+    parameters: {
+      type: "object",
+      properties: {
+        paths: {
+          type: "array",
+          items: { type: "string" },
+          description: "PDF file paths to merge, in order (need at least 2)." + EXTRA_ROOT_PATH_HINT,
+        },
+        dest_path: { type: "string", description: "Path for the resulting merged PDF." },
+      },
+      required: ["paths", "dest_path"],
+    },
+    group: "files",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "pdf_to_text",
+    description:
+      "Extract plain text from a PDF. Works well for text-based PDFs; scanned/image-only PDFs may yield little or nothing since there is no OCR step.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to the PDF file." + EXTRA_ROOT_PATH_HINT },
+      },
+      required: ["path"],
     },
     group: "files",
     risk: "read",
@@ -301,7 +497,7 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
         },
         path: {
           type: "string",
-          description: "Directory (not a file) to search in, relative to workspace root. Defaults to root — omit rather than pointing this at a single file.",
+          description: "Directory (not a file) to search in, relative to workspace root. Defaults to root — omit rather than pointing this at a single file." + EXTRA_ROOT_PATH_HINT,
         },
         file_pattern: {
           type: "string",
@@ -328,10 +524,60 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       properties: {
         path: {
           type: "string",
-          description: "Relative path to the file within the workspace (e.g. 'src/old.ts').",
+          description: "Relative path to the file within the workspace (e.g. 'src/old.ts')." + EXTRA_ROOT_PATH_HINT,
         },
       },
       required: ["path"],
+    },
+    group: "files",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "move_file",
+    description:
+      "Move (or rename, if 'to' is in the same folder) a file or directory. Works within the open workspace, or between any folders the user has enabled in Settings > Privacy & Security (e.g. moving a file from Downloads into the workspace, or organizing files within Downloads).",
+    parameters: {
+      type: "object",
+      properties: {
+        from: { type: "string", description: "Path to the existing file/directory. Relative paths resolve against the open workspace; absolute paths must be inside the workspace or an enabled folder." },
+        to: { type: "string", description: "Destination path, same rules as 'from'. Parent directories are created as needed." },
+      },
+      required: ["from", "to"],
+    },
+    group: "files",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "copy_file",
+    description:
+      "Copy a file or directory (recursively) to a new location, leaving the original in place. Same path rules as move_file.",
+    parameters: {
+      type: "object",
+      properties: {
+        from: { type: "string", description: "Path to the existing file/directory." },
+        to: { type: "string", description: "Destination path. Parent directories are created as needed." },
+      },
+      required: ["from", "to"],
+    },
+    group: "files",
+    risk: "mutate",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "rename_file",
+    description: "Rename a file or directory in place (keeps it in the same folder). For moving to a different folder, use move_file instead.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to the existing file/directory." },
+        new_name: { type: "string", description: "The new file/directory name (not a full path — just the name)." },
+      },
+      required: ["path", "new_name"],
     },
     group: "files",
     risk: "mutate",
@@ -351,7 +597,7 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
         },
         path: {
           type: "string",
-          description: "Directory (not a file) to search in, relative to workspace root. Defaults to root — omit rather than pointing this at a single file.",
+          description: "Directory (not a file) to search in, relative to workspace root. Defaults to root — omit rather than pointing this at a single file." + EXTRA_ROOT_PATH_HINT,
         },
       },
       required: ["pattern"],
@@ -480,6 +726,146 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
     },
     group: "state",
     risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "close_window",
+    description: "Close a window (a normal close request, same as clicking its X button — well-behaved apps get a chance to prompt for unsaved changes) by the id returned from list_windows.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "The window id from list_windows." },
+      },
+      required: ["id"],
+    },
+    group: "state",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "minimize_window",
+    description: "Minimize a window by the id returned from list_windows.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "The window id from list_windows." },
+      },
+      required: ["id"],
+    },
+    group: "state",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "list_processes",
+    description: "List running processes (pid + name). Use to find the pid of a process you want to terminate with kill_process.",
+    parameters: { type: "object", properties: {}, required: [] },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "kill_process",
+    description: "Forcibly terminate a process by pid (from list_processes). Unsaved work in that process is lost. Be careful with system-critical processes — only kill what the user clearly asked to stop.",
+    parameters: {
+      type: "object",
+      properties: {
+        pid: { type: "number", description: "Process id from list_processes." },
+      },
+      required: ["pid"],
+    },
+    group: "state",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "get_disk_usage",
+    description: "Get total/free disk space for a drive.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "A path on the drive to check, e.g. 'C:\\'. Omit to check the system drive." },
+      },
+      required: [],
+    },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "empty_recycle_bin",
+    description: "Empty the Recycle Bin. Cannot be undone.",
+    parameters: { type: "object", properties: {}, required: [] },
+    group: "state",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "adjust_volume",
+    description: "Adjust system volume by simulating a physical media key press — relative steps and mute only, not an exact percentage.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", description: "One of: mute, up, down." },
+      },
+      required: ["action"],
+    },
+    group: "state",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "speak_text",
+    description: "Read text aloud through the system's built-in text-to-speech voice (offline, no network call). Use for hands-free/ambient responses when the user is asking for something to be read out rather than typed.",
+    parameters: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "The text to speak (capped at 1000 characters — keep it concise)." },
+      },
+      required: ["text"],
+    },
+    group: "media",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "print_file",
+    description: "Ask the OS to print a file via its default application's Print handler (like right-click > Print). Works for common types (images, PDFs, documents) whose default app supports it — not guaranteed for every file type, and needs a configured default printer.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to the file to print." + EXTRA_ROOT_PATH_HINT },
+      },
+      required: ["path"],
+    },
+    group: "files",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "remind_me",
+    description: "Set a one-time reminder that pushes an OS notification with the given message at the given time — for casual 'remind me to X' requests. For anything recurring, use schedule_task instead.",
+    parameters: {
+      type: "object",
+      properties: {
+        message: { type: "string", description: "The reminder text to show the user." },
+        in_minutes: { type: "number", description: "Fire this many minutes from now. Use this OR at_unix_seconds, not both." },
+        at_unix_seconds: { type: "number", description: "Fire at this absolute Unix timestamp (seconds) — get the current time from get_current_datetime first if computing an absolute time like '3pm today'." },
+      },
+      required: ["message"],
+    },
+    group: "state",
+    risk: "mutate",
     planModeAllowed: false,
     requiresApproval: true,
   },
@@ -1237,6 +1623,87 @@ export function normalizeWorkspaceRelativeSubPath(p: string, workspacePath: stri
   return resolveWorkspaceRelativeParts(trimmed, workspacePath).join("/");
 }
 
+/**
+ * Resolves a model-supplied path (relative or absolute) to a (root handle,
+ * relative parts) pair for the FSA-shaped file tools (read_file/write_file/
+ * patch_file/delete_file/list_directory/grep_files/find_files). Relative
+ * paths and absolute paths inside the open workspace resolve against
+ * `dirHandle`, same as resolveWorkspaceRelativeParts. Absolute paths inside a
+ * folder the user has enabled in Settings > Privacy & Security (extraRoots —
+ * Downloads, Desktop, etc.) resolve against a fresh handle rooted there
+ * instead, so file tools can reach outside the single open workspace.
+ * TauriDirectoryHandle duck-types FileSystemDirectoryHandle (see tauriFs.ts),
+ * so callers' existing walk logic (resolveDirHandle, getFileHandle, etc.)
+ * needs no changes regardless of which root this returns — and Rust's
+ * ensure_confined is still the real security boundary underneath either root.
+ */
+export function resolveFileRoot(
+  rawPath: string,
+  dirHandle: FileSystemDirectoryHandle | null,
+  workspacePath: string | null | undefined
+): { root: FileSystemDirectoryHandle; parts: string[] } {
+  const trimmed = rawPath.trim();
+  const normRaw = trimmed.replace(/\\/g, "/");
+
+  if (ABSOLUTE_PATH_RE.test(trimmed)) {
+    if (workspacePath) {
+      const normWorkspace = workspacePath.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+      if (normRaw.toLowerCase() === normWorkspace || normRaw.toLowerCase().startsWith(normWorkspace + "/")) {
+        if (!dirHandle) throw new Error("No workspace directory set. Ask the user to open a folder.");
+        const rel = normRaw.slice(normWorkspace.length).replace(/^\/+/, "");
+        return { root: dirHandle, parts: resolvePathParts(rel) };
+      }
+    }
+    const extraRoots = useAgentStore.getState().extraRoots;
+    for (const rootPath of Object.values(extraRoots)) {
+      if (!rootPath) continue;
+      const normRoot = rootPath.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+      if (normRaw.toLowerCase() === normRoot || normRaw.toLowerCase().startsWith(normRoot + "/")) {
+        const rel = normRaw.slice(normRoot.length).replace(/^\/+/, "");
+        return {
+          root: new TauriDirectoryHandle(rootPath) as unknown as FileSystemDirectoryHandle,
+          parts: resolvePathParts(rel),
+        };
+      }
+    }
+    const enabledNames = Object.keys(extraRoots);
+    const hint = enabledNames.length > 0
+      ? ` Enabled folders: ${enabledNames.join(", ")}. Use get_known_folder to look up others, and tell the user to enable them in Settings > Privacy & Security.`
+      : " No extra folders are enabled — tell the user to enable one in Settings > Privacy & Security (e.g. Downloads) to reach outside the workspace.";
+    throw new Error(
+      `Absolute path "${rawPath}" is outside the current workspace root${workspacePath ? ` ("${workspacePath}")` : ""} and no enabled folder covers it.${hint}`
+    );
+  }
+
+  // Relative path — resolves against the open workspace.
+  if (!dirHandle) {
+    throw new Error(
+      `Relative path "${rawPath}" given but no workspace is open — open a workspace folder, or pass an absolute path inside a folder enabled in Settings > Privacy & Security.`
+    );
+  }
+  return { root: dirHandle, parts: resolvePathParts(trimmed) };
+}
+
+/**
+ * Resolves a model-supplied path to a plain absolute OS path string, for the
+ * native Rust-backed tools (move_file/copy_file/rename_file) that operate on
+ * path strings directly rather than a FileSystemDirectoryHandle. Confinement
+ * is still enforced server-side by Rust's ensure_confined — this only builds
+ * a plausible absolute path and grants no access by itself.
+ */
+export function resolveNativeAbsolutePath(rawPath: string, workspacePath: string | null | undefined): string {
+  const trimmed = rawPath.trim();
+  if (!trimmed) throw new Error("Missing path argument");
+  if (ABSOLUTE_PATH_RE.test(trimmed)) {
+    return trimmed.replace(/\\/g, "/");
+  }
+  if (!workspacePath) {
+    throw new Error(`Relative path "${rawPath}" given but no workspace is open — pass an absolute path instead.`);
+  }
+  const base = workspacePath.replace(/\\/g, "/").replace(/\/+$/, "");
+  return `${base}/${resolvePathParts(trimmed).join("/")}`;
+}
+
 async function resolveDirHandle(
   root: FileSystemDirectoryHandle,
   parts: string[]
@@ -1522,13 +1989,11 @@ export async function executeTool(
       }
 
       case "list_directory": {
-        if (!dirHandle) return noWorkspace(call);
-        const subPath = normalizeWorkspaceRelativeSubPath(argStr(call.args["path"]), workspacePath);
-        let targetHandle = dirHandle;
-        if (subPath) {
-          const parts = subPath.split("/").filter(Boolean);
-          const resolved = await resolveDirHandle(dirHandle, parts);
-          if (!resolved) throw new Error(`Directory not found: ${subPath}`);
+        const { root, parts } = resolveFileRoot(argStr(call.args["path"]), dirHandle, workspacePath);
+        let targetHandle = root;
+        if (parts.length > 0) {
+          const resolved = await resolveDirHandle(root, parts);
+          if (!resolved) throw new Error(`Directory not found: ${parts.join("/")}`);
           targetHandle = resolved;
         }
         const entries = await listEntries(targetHandle, 2);
@@ -1540,14 +2005,13 @@ export async function executeTool(
       }
 
       case "read_file": {
-        if (!dirHandle) return noWorkspace(call);
         const path = argStr(call.args["path"]) || argStr(call.args["file_path"]) || argStr(call.args["filename"]);
         if (!path) throw new Error("Missing path argument");
-        const parts = resolveWorkspaceRelativeParts(path, workspacePath);
+        const { root, parts } = resolveFileRoot(path, dirHandle, workspacePath);
         const fileName = parts.pop()!;
-        let parentHandle = dirHandle;
+        let parentHandle = root;
         if (parts.length > 0) {
-          const resolved = await resolveDirHandle(dirHandle, parts);
+          const resolved = await resolveDirHandle(root, parts);
           if (!resolved) throw new Error(`Directory not found: ${parts.join("/")}`);
           parentHandle = resolved;
         }
@@ -1582,23 +2046,22 @@ export async function executeTool(
       }
 
       case "write_file": {
-        if (!dirHandle) return noWorkspace(call);
         // Accept file_path as alias for path (models sometimes use the wrong param name)
         const path = argStr(call.args["path"]) || argStr(call.args["file_path"]) || argStr(call.args["filename"]);
         const content = argStr(call.args["content"]) || argStr(call.args["text"]) || argStr(call.args["code"]);
         if (!path) throw new Error("Missing path argument (expected 'path', 'file_path', or 'filename')");
-        const parts = resolveWorkspaceRelativeParts(path, workspacePath);
+        const { root, parts } = resolveFileRoot(path, dirHandle, workspacePath);
         const normalizedPath = parts.join("/");
 
         // Overwriting an existing file is now recovered via shadow-git
         // history (every mutating tool call is auto-committed after it
         // runs) rather than the old per-write sibling-folder backup.
-        const overwritingExisting = await fileExists(dirHandle, normalizedPath);
+        const overwritingExisting = await fileExists(root, normalizedPath);
 
         const fileName = parts.pop()!;
-        let parentHandle = dirHandle;
+        let parentHandle = root;
         if (parts.length > 0) {
-          let cursor: FileSystemDirectoryHandle = dirHandle;
+          let cursor: FileSystemDirectoryHandle = root;
           for (const part of parts) {
             cursor = await cursor.getDirectoryHandle(part, { create: true });
           }
@@ -1622,7 +2085,6 @@ export async function executeTool(
       }
 
       case "patch_file": {
-        if (!dirHandle) return noWorkspace(call);
         const path = argStr(call.args["path"]);
         const oldString = call.args["old_string"] != null ? String(call.args["old_string"]) : null;
         const newString = call.args["new_string"] != null ? String(call.args["new_string"]) : "";
@@ -1631,11 +2093,11 @@ export async function executeTool(
         if (!path) throw new Error("Missing path argument");
         if (oldString === null) throw new Error("Missing old_string argument");
 
-        const patchParts = resolveWorkspaceRelativeParts(path, workspacePath);
+        const { root: patchRoot, parts: patchParts } = resolveFileRoot(path, dirHandle, workspacePath);
         const patchFileName = patchParts.pop()!;
-        let patchParent = dirHandle;
+        let patchParent = patchRoot;
         if (patchParts.length > 0) {
-          const resolved = await resolveDirHandle(dirHandle, patchParts);
+          const resolved = await resolveDirHandle(patchRoot, patchParts);
           if (!resolved) throw new Error(`Directory not found: ${patchParts.join("/")}`);
           patchParent = resolved;
         }
@@ -1684,18 +2146,17 @@ export async function executeTool(
       }
 
       case "grep_files": {
-        if (!dirHandle) return noWorkspace(call);
         const pattern = argStr(call.args["pattern"]);
         if (!pattern) throw new Error("Missing pattern argument");
-        const searchPath = normalizeWorkspaceRelativeSubPath(argStr(call.args["path"]), workspacePath);
+        const { root: grepRoot, parts: grepParts } = resolveFileRoot(argStr(call.args["path"]), dirHandle, workspacePath);
+        const searchPath = grepParts.join("/");
         const fileGlob = argStr(call.args["file_pattern"]) || "*";
         const caseSensitive = (call.args["case_sensitive"] as boolean | undefined) ?? false;
 
-        let targetHandle = dirHandle;
-        if (searchPath) {
-          const parts = searchPath.split("/").filter(Boolean);
-          const resolved = await resolveDirHandle(dirHandle, parts);
-          if (!resolved) throw new Error(await describeDirResolutionFailure(dirHandle, searchPath, parts));
+        let targetHandle = grepRoot;
+        if (grepParts.length > 0) {
+          const resolved = await resolveDirHandle(grepRoot, grepParts);
+          if (!resolved) throw new Error(await describeDirResolutionFailure(grepRoot, searchPath, grepParts));
           targetHandle = resolved;
         }
 
@@ -1721,16 +2182,15 @@ export async function executeTool(
       }
 
       case "find_files": {
-        if (!dirHandle) return noWorkspace(call);
         const pattern = argStr(call.args["pattern"]);
         if (!pattern) throw new Error("Missing pattern argument");
-        const searchPath = normalizeWorkspaceRelativeSubPath(argStr(call.args["path"]), workspacePath);
+        const { root: findRoot, parts: findParts } = resolveFileRoot(argStr(call.args["path"]), dirHandle, workspacePath);
+        const searchPath = findParts.join("/");
 
-        let targetHandle = dirHandle;
-        if (searchPath) {
-          const parts = searchPath.split("/").filter(Boolean);
-          const resolved = await resolveDirHandle(dirHandle, parts);
-          if (!resolved) throw new Error(await describeDirResolutionFailure(dirHandle, searchPath, parts));
+        let targetHandle = findRoot;
+        if (findParts.length > 0) {
+          const resolved = await resolveDirHandle(findRoot, findParts);
+          if (!resolved) throw new Error(await describeDirResolutionFailure(findRoot, searchPath, findParts));
           targetHandle = resolved;
         }
 
@@ -1748,15 +2208,14 @@ export async function executeTool(
       }
 
       case "delete_file": {
-        if (!dirHandle) return noWorkspace(call);
         const path = argStr(call.args["path"]);
         if (!path) throw new Error("Missing path argument");
-        const parts = resolveWorkspaceRelativeParts(path, workspacePath);
-        const fileName = parts.pop()!;
-        let parentHandle = dirHandle;
-        if (parts.length > 0) {
-          const resolved = await resolveDirHandle(dirHandle, parts);
-          if (!resolved) throw new Error(`Directory not found: ${parts.join("/")}`);
+        const { root: delRoot, parts: delParts } = resolveFileRoot(path, dirHandle, workspacePath);
+        const fileName = delParts.pop()!;
+        let parentHandle = delRoot;
+        if (delParts.length > 0) {
+          const resolved = await resolveDirHandle(delRoot, delParts);
+          if (!resolved) throw new Error(`Directory not found: ${delParts.join("/")}`);
           parentHandle = resolved;
         }
         await parentHandle.removeEntry(fileName, { recursive: false });
@@ -1765,6 +2224,140 @@ export async function executeTool(
           name: call.name,
           output: `Deleted: ${path}`,
         };
+      }
+
+      case "move_file": {
+        const fromArg = argStr(call.args["from"]) || argStr(call.args["source"]) || argStr(call.args["path"]);
+        const toArg = argStr(call.args["to"]) || argStr(call.args["destination"]);
+        if (!fromArg) throw new Error("Missing 'from' argument");
+        if (!toArg) throw new Error("Missing 'to' argument");
+        const from = resolveNativeAbsolutePath(fromArg, workspacePath);
+        const to = resolveNativeAbsolutePath(toArg, workspacePath);
+        await tauriInvoke("fs_move", { from, to });
+        return { toolCallId: call.id, name: call.name, output: `Moved ${from} -> ${to}` };
+      }
+
+      case "copy_file": {
+        const fromArg = argStr(call.args["from"]) || argStr(call.args["source"]) || argStr(call.args["path"]);
+        const toArg = argStr(call.args["to"]) || argStr(call.args["destination"]);
+        if (!fromArg) throw new Error("Missing 'from' argument");
+        if (!toArg) throw new Error("Missing 'to' argument");
+        const from = resolveNativeAbsolutePath(fromArg, workspacePath);
+        const to = resolveNativeAbsolutePath(toArg, workspacePath);
+        await tauriInvoke("fs_copy", { from, to });
+        return { toolCallId: call.id, name: call.name, output: `Copied ${from} -> ${to}` };
+      }
+
+      case "rename_file": {
+        const pathArg = argStr(call.args["path"]);
+        const newName = argStr(call.args["new_name"]) || argStr(call.args["name"]);
+        if (!pathArg) throw new Error("Missing path argument");
+        if (!newName) throw new Error("Missing new_name argument");
+        if (newName.includes("/") || newName.includes("\\")) {
+          throw new Error("new_name must be a plain name, not a path — use move_file to relocate to a different folder.");
+        }
+        const from = resolveNativeAbsolutePath(pathArg, workspacePath);
+        const parentDir = from.slice(0, from.lastIndexOf("/"));
+        const to = `${parentDir}/${newName}`;
+        await tauriInvoke("fs_move", { from, to });
+        return { toolCallId: call.id, name: call.name, output: `Renamed to ${to}` };
+      }
+
+      case "get_known_folder": {
+        const name = argStr(call.args["name"]);
+        if (!name) throw new Error("Missing name argument");
+        const path = await tauriInvoke<string>("get_known_folder", { name });
+        const enabled = Object.values(useAgentStore.getState().extraRoots).some(
+          (p) => p?.toLowerCase() === path.toLowerCase()
+        );
+        const note = enabled
+          ? ""
+          : `\n(Not yet enabled for file access — ask the user to turn it on in Settings > Privacy & Security before using it with other file tools.)`;
+        return { toolCallId: call.id, name: call.name, output: path + note };
+      }
+
+      case "download_file": {
+        const url = argStr(call.args["url"]);
+        const destArg = argStr(call.args["dest_path"]) || argStr(call.args["path"]);
+        if (!url) throw new Error("Missing url argument");
+        if (!destArg) throw new Error("Missing dest_path argument");
+        const destPath = resolveNativeAbsolutePath(destArg, workspacePath);
+        const bytes = await tauriInvoke<number>("fetch_binary", { url, destPath });
+        return { toolCallId: call.id, name: call.name, output: `Downloaded ${bytes} bytes to ${destPath}` };
+      }
+
+      case "remove_background": {
+        const srcArg = argStr(call.args["src_path"]) || argStr(call.args["path"]);
+        const destArg = argStr(call.args["dest_path"]);
+        if (!srcArg) throw new Error("Missing src_path argument");
+        if (!destArg) throw new Error("Missing dest_path argument");
+        const srcPath = resolveNativeAbsolutePath(srcArg, workspacePath);
+        const destPath = resolveNativeAbsolutePath(destArg, workspacePath);
+        const srcBase64 = await tauriInvoke<string>("fs_read_file_base64", { path: srcPath });
+        const srcBlob = base64ToBlob(srcBase64, "image/png");
+        const { removeBackground } = await import("@imgly/background-removal");
+        const resultBlob = await removeBackground(srcBlob);
+        const resultBase64 = await blobToBase64(resultBlob);
+        await tauriInvoke("fs_write_file_base64", { path: destPath, dataBase64: resultBase64 });
+        return { toolCallId: call.id, name: call.name, output: `Background removed: ${destPath}` };
+      }
+
+      case "convert_image": {
+        const srcArg = argStr(call.args["src_path"]) || argStr(call.args["path"]);
+        const destArg = argStr(call.args["dest_path"]);
+        if (!srcArg) throw new Error("Missing src_path argument");
+        if (!destArg) throw new Error("Missing dest_path argument");
+        const srcPath = resolveNativeAbsolutePath(srcArg, workspacePath);
+        const destPath = resolveNativeAbsolutePath(destArg, workspacePath);
+        const rawMaxW = call.args["max_width"];
+        const rawMaxH = call.args["max_height"];
+        const maxWidth = rawMaxW != null && Number.isFinite(Number(rawMaxW)) ? Math.floor(Number(rawMaxW)) : undefined;
+        const maxHeight = rawMaxH != null && Number.isFinite(Number(rawMaxH)) ? Math.floor(Number(rawMaxH)) : undefined;
+        await tauriInvoke("image_convert", { srcPath, destPath, maxWidth, maxHeight });
+        return { toolCallId: call.id, name: call.name, output: `Converted: ${destPath}` };
+      }
+
+      case "compress_files": {
+        const rawPaths = call.args["paths"];
+        const inputPaths = Array.isArray(rawPaths) ? rawPaths.map((p) => String(p)) : [];
+        if (inputPaths.length === 0) throw new Error("Missing paths argument (expected a non-empty array)");
+        const destArg = argStr(call.args["dest_path"]);
+        if (!destArg) throw new Error("Missing dest_path argument");
+        const paths = inputPaths.map((p) => resolveNativeAbsolutePath(p, workspacePath));
+        const destPath = resolveNativeAbsolutePath(destArg, workspacePath);
+        await tauriInvoke("fs_compress", { paths, destPath });
+        return { toolCallId: call.id, name: call.name, output: `Created archive: ${destPath}` };
+      }
+
+      case "extract_archive": {
+        const archiveArg = argStr(call.args["archive_path"]) || argStr(call.args["path"]);
+        const destArg = argStr(call.args["dest_dir"]);
+        if (!archiveArg) throw new Error("Missing archive_path argument");
+        if (!destArg) throw new Error("Missing dest_dir argument");
+        const archivePath = resolveNativeAbsolutePath(archiveArg, workspacePath);
+        const destDir = resolveNativeAbsolutePath(destArg, workspacePath);
+        await tauriInvoke("fs_extract", { archivePath, destDir });
+        return { toolCallId: call.id, name: call.name, output: `Extracted to: ${destDir}` };
+      }
+
+      case "pdf_merge": {
+        const rawPaths = call.args["paths"];
+        const inputPaths = Array.isArray(rawPaths) ? rawPaths.map((p) => String(p)) : [];
+        if (inputPaths.length < 2) throw new Error("Missing paths argument (expected an array of at least 2 PDF paths)");
+        const destArg = argStr(call.args["dest_path"]);
+        if (!destArg) throw new Error("Missing dest_path argument");
+        const paths = inputPaths.map((p) => resolveNativeAbsolutePath(p, workspacePath));
+        const destPath = resolveNativeAbsolutePath(destArg, workspacePath);
+        await tauriInvoke("pdf_merge", { paths, destPath });
+        return { toolCallId: call.id, name: call.name, output: `Merged PDF: ${destPath}` };
+      }
+
+      case "pdf_to_text": {
+        const pathArg = argStr(call.args["path"]);
+        if (!pathArg) throw new Error("Missing path argument");
+        const path = resolveNativeAbsolutePath(pathArg, workspacePath);
+        const text = await tauriInvoke<string>("pdf_to_text", { path });
+        return { toolCallId: call.id, name: call.name, output: text };
       }
 
       case "run_command": {
@@ -2576,6 +3169,99 @@ export async function executeTool(
           toolCallId: call.id,
           name: call.name,
           output,
+        };
+      }
+
+      case "close_window": {
+        const id = argStr(call.args["id"]);
+        if (!id) throw new Error("Missing id argument");
+        const output = await tauriInvoke<string>("close_window", { id });
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      case "minimize_window": {
+        const id = argStr(call.args["id"]);
+        if (!id) throw new Error("Missing id argument");
+        const output = await tauriInvoke<string>("minimize_window", { id });
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      case "list_processes": {
+        const processes = await tauriInvoke<Array<{ pid: number; name: string }>>("list_processes");
+        const output = processes.length === 0
+          ? "No processes found."
+          : processes.map((p) => `${p.pid}\t${p.name}`).join("\n");
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      case "kill_process": {
+        const rawPid = call.args["pid"];
+        const pid = rawPid != null ? Math.floor(Number(rawPid)) : NaN;
+        if (!Number.isFinite(pid) || pid <= 0) throw new Error("Missing or invalid pid argument");
+        const output = await tauriInvoke<string>("kill_process", { pid });
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      case "get_disk_usage": {
+        const path = argStr(call.args["path"]) || undefined;
+        const usage = await tauriInvoke<{ total_bytes: number; free_bytes: number }>("get_disk_usage", { path });
+        const gb = (n: number) => (n / (1024 ** 3)).toFixed(1);
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `${gb(usage.free_bytes)} GB free of ${gb(usage.total_bytes)} GB total`,
+        };
+      }
+
+      case "empty_recycle_bin": {
+        const output = await tauriInvoke<string>("empty_recycle_bin");
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      case "adjust_volume": {
+        const action = argStr(call.args["action"]);
+        if (!action) throw new Error("Missing action argument");
+        const output = await tauriInvoke<string>("adjust_volume", { action });
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      case "speak_text": {
+        const text = argStr(call.args["text"]);
+        if (!text) throw new Error("Missing text argument");
+        const output = await tauriInvoke<string>("speak_text", { text });
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      case "print_file": {
+        const pathArg = argStr(call.args["path"]);
+        if (!pathArg) throw new Error("Missing path argument");
+        const path = resolveNativeAbsolutePath(pathArg, workspacePath);
+        const output = await tauriInvoke<string>("print_file", { path });
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      case "remind_me": {
+        const message = argStr(call.args["message"]) || argStr(call.args["reminder"]) || argStr(call.args["text"]);
+        if (!message) throw new Error("Missing message argument");
+        const rawAtUnix = call.args["at_unix_seconds"];
+        const rawInMinutes = call.args["in_minutes"];
+        let atSeconds: number;
+        if (rawAtUnix != null && Number.isFinite(Number(rawAtUnix))) {
+          atSeconds = Math.floor(Number(rawAtUnix));
+        } else if (rawInMinutes != null && Number.isFinite(Number(rawInMinutes))) {
+          atSeconds = Math.floor(Date.now() / 1000) + Math.round(Number(rawInMinutes) * 60);
+        } else {
+          throw new Error("Provide either in_minutes (relative) or at_unix_seconds (absolute — use get_current_datetime first if computing a specific clock time).");
+        }
+        const schedule = normalizeSchedule(`once:${atSeconds}`);
+        const task = `This is a one-time scheduled reminder. Do not call any tools — simply respond with exactly this reminder text so it can be shown to the user: "${message}"`;
+        const spec = buildJobSpec(task, schedule);
+        const id = crypto.randomUUID();
+        await tauriInvoke("jobs_insert", { id, spec, nextRunAt: computeInitialNextRun(schedule), status: "active" });
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Reminder set: "${message}" (${describeSchedule(schedule)}). Job id: ${id}. This task is now done — do not schedule it again.`,
         };
       }
 

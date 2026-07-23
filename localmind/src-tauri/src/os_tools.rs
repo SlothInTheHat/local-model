@@ -211,6 +211,257 @@ pub fn focus_window(id: String) -> Result<String, String> {
     }
 }
 
+/// Close a window (posts a normal close request, same as clicking its X
+/// button — well-behaved apps get a chance to prompt for unsaved changes)
+/// by the id returned from `list_windows`.
+#[tauri::command]
+pub fn close_window(id: String) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_impl::close_window(&id)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = id;
+        Err("Window control is only supported on Windows".to_string())
+    }
+}
+
+/// Minimize a window by the id returned from `list_windows`.
+#[tauri::command]
+pub fn minimize_window(id: String) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_impl::minimize_window(&id)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = id;
+        Err("Window control is only supported on Windows".to_string())
+    }
+}
+
+/// Escape a string for embedding in a PowerShell SINGLE-quoted literal — the
+/// only escape single-quoted PS strings need is doubling embedded `'`
+/// characters; backticks/`$`/etc. are literal (unlike double-quoted PS
+/// strings, which would need much more care). Shared by speak_text and
+/// print_file, both of which pass user-controlled text into a PS one-liner.
+#[cfg(target_os = "windows")]
+fn escape_powershell_single_quoted(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Cap on how much text a single speak_text call will read aloud — long text
+/// blocks the command for a long time (SpeechSynthesizer.Speak is
+/// synchronous) with no way to cancel mid-utterance, so this bounds worst case.
+const SPEAK_TEXT_MAX_CHARS: usize = 1000;
+
+/// Read text aloud via Windows' built-in SAPI speech synthesizer (System.Speech,
+/// same engine Narrator/other Windows apps use) — no extra dependency, no
+/// network call. Synchronous: blocks until speech finishes.
+#[tauri::command]
+pub fn speak_text(text: String) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Err("speak_text: empty text".to_string());
+        }
+        let (spoken, truncated) = if trimmed.chars().count() > SPEAK_TEXT_MAX_CHARS {
+            (trimmed.chars().take(SPEAK_TEXT_MAX_CHARS).collect::<String>(), true)
+        } else {
+            (trimmed.to_string(), false)
+        };
+        let escaped = escape_powershell_single_quoted(&spoken);
+        let script = format!(
+            "Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{escaped}')"
+        );
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .map_err(|e| format!("Failed to run speech synthesizer: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!("speak_text failed: {stderr}"));
+        }
+        Ok(if truncated {
+            format!("Spoke the text aloud (truncated to {SPEAK_TEXT_MAX_CHARS} characters).")
+        } else {
+            "Spoke the text aloud.".to_string()
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = text;
+        Err("Text-to-speech is only supported on Windows".to_string())
+    }
+}
+
+/// Ask the OS to print a file via its default handler's "Print" verb (same as
+/// right-click → Print in Explorer). Works for common types (images, PDFs,
+/// Office docs) whose registered app supports that verb — not universal, and
+/// like open_application this is a best-effort request, not a confirmed print.
+#[tauri::command]
+pub fn print_file(path: String) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let escaped = escape_powershell_single_quoted(&path);
+        let script = format!("Start-Process -FilePath '{escaped}' -Verb Print");
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .map_err(|e| format!("Failed to request print: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!(
+                "print_file: could not print '{path}' ({stderr}). The file's default app may not support the Print verb, or there may be no default printer configured."
+            ));
+        }
+        Ok(format!("Requested print of '{path}' via its default application."))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        Err("Printing is only supported on Windows".to_string())
+    }
+}
+
+// ─── Process listing / termination ─────────────────────────────────────────
+//
+// Shells out to the OS's own process tools (tasklist/taskkill, ps/kill)
+// rather than a Win32 API, mirroring open_application's existing
+// shell-first approach — simpler and already cross-platform.
+
+#[derive(serde::Serialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub name: String,
+}
+
+/// Parse one `tasklist /fo csv /nh` line, e.g.
+/// `"notepad.exe","1234","Console","1","5,678 K"` — a plain `split(',')`
+/// would break on the comma inside the quoted memory field, so this splits
+/// only on `","` between quoted fields instead.
+#[cfg(target_os = "windows")]
+fn parse_tasklist_csv_line(line: &str) -> Option<(String, u32)> {
+    let fields: Vec<&str> = line.split("\",\"").collect();
+    let name = fields.first()?.trim_start_matches('"');
+    let pid_str = fields.get(1)?.trim_end_matches('"');
+    let pid: u32 = pid_str.trim().parse().ok()?;
+    Some((name.to_string(), pid))
+}
+
+#[tauri::command]
+pub fn list_processes() -> Result<Vec<ProcessInfo>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("tasklist")
+            .args(["/fo", "csv", "/nh"])
+            .output()
+            .map_err(|e| format!("Failed to list processes: {e}"))?;
+        if !output.status.success() {
+            return Err("tasklist failed".to_string());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout
+            .lines()
+            .filter_map(parse_tasklist_csv_line)
+            .map(|(name, pid)| ProcessInfo { pid, name })
+            .collect())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let output = Command::new("ps")
+            .args(["-eo", "pid,comm", "--no-headers"])
+            .output()
+            .map_err(|e| format!("Failed to list processes: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                let (pid_str, name) = trimmed.split_once(' ')?;
+                Some(ProcessInfo { pid: pid_str.trim().parse().ok()?, name: name.trim().to_string() })
+            })
+            .collect())
+    }
+}
+
+/// Forcibly terminate a process by pid. Same mechanism `cancel_command`
+/// already uses for the Terminal tab's Kill button (taskkill /F on Windows,
+/// SIGKILL elsewhere), just exposed directly for an arbitrary pid.
+#[tauri::command]
+pub fn kill_process(pid: u32) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    let output = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .output();
+    #[cfg(not(target_os = "windows"))]
+    let output = Command::new("kill").args(["-9", &pid.to_string()]).output();
+
+    match output {
+        Ok(out) if out.status.success() => Ok(format!("Terminated process {pid}")),
+        Ok(out) => Err(format!(
+            "Failed to terminate process {pid}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Err(format!("Failed to terminate process {pid}: {e}")),
+    }
+}
+
+// ─── Disk usage / recycle bin / volume ─────────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct DiskUsage {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+}
+
+/// Free/total space for the drive containing `path` (or the system drive if
+/// omitted).
+#[tauri::command]
+pub fn get_disk_usage(path: Option<String>) -> Result<DiskUsage, String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_impl::get_disk_usage(path.as_deref())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        Err("Disk usage is only supported on Windows".to_string())
+    }
+}
+
+/// Empty the Recycle Bin, silently (no confirmation dialog/progress UI/sound).
+#[tauri::command]
+pub fn empty_recycle_bin() -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_impl::empty_recycle_bin()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("Recycle Bin control is only supported on Windows".to_string())
+    }
+}
+
+/// Adjust system volume by simulating the physical media keys — relative
+/// steps and mute only (Windows has no simple "set to exact %" API short of
+/// the Core Audio COM interfaces, which is a lot of surface for a small win;
+/// step-based control covers "turn it down"/"mute that" style requests).
+#[tauri::command]
+pub fn adjust_volume(action: String) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_impl::adjust_volume(&action)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = action;
+        Err("Volume control is only supported on Windows".to_string())
+    }
+}
+
 /// Capture the primary monitor, save a PNG to the temp dir, run OCR over it,
 /// and return the OCR text plus the saved path. If no OCR language pack is
 /// installed (or OCR otherwise fails), the capture still succeeds — the
@@ -325,7 +576,8 @@ mod windows_impl {
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetSystemMetrics, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
-        SetForegroundWindow, ShowWindow, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE,
+        PostMessageW, SetForegroundWindow, ShowWindow, SM_CXSCREEN, SM_CYSCREEN, SW_MINIMIZE,
+        SW_RESTORE, WM_CLOSE,
     };
 
     // ─── Fuzzy Start Menu app resolution (open_application) ────────────────
@@ -470,6 +722,115 @@ mod windows_impl {
             }
         }
         Ok(format!("Focused window {id}"))
+    }
+
+    fn parse_hwnd(id: &str) -> Result<HWND, String> {
+        let raw: isize = id.trim().parse().map_err(|_| format!("Invalid window id '{id}'"))?;
+        Ok(HWND(raw as *mut core::ffi::c_void))
+    }
+
+    pub fn close_window(id: &str) -> Result<String, String> {
+        let hwnd = parse_hwnd(id)?;
+        unsafe {
+            PostMessageW(Some(hwnd), WM_CLOSE, windows::Win32::Foundation::WPARAM(0), LPARAM(0))
+                .map_err(|e| format!("Failed to close window '{id}': {e}"))?;
+        }
+        Ok(format!("Requested close of window {id}"))
+    }
+
+    pub fn minimize_window(id: &str) -> Result<String, String> {
+        let hwnd = parse_hwnd(id)?;
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_MINIMIZE);
+        }
+        Ok(format!("Minimized window {id}"))
+    }
+
+    // ─── Disk usage ──────────────────────────────────────────────────────────
+
+    pub fn get_disk_usage(path: Option<&str>) -> Result<super::DiskUsage, String> {
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+        // Default to the system drive (the dir Windows itself lives on) when
+        // no path is given, same fallback GetDiskFreeSpaceExW itself uses for
+        // a null path — spelled out explicitly so the returned info always
+        // corresponds to a real, obvious drive rather than depending on an
+        // unstated OS default.
+        let target = path
+            .map(|p| p.to_string())
+            .or_else(|| std::env::var("SystemDrive").ok())
+            .unwrap_or_else(|| "C:\\".to_string());
+        let wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+
+        let mut free_available: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut total_free: u64 = 0;
+        unsafe {
+            GetDiskFreeSpaceExW(
+                PCWSTR(wide.as_ptr()),
+                Some(&mut free_available),
+                Some(&mut total_bytes),
+                Some(&mut total_free),
+            )
+            .map_err(|e| format!("GetDiskFreeSpaceExW failed for '{target}': {e}"))?;
+        }
+        Ok(super::DiskUsage { total_bytes, free_bytes: total_free })
+    }
+
+    // ─── Recycle bin ─────────────────────────────────────────────────────────
+
+    pub fn empty_recycle_bin() -> Result<String, String> {
+        use windows::Win32::UI::Shell::{
+            SHEmptyRecycleBinW, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND,
+        };
+        unsafe {
+            SHEmptyRecycleBinW(None, None, SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND)
+                .map_err(|e| format!("SHEmptyRecycleBinW failed: {e}"))?;
+        }
+        Ok("Recycle Bin emptied".to_string())
+    }
+
+    // ─── Volume (media-key simulation) ───────────────────────────────────────
+
+    pub fn adjust_volume(action: &str) -> Result<String, String> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+            VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP,
+        };
+
+        let vk: VIRTUAL_KEY = match action.to_lowercase().as_str() {
+            "mute" => VK_VOLUME_MUTE,
+            "up" => VK_VOLUME_UP,
+            "down" => VK_VOLUME_DOWN,
+            other => {
+                return Err(format!(
+                    "Unknown volume action '{other}'. Valid actions: mute, up, down."
+                ))
+            }
+        };
+
+        fn key_input(vk: VIRTUAL_KEY, key_up: bool) -> INPUT {
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: vk,
+                        wScan: 0,
+                        dwFlags: if key_up { KEYEVENTF_KEYUP } else { Default::default() },
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            }
+        }
+
+        let inputs = [key_input(vk, false), key_input(vk, true)];
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        if sent as usize != inputs.len() {
+            return Err("SendInput did not deliver the volume key event".to_string());
+        }
+        Ok(format!("Volume: {action}"))
     }
 
     // ─── Screen capture ──────────────────────────────────────────────────────

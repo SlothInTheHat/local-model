@@ -215,6 +215,27 @@ export async function mcpInitialize(server: McpServer): Promise<unknown> {
   });
 }
 
+// ─── Read/write risk heuristic ─────────────────────────────────────────────
+//
+// Every MCP tool used to be gated identically at max friction (approval
+// required, denied in Plan mode) regardless of whether it was e.g. "list
+// unread emails" or "send email" — MCP servers don't universally annotate
+// read/write in a machine-readable way, so this classifies by name instead.
+// Ambiguous or unmatched names fall back to the safe (mutate) side rather
+// than risking a wrongly-relaxed write tool.
+
+const MCP_READ_NAME_PATTERN = /(?:^|[_-])(list|get|search|read|fetch|find|query|describe|show|view|check|count)(?:$|[_-])/i;
+const MCP_WRITE_NAME_PATTERN = /(?:^|[_-])(send|delete|remove|create|update|write|insert|modify|edit|set|add|move|copy|archive|trash|share|invite|post|publish|execute|run|reply|forward|upload)(?:$|[_-])/i;
+
+function classifyMcpToolRisk(toolName: string): Pick<ToolDef, "risk" | "planModeAllowed" | "requiresApproval"> {
+  const isWrite = MCP_WRITE_NAME_PATTERN.test(toolName);
+  const isRead = MCP_READ_NAME_PATTERN.test(toolName);
+  if (isWrite || !isRead) {
+    return { risk: "mutate", planModeAllowed: false, requiresApproval: true };
+  }
+  return { risk: "read", planModeAllowed: true, requiresApproval: false };
+}
+
 /** Fetch available tools from the MCP server and convert to LocalMind ToolDef format. */
 export async function mcpListTools(server: McpServer): Promise<ToolDef[]> {
   const result = (await sendRequest(server, "tools/list")) as {
@@ -225,6 +246,8 @@ export async function mcpListTools(server: McpServer): Promise<ToolDef[]> {
     name: `${server.id}__${t.name}` as ToolDef["name"],
     description: `[${server.label}] ${t.description ?? t.name}`,
     parameters: t.inputSchema ?? { type: "object", properties: {} },
+    group: "external" as const,
+    ...classifyMcpToolRisk(t.name),
   }));
 }
 

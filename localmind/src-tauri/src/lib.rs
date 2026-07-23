@@ -60,7 +60,7 @@ fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
 
 /// Resolve `path` and ensure it is confined to a registered workspace root.
 /// Returns the canonical path on success, or a human-readable refusal error.
-fn ensure_confined(path: &str) -> Result<PathBuf, String> {
+pub(crate) fn ensure_confined(path: &str) -> Result<PathBuf, String> {
     let target = canonicalize_lenient(Path::new(path))
         .ok_or_else(|| format!("Path confinement: cannot resolve '{path}'"))?;
     let guard = registered_roots()
@@ -144,6 +144,96 @@ fn register_workspace_root(path: String) -> Result<(), String> {
         .map_err(|_| "roots lock poisoned".to_string())?
         .insert(canon);
     Ok(())
+}
+
+/// Revoke a previously registered root (Settings > Privacy & Security "known
+/// folder" toggles turned off). Unlike register, this refuses silently rather
+/// than erroring if the path no longer exists — turning off access to a folder
+/// that's since been deleted should still succeed in revoking it.
+#[tauri::command]
+fn unregister_workspace_root(path: String) -> Result<(), String> {
+    let mut guard = registered_roots()
+        .lock()
+        .map_err(|_| "roots lock poisoned".to_string())?;
+    if let Ok(canon) = dunce::canonicalize(&path) {
+        guard.remove(&canon);
+    }
+    // Also remove a non-canonicalized match in case the path no longer resolves.
+    guard.remove(Path::new(&path));
+    Ok(())
+}
+
+/// Resolve an OS well-known folder (Downloads/Desktop/Documents/Pictures/Home)
+/// to its real path. Does NOT register it as an accessible root — that only
+/// happens when the user explicitly enables it in Settings > Privacy & Security,
+/// so this command alone grants no new file access, just a path lookup.
+#[tauri::command]
+fn get_known_folder(name: String) -> Result<String, String> {
+    let path = match name.to_lowercase().as_str() {
+        "downloads" => dirs::download_dir(),
+        "desktop" => dirs::desktop_dir(),
+        "documents" => dirs::document_dir(),
+        "pictures" => dirs::picture_dir(),
+        "home" => dirs::home_dir(),
+        other => {
+            return Err(format!(
+                "Unknown known folder '{other}'. Valid names: downloads, desktop, documents, pictures, home."
+            ))
+        }
+    };
+    let path = path.ok_or_else(|| format!("Could not resolve the '{name}' folder on this system"))?;
+    let canon = dunce::canonicalize(&path).map_err(|e| format!("Cannot resolve {name} folder: {e}"))?;
+    Ok(canon.to_string_lossy().replace('\\', "/"))
+}
+
+/// Recursively copy a file or directory tree. Used by both fs_copy and
+/// fs_move's cross-device fallback (std::fs::rename fails when `from`/`to`
+/// live on different drives/filesystems, which copy+delete works around).
+fn copy_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
+    if from.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            let dest = to.join(entry.file_name());
+            copy_recursive(&entry.path(), &dest)?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(from, to)?;
+        Ok(())
+    }
+}
+
+/// Move (rename) a file or directory. Both endpoints must resolve inside a
+/// registered root. Falls back to copy+delete on cross-device rename failure.
+#[tauri::command]
+fn fs_move(from: String, to: String) -> Result<(), String> {
+    let from_p = ensure_confined(&from)?;
+    let to_p = ensure_confined(&to)?;
+    if let Some(parent) = to_p.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if let Err(rename_err) = std::fs::rename(&from_p, &to_p) {
+        copy_recursive(&from_p, &to_p)
+            .map_err(|copy_err| format!("{rename_err}; fallback copy also failed: {copy_err}"))?;
+        if from_p.is_dir() {
+            std::fs::remove_dir_all(&from_p).map_err(|e| e.to_string())?;
+        } else {
+            std::fs::remove_file(&from_p).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy a file or directory. Both endpoints must resolve inside a registered root.
+#[tauri::command]
+fn fs_copy(from: String, to: String) -> Result<(), String> {
+    let from_p = ensure_confined(&from)?;
+    let to_p = ensure_confined(&to)?;
+    if let Some(parent) = to_p.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    copy_recursive(&from_p, &to_p).map_err(|e| e.to_string())
 }
 
 // ─── Ollama lifecycle ─────────────────────────────────────────────────────────
@@ -272,6 +362,9 @@ use mcp::{mcp_start_server, mcp_stop_server, mcp_send_request};
 mod transcribe;
 use transcribe::{transcribe_video, transcribe_audio_base64};
 
+mod pdf;
+use pdf::{pdf_merge, pdf_to_text};
+
 mod db;
 use db::{
     memory_upsert, memory_all, memory_delete, memory_touch, memory_delete_by_doc,
@@ -288,7 +381,9 @@ use tray::{set_close_to_tray, show_result_widget};
 mod os_tools;
 use os_tools::{
     open_application, list_windows, focus_window, take_screenshot, read_image_base64,
-    capture_region, clear_pending_region,
+    capture_region, clear_pending_region, close_window, minimize_window,
+    list_processes, kill_process, get_disk_usage, empty_recycle_bin, adjust_volume,
+    speak_text, print_file,
 };
 
 mod ipc;
@@ -452,6 +547,163 @@ fn fs_read_file_base64(path: String) -> Result<String, String> {
     let p = ensure_confined(&path)?;
     let bytes = std::fs::read(&p).map_err(|e| e.to_string())?;
     Ok(base64_encode(&bytes))
+}
+
+/// Write a base64-encoded byte string to a file (creates parent directories as
+/// needed). The binary counterpart to fs_write_file, which only accepts text —
+/// used by agent tools that produce binary output in JS (e.g. remove_background's
+/// @imgly/background-removal result) and need to save it through the confined
+/// native fs layer.
+#[tauri::command]
+fn fs_write_file_base64(path: String, data_base64: String) -> Result<(), String> {
+    let p = ensure_confined(&path)?;
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let bytes = base64_decode(&data_base64)?;
+    std::fs::write(&p, bytes).map_err(|e| e.to_string())
+}
+
+/// Cap on how much a single download_file call will pull down — generous
+/// enough for images/PDFs/small archives while still bounding an unattended
+/// or malicious response from exhausting disk/memory.
+const FETCH_BINARY_MAX_BYTES: u64 = 200 * 1024 * 1024; // 200MB
+
+/// Download a URL's binary body straight to disk — the binary-safe counterpart
+/// to http_fetch, which reads everything as UTF-8 text with a 2MB cap. This is
+/// what the agent's download_file tool uses to actually save an image/PDF/zip
+/// from a URL, which no prior tool could do.
+#[tauri::command]
+fn fetch_binary(url: String, dest_path: String) -> Result<u64, String> {
+    use std::io::Read;
+
+    let dest = ensure_confined(&dest_path)?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(60))
+        .build();
+    let resp = agent
+        .get(&url)
+        .set(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        )
+        .call()
+        .map_err(|e| format!("download_file: request failed: {e}"))?;
+
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(FETCH_BINARY_MAX_BYTES)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("download_file: failed reading response body: {e}"))?;
+
+    let len = buf.len() as u64;
+    std::fs::write(&dest, buf).map_err(|e| e.to_string())?;
+    Ok(len)
+}
+
+/// Zip one or more files/directories (recursively) into a single archive.
+#[tauri::command]
+fn fs_compress(paths: Vec<String>, dest_path: String) -> Result<(), String> {
+    if paths.is_empty() {
+        return Err("compress_files: no paths given".to_string());
+    }
+    let dest = ensure_confined(&dest_path)?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let confined: Vec<PathBuf> = paths
+        .iter()
+        .map(|p| ensure_confined(p))
+        .collect::<Result<_, _>>()?;
+
+    let file = std::fs::File::create(&dest).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    fn add_entry(
+        zip: &mut zip::ZipWriter<std::fs::File>,
+        options: zip::write::SimpleFileOptions,
+        base: &Path,
+        entry: &Path,
+    ) -> Result<(), String> {
+        let rel = entry.strip_prefix(base).unwrap_or(entry).to_string_lossy().replace('\\', "/");
+        if entry.is_dir() {
+            for child in std::fs::read_dir(entry).map_err(|e| e.to_string())? {
+                add_entry(zip, options, base, &child.map_err(|e| e.to_string())?.path())?;
+            }
+        } else {
+            zip.start_file(rel, options).map_err(|e| e.to_string())?;
+            let bytes = std::fs::read(entry).map_err(|e| e.to_string())?;
+            std::io::Write::write_all(zip, &bytes).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    for p in &confined {
+        let base = p.parent().unwrap_or(p);
+        add_entry(&mut zip, options, base, p)?;
+    }
+    zip.finish().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Extract a zip archive into a destination directory.
+#[tauri::command]
+fn fs_extract(archive_path: String, dest_dir: String) -> Result<(), String> {
+    let archive_p = ensure_confined(&archive_path)?;
+    let dest = ensure_confined(&dest_dir)?;
+    std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+
+    let file = std::fs::File::open(&archive_p).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("extract_archive: {e}"))?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        // Reject any entry path that escapes dest_dir via ".." — mirrors the
+        // same traversal protection ensure_confined gives every other command.
+        let out_path = match entry.enclosed_name() {
+            Some(p) => dest.join(p),
+            None => return Err(format!("extract_archive: unsafe path in archive entry {i}")),
+        };
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut out_file = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
+            std::io::copy(&mut entry, &mut out_file).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Resize (optional, downscale-only, aspect-ratio preserved) and/or convert an
+/// image's format. Format is inferred from dest_path's extension — the same
+/// convention image::DynamicImage::save already follows.
+#[tauri::command]
+fn image_convert(
+    src_path: String,
+    dest_path: String,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+) -> Result<(), String> {
+    let src = ensure_confined(&src_path)?;
+    let dest = ensure_confined(&dest_path)?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut img = image::open(&src).map_err(|e| format!("Cannot open image: {e}"))?;
+    if max_width.is_some() || max_height.is_some() {
+        let w = max_width.unwrap_or(u32::MAX);
+        let h = max_height.unwrap_or(u32::MAX);
+        img = img.thumbnail(w, h);
+    }
+    img.save(&dest).map_err(|e| format!("Cannot save image: {e}"))
 }
 
 /// KM1 — file extensions the Knowledge Hub is allowed to ingest. Shared
@@ -1284,6 +1536,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_workspace_dialog,
             register_workspace_root,
+            unregister_workspace_root,
+            get_known_folder,
+            fs_move,
+            fs_copy,
             run_command,
             cancel_command,
             get_cwd,
@@ -1301,6 +1557,13 @@ pub fn run() {
             fs_exists,
             fs_mkdir,
             fs_read_file_base64,
+            fs_write_file_base64,
+            fetch_binary,
+            fs_compress,
+            fs_extract,
+            image_convert,
+            pdf_merge,
+            pdf_to_text,
             open_upload_dialog,
             read_upload_bytes,
             memory_upsert,
@@ -1330,10 +1593,19 @@ pub fn run() {
             open_application,
             list_windows,
             focus_window,
+            close_window,
+            minimize_window,
             take_screenshot,
             read_image_base64,
             capture_region,
             clear_pending_region,
+            list_processes,
+            kill_process,
+            get_disk_usage,
+            empty_recycle_bin,
+            adjust_volume,
+            speak_text,
+            print_file,
             get_ipc_token,
             ipc_report_task_result,
             shadow_git_ensure_init,
