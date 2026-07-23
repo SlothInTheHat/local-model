@@ -1,6 +1,6 @@
-# Tauri + React + Typescript
+# LocalMind (app source)
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+This is the Tauri + React + TypeScript desktop app itself. For the full project README (features, prerequisites, download, build instructions), see [`../README.md`](../README.md).
 
 ## Recommended IDE Setup
 
