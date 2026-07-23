@@ -1,6 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import {
-  Brain, FolderOpen, MessageSquare, Microscope, Bot, ImageIcon, AlertCircle,
+  Brain, FolderOpen, MessageSquare, Microscope, Bot, ImageIcon, AlertCircle, Download,
 } from "lucide-react";
 import { Button } from "./ui/button";
 import { useOnboardingStore } from "../store/onboarding";
@@ -90,6 +90,31 @@ export function Onboarding({ ollamaError }: Props) {
 
           <div className="rounded-lg border bg-muted/40 p-3 space-y-1.5">
             <p className="text-xs font-medium text-foreground flex items-center gap-1.5">
+              <Download className="size-3.5" /> What you'll need installed separately
+            </p>
+            <p className="text-xs text-muted-foreground leading-relaxed">
+              LocalMind is a shell around software that runs on your machine — it doesn't bundle any of this itself:
+            </p>
+            <ul className="text-xs text-muted-foreground leading-relaxed list-disc pl-4 space-y-1">
+              <li>
+                <a href="https://ollama.com" target="_blank" rel="noreferrer" className="underline text-foreground">
+                  Ollama
+                </a>{" "}
+                — <strong>required</strong>. Every model LocalMind runs (chat, code, vision, embeddings) goes through
+                it. Install it and make sure it's running before you start.
+              </li>
+              <li>
+                <a href="https://nodejs.org" target="_blank" rel="noreferrer" className="underline text-foreground">
+                  Node.js
+                </a>{" "}
+                — optional, only needed if you connect an MCP integration in Settings (Gmail, Drive, Calendar,
+                Canvas, browser control). Everything else works without it.
+              </li>
+            </ul>
+          </div>
+
+          <div className="rounded-lg border bg-muted/40 p-3 space-y-1.5">
+            <p className="text-xs font-medium text-foreground flex items-center gap-1.5">
               <FolderOpen className="size-3.5" /> Workspaces
             </p>
             <p className="text-xs text-muted-foreground leading-relaxed">
@@ -112,6 +137,11 @@ export function Onboarding({ ollamaError }: Props) {
               </div>
             ))}
           </div>
+
+          <p className="text-[11px] text-muted-foreground text-center">
+            Not sure where to start? Just ask chat something like <em>"what can you do?"</em> — it can give you a
+            full rundown of every feature and tool it has access to.
+          </p>
 
           <div className="flex gap-2 pt-1">
             <Button className="flex-1 gap-1.5" onClick={() => void handleOpenWorkspace()}>
