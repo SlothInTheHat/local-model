@@ -14,8 +14,17 @@ export interface Workflow {
   id: string;
   name: string;
   description: string;
-  /** The natural-language goal, as given to the headless run each time. */
+  /** The natural-language goal, as given to the headless run each time —
+   *  compiled from `steps` (see compileInstruction below) rather than
+   *  hand-maintained separately, so editing a step in the Workflows tab
+   *  actually changes what runs, not just a cosmetic label. */
   instruction: string;
+  /** Ordered, human-readable breakdown of what this workflow does — the
+   *  source of truth `instruction` is compiled from. Every workflow has at
+   *  least one step; older/simple workflows may just be a single-item array
+   *  wrapping the whole instruction. Rendered as an editable visual flow in
+   *  the Workflows tab (see components/Workflows.tsx). */
+  steps: string[];
   /** Extra built-in tool names auto-approved beyond the scheduler's SAFE_SCHED_ALLOWLIST baseline. */
   toolAllowlist: string[];
   /** McpServer.id values (src/store/mcp.ts) this workflow may use unattended. Empty by default. */
@@ -31,6 +40,16 @@ export interface Workflow {
   lastRunAt: number | null;
   lastRunOutcome: SessionResult["outcome"] | null;
   runCount: number;
+}
+
+/** Compiles an ordered step list into the single instruction string actually
+ *  handed to the headless run — a single step is passed through unchanged
+ *  (no pointless "Step 1: ..." wrapping for the common simple case). */
+export function compileInstruction(steps: string[]): string {
+  const cleaned = steps.map((s) => s.trim()).filter(Boolean);
+  if (cleaned.length === 0) return "";
+  if (cleaned.length === 1) return cleaned[0];
+  return cleaned.map((s, i) => `${i + 1}. ${s}`).join("\n");
 }
 
 interface WorkflowState {

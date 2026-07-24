@@ -291,6 +291,59 @@ fn ensure_ollama_running() {
     }
 }
 
+/// User-initiated hard restart of Ollama — the only way to make it re-detect
+/// available GPUs, since Ollama only probes hardware once, at its own process
+/// startup. A user who physically toggles a hybrid/discrete GPU on or off
+/// while LocalMind (and Ollama) are already running needs this: Ollama will
+/// keep running on whatever it saw at its last startup until something kills
+/// and relaunches it. Unlike ensure_ollama_running (which leaves an
+/// already-running instance alone, on the theory it might be user-managed),
+/// this deliberately kills ANY running ollama process regardless of who
+/// started it — that's the whole point of an explicit "restart" button.
+/// Tree-kill (`/T`) also takes out the "ollama_llama_server" runner child
+/// process a loaded model spawns, so it can't hold the port or a stale model
+/// in VRAM after the parent dies.
+#[tauri::command]
+fn restart_ollama() -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", "ollama.exe", "/F", "/T"])
+            .output();
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", "ollama_llama_server.exe", "/F", "/T"])
+            .output();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("pkill").args(["-9", "-x", "ollama"]).output();
+    }
+
+    // Our own tracked child handle (if any) is now dead or about to be —
+    // clear it so the exit handler doesn't try to kill/wait on a stale Child.
+    if let Some(lock) = OLLAMA_CHILD.get() {
+        if let Ok(mut guard) = lock.lock() {
+            *guard = None;
+        }
+    }
+
+    // Give the OS a moment to actually free the port before rebinding —
+    // taskkill/pkill return before the process has fully torn down.
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    ensure_ollama_running();
+
+    // Ollama binds its port almost immediately on startup, well before any
+    // model is loaded, so a short poll is enough to confirm it's really back.
+    for _ in 0..20 {
+        if is_ollama_running() {
+            return Ok("Ollama restarted".to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    Err("Ollama did not come back up within ~6s of restarting — check that 'ollama' is on PATH".to_string())
+}
+
 // ─── PATH augmentation ────────────────────────────────────────────────────────
 
 static EFFECTIVE_PATH: OnceLock<String> = OnceLock::new();
@@ -413,8 +466,14 @@ use ipc::{get_ipc_token, ipc_report_task_result};
 mod git_shadow;
 use git_shadow::{
     shadow_git_ensure_init, shadow_git_commit, shadow_git_log, shadow_git_show_file,
-    shadow_git_diff, shadow_git_restore_file, shadow_git_restore_all,
+    shadow_git_diff, shadow_git_diff_range, shadow_git_restore_file, shadow_git_restore_all,
 };
+
+mod ui_automation;
+use ui_automation::{uia_list_elements, uia_click_element, uia_read_element_text, uia_set_element_text};
+
+mod credential_store;
+use credential_store::{cred_set, cred_get, cred_delete};
 
 // ─── Generic HTTP fetch (used by the frontend for requests that would hit CORS
 // in the packaged webview, e.g. web search against DuckDuckGo) ────────────────
@@ -1626,6 +1685,7 @@ pub fn run() {
             clear_pending_region,
             list_processes,
             kill_process,
+            restart_ollama,
             get_disk_usage,
             empty_recycle_bin,
             adjust_volume,
@@ -1638,8 +1698,16 @@ pub fn run() {
             shadow_git_log,
             shadow_git_show_file,
             shadow_git_diff,
+            shadow_git_diff_range,
             shadow_git_restore_file,
             shadow_git_restore_all,
+            uia_list_elements,
+            uia_click_element,
+            uia_read_element_text,
+            uia_set_element_text,
+            cred_set,
+            cred_get,
+            cred_delete,
         ])
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,

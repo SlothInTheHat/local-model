@@ -66,6 +66,10 @@ const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   pdf_to_text: true,
   close_window: true,
   minimize_window: true,
+  uia_list_elements: true,
+  uia_click_element: true,
+  uia_read_element_text: true,
+  uia_set_element_text: true,
   list_processes: true,
   kill_process: true,
   get_disk_usage: true,
@@ -98,8 +102,10 @@ const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   list_scheduled: true,
   cancel_scheduled: true,
   spawn_subagent: true,
+  spawn_reviewer_subagent: true,
   propose_feature: true,
   search_past_sessions: true,
+  find_recurring_issues: true,
   search_knowledge: true,
   list_collections: true,
   read_clipboard: true,
@@ -112,6 +118,7 @@ const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   list_workflows: true,
   run_workflow: true,
   delete_workflow: true,
+  notify_user: true,
 };
 
 export const useAgentStore = create<AgentState>()(

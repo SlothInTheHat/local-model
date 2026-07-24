@@ -270,6 +270,68 @@ pub fn shadow_git_diff(workspace_root: String, commit_oid: String, path: Option<
     Ok(out)
 }
 
+/// Unified diff spanning an arbitrary range — `base_oid`'s tree (or an empty
+/// tree if `base_oid` is None, i.e. the full tracked snapshot) to
+/// `head_oid`'s tree (or current HEAD if `head_oid` is None). Unlike
+/// `shadow_git_diff` (always one commit vs its immediate parent), this lets a
+/// caller review the *net* change across a whole run of commits — e.g. a
+/// reviewer subagent checking "everything this build task changed" as one
+/// diff instead of N separate per-commit fragments that could show the same
+/// hunk touched more than once.
+#[tauri::command]
+pub fn shadow_git_diff_range(
+    workspace_root: String,
+    base_oid: Option<String>,
+    head_oid: Option<String>,
+    path: Option<String>,
+) -> Result<String, String> {
+    let confined = ensure_confined(&workspace_root)?;
+    let repo = open_or_init(&confined)?;
+
+    let head_commit = match head_oid {
+        Some(s) => repo
+            .find_commit(Oid::from_str(&s).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?,
+        None => repo
+            .head()
+            .ok()
+            .and_then(|h| h.peel_to_commit().ok())
+            .ok_or_else(|| "No shadow-git commits yet for this workspace".to_string())?,
+    };
+    let head_tree = head_commit.tree().map_err(|e| e.to_string())?;
+
+    let base_tree = match base_oid {
+        Some(s) => Some(
+            repo.find_commit(Oid::from_str(&s).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?
+                .tree()
+                .map_err(|e| e.to_string())?,
+        ),
+        None => None,
+    };
+
+    let mut diff_opts = DiffOptions::new();
+    if let Some(ref p) = path {
+        diff_opts.pathspec(p);
+    }
+    let diff = repo
+        .diff_tree_to_tree(base_tree.as_ref(), Some(&head_tree), Some(&mut diff_opts))
+        .map_err(|e| e.to_string())?;
+
+    let mut out = String::new();
+    diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+        match line.origin() {
+            '+' | '-' | ' ' => out.push(line.origin()),
+            _ => {}
+        }
+        out.push_str(&String::from_utf8_lossy(line.content()));
+        true
+    })
+    .map_err(|e| e.to_string())?;
+
+    Ok(out)
+}
+
 /// Writes EVERY file tracked at `commit_oid` back to disk — a `git reset
 /// --hard` analog scoped to whatever the shadow repo tracks (respects the
 /// workspace's own .gitignore, same as shadow_git_commit's staging). Used by

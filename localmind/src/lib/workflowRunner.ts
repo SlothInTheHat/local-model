@@ -88,7 +88,14 @@ export async function runWorkflow(workflow: Workflow, opts: RunWorkflowOpts): Pr
 
   const { tools: extraTools, unavailableNote } = await resolveMcpTools(workflow);
 
-  const task = `${workflow.instruction}\n\nBefore adding anything new, read ${workflow.outputFile} if it exists (use read_file) and skim its existing entries so you do not add a duplicate of something already recorded. Then use write_file or patch_file to save your findings back to exactly that path, in a consistent structured format (e.g. one Markdown list item or table row per entry), appending only genuinely new items to what's already there.${unavailableNote}`;
+  // HTML-output workflows ("applets") get a different framing: a complete,
+  // self-contained interactive page each run (real filter/sort controls),
+  // not an accumulating list — appending rows the way the markdown path does
+  // doesn't make sense for a dashboard that should just reflect current data.
+  const isHtmlOutput = workflow.outputFile.toLowerCase().endsWith(".html");
+  const task = isHtmlOutput
+    ? `${workflow.instruction}\n\nWrite the result as a single complete, self-contained HTML page to ${workflow.outputFile} (use write_file) — inline all CSS in a <style> tag and all JS in a <script> tag, no external resources. Include real interactive controls (filter/sort/search) that work with plain client-side JS, not just a static table. If ${workflow.outputFile} already exists, you may read it first (read_file) to reuse its data/structure for continuity, but always write back a complete valid HTML document, not a partial edit.${unavailableNote}`
+    : `${workflow.instruction}\n\nBefore adding anything new, read ${workflow.outputFile} if it exists (use read_file) and skim its existing entries so you do not add a duplicate of something already recorded. Then use write_file or patch_file to save your findings back to exactly that path, in a consistent structured format (e.g. one Markdown list item or table row per entry), appending only genuinely new items to what's already there.${unavailableNote}`;
 
   const effectiveAllowlist = Array.from(
     new Set([...SAFE_SCHED_ALLOWLIST, ...workflow.toolAllowlist, ...extraTools.map((t) => t.name)]),

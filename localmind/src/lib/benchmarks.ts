@@ -6,6 +6,8 @@
  * shared no code or storage at all).
  */
 
+import { streamChatForModel } from "./chatProvider";
+
 export interface BenchmarkDef {
   name: string;
   prompt: string;
@@ -13,6 +15,23 @@ export interface BenchmarkDef {
   min_matches: number;
   timeout_seconds: number;
   filename: string;
+}
+
+export interface BenchmarkResult {
+  name: string;
+  passed: boolean;
+  score: number;       // matched / required
+  latencyMs: number;
+  response: string;
+  error?: string;
+  ranAt: string;
+}
+
+export interface BenchmarkSuiteSummary {
+  total: number;
+  passed: number;
+  failed: string[];   // names of failed benchmarks
+  results: BenchmarkResult[];
 }
 
 /** Minimal hand-rolled YAML parser — adequate for the flat schema this module itself generates. */
@@ -72,6 +91,71 @@ export async function saveBenchmark(
   }\nmin_matches: ${def.min_matches}\ntimeout_seconds: ${def.timeout_seconds}\n`;
   const fh = await bmDir.getFileHandle(def.filename, { create: true });
   const w = await fh.createWritable(); await w.write(yaml); await w.close();
+}
+
+/**
+ * Runs one benchmark def against a model and scores it — the same
+ * request/timeout/keyword-match logic BenchmarkRunner.tsx's UI uses, factored
+ * out here so it's callable without a React component around it (headless
+ * self-improvement passes, propose_feature's regression baseline, etc).
+ */
+export async function runBenchmarkDef(def: BenchmarkDef, modelRef: string, signal?: AbortSignal): Promise<BenchmarkResult> {
+  const ctrl = new AbortController();
+  const onAbort = () => ctrl.abort();
+  signal?.addEventListener("abort", onAbort);
+
+  const start = Date.now();
+  let response = "";
+  let errorMsg: string | undefined;
+  try {
+    const timer = setTimeout(() => ctrl.abort(), def.timeout_seconds * 1000);
+    for await (const chunk of streamChatForModel(modelRef, [{ role: "user", content: def.prompt }], ctrl.signal)) {
+      response += chunk;
+    }
+    clearTimeout(timer);
+  } catch (err) {
+    const e = err as Error;
+    errorMsg = e.name === "AbortError" ? `Timed out after ${def.timeout_seconds}s` : e.message;
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+  }
+
+  const latencyMs = Date.now() - start;
+  const matched = def.keywords.filter((kw) => response.toLowerCase().includes(kw.toLowerCase())).length;
+  const passed = !errorMsg && matched >= def.min_matches;
+
+  return {
+    name: def.name,
+    passed,
+    score: matched,
+    latencyMs,
+    response: response.slice(0, 2000),
+    error: errorMsg,
+    ranAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Runs every benchmark saved in this workspace against a model, sequentially
+ * (benchmarks share the same Ollama server — running them concurrently would
+ * just queue on the backend anyway). Returns null if there are no benchmarks
+ * to run, so callers can distinguish "nothing to gate against" from "ran and
+ * passed everything."
+ */
+export async function runBenchmarkSuite(
+  dirHandle: FileSystemDirectoryHandle,
+  modelRef: string,
+  signal?: AbortSignal,
+): Promise<BenchmarkSuiteSummary | null> {
+  const defs = await loadBenchmarks(dirHandle);
+  if (defs.length === 0) return null;
+
+  const results: BenchmarkResult[] = [];
+  for (const def of defs) {
+    results.push(await runBenchmarkDef(def, modelRef, signal));
+  }
+  const failed = results.filter((r) => !r.passed).map((r) => r.name);
+  return { total: results.length, passed: results.length - failed.length, failed, results };
 }
 
 /** Turns a display name into a filesystem-safe `.yaml` filename, deduped

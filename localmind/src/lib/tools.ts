@@ -20,13 +20,16 @@ import { useAppViewStore } from "../store/appView";
 import { useTaskQueueStore } from "../store/taskQueue";
 import { useAgentStore } from "../store/agent";
 import { useModelStore } from "../store/models";
-import { useWorkflowStore } from "../store/workflows";
+import { useWorkflowStore, compileInstruction } from "../store/workflows";
 import type { Workflow } from "../store/workflows";
 import { buildJobSpec, computeInitialNextRun, describeSchedule, normalizeSchedule, parseJobSpec } from "./scheduler";
 import { searchSessions } from "./sessionSearch";
 import { isTauriEnv } from "./fileSystem";
 import { resolveRole } from "./modelRoles";
 import { streamChatForModel } from "./chatProvider";
+import { listShadowHistory, diffShadowRange } from "./shadowGit";
+import { runBenchmarkSuite } from "./benchmarks";
+import { notifyOs } from "./osNotify";
 
 // ─── Tauri invoke shim ───────────────────────────────────────────────────────
 
@@ -98,6 +101,10 @@ export type ToolName =
   | "pdf_to_text"
   | "close_window"
   | "minimize_window"
+  | "uia_list_elements"
+  | "uia_click_element"
+  | "uia_read_element_text"
+  | "uia_set_element_text"
   | "list_processes"
   | "kill_process"
   | "get_disk_usage"
@@ -130,8 +137,10 @@ export type ToolName =
   | "list_scheduled"
   | "cancel_scheduled"
   | "spawn_subagent"
+  | "spawn_reviewer_subagent"
   | "propose_feature"
   | "search_past_sessions"
+  | "find_recurring_issues"
   | "search_knowledge"
   | "list_collections"
   | "read_clipboard"
@@ -143,7 +152,8 @@ export type ToolName =
   | "save_workflow"
   | "list_workflows"
   | "run_workflow"
-  | "delete_workflow";
+  | "delete_workflow"
+  | "notify_user";
 
 export interface ToolDef {
   // string allows MCP tools with dynamic "serverId__toolName" names
@@ -447,6 +457,25 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
         limit: { type: "number", description: "Max results to return. Defaults to 8." },
       },
       required: ["query"],
+    },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "find_recurring_issues",
+    description:
+      "Scans past agent session history for RECURRING friction patterns — the same block/error/recovery-hint showing up across multiple separate sessions — not a single anecdote. Returns counts and example snippets per pattern, grounded in real history. Use this before calling propose_feature for a system-prompt or tool-description fix, so the proposal is backed by data instead of one bad session. If nothing clears the occurrence threshold, that itself is useful information — it means there's no clear recurring problem yet.",
+    parameters: {
+      type: "object",
+      properties: {
+        min_occurrences: {
+          type: "number",
+          description: "Minimum distinct sessions a pattern must appear in to be reported. Defaults to 3 — lower this only if session history is still sparse.",
+        },
+      },
+      required: [],
     },
     group: "state",
     risk: "read",
@@ -761,6 +790,74 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
     requiresApproval: true,
   },
   {
+    name: "uia_list_elements",
+    description: "List UI elements (buttons, text fields, checkboxes, etc.) inside a window's accessibility tree, by the id from list_windows. Use this to see what's actually on screen — names, control types, and which actions each element supports — before targeting one with uia_click_element/uia_read_element_text/uia_set_element_text. This reads the accessibility tree directly (no screenshots), so it works even for elements that are visually scrolled off-screen or overlapped.",
+    parameters: {
+      type: "object",
+      properties: {
+        window_id: { type: "string", description: "The window id from list_windows." },
+        control_type: { type: "string", description: "Optional filter, e.g. 'button', 'edit', 'checkbox', 'menuitem'. Omit to list everything." },
+      },
+      required: ["window_id"],
+    },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "uia_click_element",
+    description: "Click/activate a UI element by its accessible name inside a window (from list_windows), matched via the element-targeted accessibility API — not screen coordinates. Works for buttons, checkboxes, menu items, links, etc. Call uia_list_elements first if you're not sure of the exact name.",
+    parameters: {
+      type: "object",
+      properties: {
+        window_id: { type: "string", description: "The window id from list_windows." },
+        name: { type: "string", description: "The element's accessible name (exact match preferred, substring match as fallback)." },
+        control_type: { type: "string", description: "Optional filter to disambiguate elements sharing a name, e.g. 'button'." },
+      },
+      required: ["window_id", "name"],
+    },
+    group: "state",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "uia_read_element_text",
+    description: "Read the text/value of a UI element by its accessible name inside a window (from list_windows) — edit fields, labels, static text, or document content. Call uia_list_elements first if you're not sure of the exact name.",
+    parameters: {
+      type: "object",
+      properties: {
+        window_id: { type: "string", description: "The window id from list_windows." },
+        name: { type: "string", description: "The element's accessible name (exact match preferred, substring match as fallback)." },
+        control_type: { type: "string", description: "Optional filter to disambiguate elements sharing a name, e.g. 'edit'." },
+      },
+      required: ["window_id", "name"],
+    },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "uia_set_element_text",
+    description: "Set the text/value of an editable UI element (text box, combo box edit area) by its accessible name inside a window (from list_windows). Call uia_list_elements first if you're not sure of the exact name.",
+    parameters: {
+      type: "object",
+      properties: {
+        window_id: { type: "string", description: "The window id from list_windows." },
+        name: { type: "string", description: "The element's accessible name (exact match preferred, substring match as fallback)." },
+        value: { type: "string", description: "The text to set." },
+        control_type: { type: "string", description: "Optional filter to disambiguate elements sharing a name, e.g. 'edit'." },
+      },
+      required: ["window_id", "name", "value"],
+    },
+    group: "state",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
     name: "list_processes",
     description: "List running processes (pid + name). Use to find the pid of a process you want to terminate with kill_process.",
     parameters: { type: "object", properties: {}, required: [] },
@@ -1003,7 +1100,7 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
   },
   {
     name: "propose_feature",
-    description: "Draft a structured spec for a NEW LocalMind capability you lack and cannot build yourself with register_tool (i.e. it needs app source changes). Saved to .localmind/improvements/ for the user or Claude Code to implement later. Use this instead of refusing or faking a capability. Do NOT use it for things a shell one-liner could do — use register_tool for those.",
+    description: "Draft a structured spec for a NEW LocalMind capability you lack and cannot build yourself with register_tool (i.e. it needs app source changes). Saved to .localmind/improvements/ for the user or Claude Code to implement later. Use this instead of refusing or faking a capability. Do NOT use it for things a shell one-liner could do — use register_tool for those. When the proposal is a system-prompt or tool-description wording change (e.g. following up on find_recurring_issues), fill in 'diff' with the concrete before/after text — a prose description of a wording tweak is much harder for an implementer to act on than the actual wording. If this workspace has any saved benchmarks (Benchmarks tab), they're run automatically before saving as a baseline score attached to the proposal, so a human reviewer can re-run them after applying the change and see immediately if anything regressed.",
     parameters: {
       type: "object",
       properties: {
@@ -1013,6 +1110,7 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
         acceptance_criteria: { type: "string", description: "Optional: how you'd know it works." },
         size_guess: { type: "string", description: "Optional rough effort: S, M, or L." },
         details: { type: "string", description: "The detailed spec — approach, edge cases, anything an implementer needs." },
+        diff: { type: "string", description: "Optional: for a wording/prompt/tool-description change specifically, the concrete before → after text (quote the exact current wording and the exact proposed replacement)." },
       },
       required: ["title", "motivation"],
     },
@@ -1295,7 +1393,12 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
         description: { type: "string", description: "One-sentence summary of what this workflow does." },
         instruction: {
           type: "string",
-          description: "The natural-language goal to run each time, in plain English — never shell code. This is combined automatically with instructions to read/update this workflow's output file without duplicating entries, so just describe the goal itself (e.g. 'Search for new remote software engineering internship postings on <specific sites the user named>').",
+          description: "The natural-language goal to run each time, in plain English — never shell code. This is combined automatically with instructions to read/update this workflow's output file without duplicating entries, so just describe the goal itself (e.g. 'Search for new remote software engineering internship postings on <specific sites the user named>'). If you provide 'steps' below, this can just be a short overall summary — the actual run instruction is compiled from steps instead. IMPORTANT: unattended/scheduled runs never have run_command (or any shell/script execution) access — that's a deliberate safety boundary, not a bug, since no human is present to review a command before it runs unattended. If migrating an existing script-based process (e.g. a Python file that computes something), do NOT write a step like 'run update_status.py' — it will be silently denied every round until the run fails. Instead describe the underlying logic itself in plain English (e.g. 'compare each row's deadline to today's date and mark it past-due if earlier') so the agent works it out directly each run — this fully replaces needing the script.",
+        },
+        steps: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional but recommended: break the goal into an ordered list of concrete sub-steps (e.g. ['Search <site> for new internship postings', 'Extract company, role, deadline, and link for each', 'Filter to remote-only', 'Write results to the output file']). Shown as an editable visual flow in the Workflows tab — the user can edit individual steps later, so make each one a self-contained, meaningful unit of work rather than an arbitrarily fine or coarse split. Each step must be achievable with read_file/write_file/patch_file/web_search/web_fetch/grep_files/find_files (plus any connected MCP tools opted into via mcp_servers) — never a step that assumes run_command/shell execution, which unattended runs never have access to (see instruction's note above).",
         },
         schedule: {
           type: "string",
@@ -1305,6 +1408,10 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
           type: "array",
           items: { type: "string" },
           description: "Optional. Labels (not ids) of currently-connected MCP servers this workflow may use during UNATTENDED (scheduled) runs, e.g. ['Browser']. Only include a server the user has explicitly agreed this workflow should use, and only if it shows as connected in your context right now.",
+        },
+        output_format: {
+          type: "string",
+          description: "Optional, defaults to 'markdown'. Use 'html' when the user wants an interactive result — a filterable/sortable dashboard, not just a running list — e.g. 'find internships and let me filter by paid/unpaid' rather than 'keep a list of internships'. HTML workflows are shown as a live rendered preview in the Workflows tab instead of raw text, and each run should write a complete, self-contained interactive page (inline <style>/<script>, real filter/sort controls) rather than a static table.",
         },
       },
       required: ["name", "description", "instruction"],
@@ -1358,6 +1465,22 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
     requiresApproval: true,
   },
   {
+    name: "notify_user",
+    description: "Send the user a desktop OS notification right now, outside your normal chat response. This is for UNATTENDED/background contexts (a scheduled job, a workflow, a self-improvement pass) where you've noticed something worth telling the user about immediately — e.g. a workflow's output changed in a way that matters, or you found a genuine recurring problem worth flagging. Do NOT use this for routine 'finished successfully, nothing notable' status — a scheduled run already gets its own completion notification separately, so only call this when there's something specific and worth interrupting the user for. If in doubt, don't call it — silence is the correct default.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Short notification title." },
+        message: { type: "string", description: "The specific thing worth telling the user, in one or two sentences." },
+      },
+      required: ["title", "message"],
+    },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
     name: "spawn_subagent",
     description:
       "Delegate a sub-task to a separate, autonomous headless agent session that runs against the current workspace and reports back its result. Use this to fan out an independent chunk of work (e.g. 'summarize this directory', 'analyze src/ and report structure') without consuming your own context on it. The subagent gets read-only tools (read_file, list_directory, grep_files, find_files, web_search, web_fetch, get_system_info, git_status, git_diff, git_log, list_skills, calculator) — it can investigate but cannot write/delete files or run shell commands, and it cannot spawn further subagents. Requires an open workspace.",
@@ -1368,6 +1491,30 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
         model: { type: "string", description: "Optional model name to run the subagent with. Defaults to the current active model." },
       },
       required: ["task"],
+    },
+    group: "state",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "spawn_reviewer_subagent",
+    description:
+      "After finishing a non-trivial build task (multiple file edits, a new feature, a bug fix) and before declaring it done, use this to get an independent second opinion — a separate agent with completely fresh context (no memory of writing the code, no motivation to see it as correct) reviews the actual diff of what changed. This catches issues a single agent grading its own homework tends to miss. It automatically gathers the diff itself (from this app's own shadow version history, independent of any real git repo) — you do not need to pass a diff. The reviewer is read-only: it can read files for context but never edits anything, and just reports what it found.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_description: {
+          type: "string",
+          description: "What the work was supposed to accomplish, so the reviewer can judge the diff against the actual goal rather than reviewing it in a vacuum.",
+        },
+        since_commits: {
+          type: "number",
+          description: "How many recent shadow-history commits to include in the reviewed diff. Defaults to 10 — enough to cover a typical build task's worth of changes.",
+        },
+        model: { type: "string", description: "Optional model name to run the reviewer with. Defaults to the current active model." },
+      },
+      required: ["task_description"],
     },
     group: "state",
     risk: "execute",
@@ -1868,6 +2015,24 @@ function fuzzyFindMatch(content: string, oldString: string): [number, number] | 
   return null;
 }
 
+/**
+ * Best-effort nudge appended to a zero-result workspace-file search
+ * (grep_files/find_files): if this workspace has knowledge-base collections,
+ * point the model at search_knowledge instead of letting it give up. Cheap
+ * (one extra API call, only on the empty-result path) and harmless if the
+ * model's query really was about workspace files — see the "what do my class
+ * notes say about X" tool-selection failure this exists to catch.
+ */
+async function noMatchKnowledgeHint(): Promise<string> {
+  try {
+    const collections = await tauriInvoke<Array<{ id: string; label: string }>>("collections_all");
+    if (collections.length === 0) return "";
+    return `\n\n[ACTION REQUIRED] No matches in this project's files. If the question is about the user's class notes / uploaded documents: do not tell the user you can't find them — call search_knowledge now (available: ${collections.map((c) => c.label || c.id).join(", ")}) before answering.`;
+  } catch {
+    return ""; // not in Tauri desktop mode, or no knowledge backend — no hint, no error either
+  }
+}
+
 // ─── Executor ────────────────────────────────────────────────────────────────
 
 export async function executeTool(
@@ -1952,6 +2117,63 @@ export async function executeTool(
                 return `${i + 1}. [${h.origin}] ${h.task} (${date}, ${h.outcome})\n   ${h.snippet}`;
               })
               .join("\n\n");
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      case "find_recurring_issues": {
+        const rawMin = call.args["min_occurrences"];
+        const minOccurrences = typeof rawMin === "number" && rawMin > 0 ? Math.floor(rawMin) : 3;
+
+        // Mirrors the exact bracketed markers stuckDetector.ts / agentRuntime.ts
+        // already emit into transcripts — this reuses those signals rather than
+        // inventing a new failure-detection mechanism. Aggregated via the
+        // existing session_search FTS (searchSessions), no new backend needed.
+        const PATTERN_QUERIES: { label: string; query: string }[] = [
+          { label: "Loop block (repeated identical tool call)", query: "BLOCKED LOOP" },
+          { label: "Repeated-call block (re-ran an already-completed action)", query: "BLOCKED REPEATED CALL" },
+          { label: "Read-only investigation loop", query: "BLOCKED READ-ONLY LOOP" },
+          { label: "Planning-without-acting loop", query: "BLOCKED PLANNING LOOP" },
+          { label: "Same run_command error repeated", query: "SAME ERROR" },
+          { label: "Recovery hint triggered (a real error occurred)", query: "RECOVERY HINT" },
+          { label: "Tool call denied by user", query: "Denied by user" },
+          { label: "Denied in Plan mode", query: "Denied Plan mode" },
+        ];
+
+        const findings: { label: string; count: number; examples: string[] }[] = [];
+        for (const { label, query } of PATTERN_QUERIES) {
+          try {
+            const hits = await searchSessions(query, 20);
+            if (hits.length >= minOccurrences) {
+              findings.push({
+                label,
+                count: hits.length,
+                examples: hits.slice(0, 3).map((h) => `[${h.origin}] ${h.task}: ${h.snippet}`),
+              });
+            }
+          } catch {
+            // session search unavailable (non-Tauri / no history yet) — skip this pattern
+          }
+        }
+
+        findings.sort((a, b) => b.count - a.count);
+
+        if (findings.length === 0) {
+          return {
+            toolCallId: call.id,
+            name: call.name,
+            output: `No pattern recurred across at least ${minOccurrences} sessions. Either history is still sparse, or there's genuinely no clear recurring problem right now — that's a fine outcome, not a failed scan.`,
+          };
+        }
+
+        const output = [
+          `Found ${findings.length} recurring pattern(s) across session history (threshold: ${minOccurrences}+ sessions):`,
+          ...findings.map((f, i) =>
+            `${i + 1}. ${f.label} — ${f.count} session(s)\n   Examples:\n${f.examples.map((e) => `   - ${e}`).join("\n")}`
+          ),
+          "",
+          "If one of these looks worth fixing, use propose_feature to draft a concrete system-prompt or tool-description change — cite the pattern and count as the motivation. Where practical, test the change against the Benchmarks tab before/after to confirm it doesn't regress anything else.",
+        ].join("\n\n");
+
         return { toolCallId: call.id, name: call.name, output };
       }
 
@@ -2148,7 +2370,7 @@ export async function executeTool(
 
       case "grep_files": {
         const pattern = argStr(call.args["pattern"]);
-        if (!pattern) throw new Error("Missing pattern argument");
+        if (!pattern) throw new Error("Missing pattern argument. If this is about the user's class notes/uploaded documents: do not ask the user to clarify — call search_knowledge now instead (it takes 'query', not 'pattern'). grep_files only searches this workspace's own project files.");
         const { root: grepRoot, parts: grepParts } = resolveFileRoot(argStr(call.args["path"]), dirHandle, workspacePath);
         const searchPath = grepParts.join("/");
         const fileGlob = argStr(call.args["file_pattern"]) || "*";
@@ -2173,18 +2395,25 @@ export async function executeTool(
         const results: string[] = [];
         await grepInHandle(targetHandle, regex, fileGlob, searchPath || ".", results, 100);
 
+        // A zero-match grep is a dead end this workspace's files genuinely
+        // can't help with — but a weaker model asked something like "what do
+        // my notes say about X" will sometimes reach for grep_files (it
+        // searches "files") instead of search_knowledge (it searches
+        // "notes"), despite the tool descriptions already distinguishing
+        // them, then give up rather than retry with the right tool. If this
+        // workspace actually has knowledge collections, nudge toward them.
         return {
           toolCallId: call.id,
           name: call.name,
-          output: results.length > 0
+          output: (results.length > 0
             ? `${results.length} match${results.length !== 1 ? "es" : ""}:\n${results.join("\n")}`
-            : "No matches found.",
+            : "No matches found.") + (results.length === 0 ? await noMatchKnowledgeHint() : ""),
         };
       }
 
       case "find_files": {
         const pattern = argStr(call.args["pattern"]);
-        if (!pattern) throw new Error("Missing pattern argument");
+        if (!pattern) throw new Error("Missing pattern argument. If this is about the user's class notes/uploaded documents: do not ask the user to clarify — call search_knowledge now instead (it takes 'query', not 'pattern'). find_files only searches this workspace's own project files by name.");
         const { root: findRoot, parts: findParts } = resolveFileRoot(argStr(call.args["path"]), dirHandle, workspacePath);
         const searchPath = findParts.join("/");
 
@@ -2202,9 +2431,9 @@ export async function executeTool(
         return {
           toolCallId: call.id,
           name: call.name,
-          output: results.length > 0
+          output: (results.length > 0
             ? `${results.length} file${results.length !== 1 ? "s" : ""} found:\n${results.join("\n")}`
-            : "No files matched.",
+            : "No files matched.") + (results.length === 0 ? await noMatchKnowledgeHint() : ""),
         };
       }
 
@@ -2784,13 +3013,40 @@ export async function executeTool(
         if (!dirHandle) return noWorkspace(call);
         const title = argStr(call.args["title"]);
         if (!title) throw new Error("Missing title");
+        const diff = argStr(call.args["diff"]);
+
+        // Regression baseline: if this workspace has any saved benchmarks, run
+        // them now and fold the score into the proposal body — gives whoever
+        // reviews the proposal a concrete "was passing N/M before" number to
+        // compare against after applying the change, rather than propose_feature
+        // being pure prose with no way to tell if a fix actually helped.
+        // Best-effort only: a benchmark run failing/timing out must never block
+        // saving the proposal itself.
+        let benchmarkNote = "";
+        try {
+          const modelRef = useModelSelectionStore.getState().selectedModel;
+          const summary = modelRef ? await runBenchmarkSuite(dirHandle, modelRef) : null;
+          if (summary) {
+            benchmarkNote = `\n\n---\n**Benchmark baseline at proposal time:** ${summary.passed}/${summary.total} passed` +
+              (summary.failed.length > 0 ? ` (failing: ${summary.failed.join(", ")})` : "") +
+              `. Re-run the Benchmarks tab after applying this change to confirm nothing regressed.`;
+          }
+        } catch {
+          // No workspace benchmarks, no model selected, or a run errored — the
+          // proposal still saves without a baseline note.
+        }
+
+        const bodyParts = [argStr(call.args["details"])];
+        if (diff) bodyParts.push(`\n\n---\n**Proposed diff:**\n\n${diff}`);
+        bodyParts.push(benchmarkNote);
+
         const path = await saveImprovement(dirHandle, {
           title,
           motivation: argStr(call.args["motivation"]),
           proposed_files: argStr(call.args["proposed_files"]),
           acceptance_criteria: argStr(call.args["acceptance_criteria"]),
           size_guess: argStr(call.args["size_guess"]),
-          body: argStr(call.args["details"]),
+          body: bodyParts.join(""),
         });
         return {
           toolCallId: call.id,
@@ -2938,10 +3194,19 @@ export async function executeTool(
       case "save_workflow": {
         const name = argStr(call.args["name"]);
         const description = argStr(call.args["description"]);
-        const instruction = argStr(call.args["instruction"]);
+        const rawInstruction = argStr(call.args["instruction"]);
+        const rawSteps = argStrArray(call.args["steps"]);
         if (!name) throw new Error("Missing name argument");
         if (!description) throw new Error("Missing description argument");
-        if (!instruction) throw new Error("Missing instruction argument");
+        if (!rawInstruction && rawSteps.length === 0) throw new Error("Missing instruction argument");
+
+        // steps is the source of truth when given — instruction is compiled
+        // from it (see store/workflows.ts's compileInstruction) so the visual
+        // editor in the Workflows tab stays meaningful; falls back to wrapping
+        // the plain instruction as a single step when the model didn't break
+        // the goal down.
+        const steps = rawSteps.length > 0 ? rawSteps : [rawInstruction];
+        const instruction = rawSteps.length > 0 ? compileInstruction(rawSteps) : rawInstruction;
 
         // Name-based idempotency: unlike schedule_task's identical-spec check,
         // each workflow gets a fresh random id every call, so an identical-spec
@@ -2979,7 +3244,8 @@ export async function executeTool(
             .toLowerCase()
             .replace(/[^a-z0-9]+/g, "-")
             .replace(/^-|-$/g, "") || "workflow";
-        const outputFile = `.localmind/workflows/${slug}/output.md`;
+        const outputFormat = argStr(call.args["output_format"]).toLowerCase() === "html" ? "html" : "markdown";
+        const outputFile = `.localmind/workflows/${slug}/output.${outputFormat === "html" ? "html" : "md"}`;
 
         const id = crypto.randomUUID();
         const now = Date.now();
@@ -2996,6 +3262,7 @@ export async function executeTool(
           name,
           description,
           instruction,
+          steps,
           toolAllowlist: [],
           mcpServerIds,
           outputFile,
@@ -3076,6 +3343,19 @@ export async function executeTool(
         };
       }
 
+      case "notify_user": {
+        const title = argStr(call.args["title"]);
+        const message = argStr(call.args["message"]);
+        if (!title) throw new Error("Missing title argument");
+        if (!message) throw new Error("Missing message argument");
+        await notifyOs(title, message);
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Notification sent: "${title}" — ${message}`,
+        };
+      }
+
       case "spawn_subagent": {
         const subWorkspacePath = useAgentStore.getState().workspacePath ?? workspacePath;
         if (!subWorkspacePath) {
@@ -3112,6 +3392,71 @@ export async function executeTool(
             `Subagent (${subModel}) finished — outcome: ${record.outcome}, ${record.roundsUsed} round(s).\n\n` +
             `Summary: ${record.summary}\n\n` +
             `Transcript:\n${trimmedTranscript}${transcript.trim().length > 4000 ? "\n\n…(truncated)" : ""}`,
+        };
+      }
+
+      case "spawn_reviewer_subagent": {
+        const reviewWorkspacePath = useAgentStore.getState().workspacePath ?? workspacePath;
+        if (!reviewWorkspacePath) {
+          throw new Error("spawn_reviewer_subagent requires an open workspace — ask the user to open a folder first.");
+        }
+        const taskDescription = argStr(call.args["task_description"]);
+        if (!taskDescription) throw new Error("Missing task_description argument");
+        const rawSince = call.args["since_commits"];
+        const sinceCommits = typeof rawSince === "number" && rawSince > 0 ? Math.floor(rawSince) : 10;
+        const reviewModel = argStr(call.args["model"]) || useModelSelectionStore.getState().selectedModel;
+        if (!reviewModel) throw new Error("No model specified and no default model is selected.");
+        const reviewHardware = useModelStore.getState().hardware;
+
+        // Fetch one more than the window so the (N+1)th commit's tree can serve
+        // as the diff's base — otherwise the oldest commit in the window would
+        // be excluded from its own diff (it'd only be the base, never merged in).
+        const history = await listShadowHistory(reviewWorkspacePath, undefined, sinceCommits + 1);
+        if (history.length === 0) {
+          return {
+            toolCallId: call.id,
+            name: call.name,
+            output: "No shadow-history changes recorded yet for this workspace — nothing to review.",
+          };
+        }
+        const headOid = history[0].oid;
+        const baseOid = history.length > sinceCommits ? history[sinceCommits].oid : undefined;
+        const diff = await diffShadowRange(reviewWorkspacePath, baseOid, headOid);
+        if (!diff.trim()) {
+          return {
+            toolCallId: call.id,
+            name: call.name,
+            output: "The recent shadow-history commits produced an empty diff (net no-op) — nothing to review.",
+          };
+        }
+        const MAX_DIFF_CHARS = 20000;
+        const truncatedDiff = diff.length > MAX_DIFF_CHARS ? `${diff.slice(0, MAX_DIFF_CHARS)}\n…(diff truncated)` : diff;
+
+        const reviewTask = `You are doing an independent code review with completely fresh eyes — you did not write any of this code and have no context beyond what's given here, so don't assume it's correct just because it exists.\n\nThe work was supposed to accomplish: ${taskDescription}\n\nBelow is a unified diff of what actually changed. Review it for correctness bugs, regressions, missed edge cases, and anywhere it diverges from the stated goal. Use read_file/grep_files if the diff alone doesn't give enough context to judge a change. Report your findings as a concise list; if you genuinely find nothing wrong, say so plainly rather than inventing something to flag.\n\n--- DIFF ---\n${truncatedDiff}\n--- END DIFF ---`;
+
+        // Dynamic import avoids a static circular dependency (headlessRunner.ts
+        // imports TOOL_DEFINITIONS from this file).
+        const { runHeadlessTask, HEADLESS_DEFAULT_ALLOWLIST } = await import("./headlessRunner");
+
+        const { record, transcript } = await runHeadlessTask({
+          workspacePath: reviewWorkspacePath,
+          modelRef: reviewModel,
+          task: reviewTask,
+          hardware: reviewHardware,
+          origin: "subagent",
+          agentBuildMode: true,
+          // Read-only: a reviewer that can edit files defeats the point of a
+          // fresh, independent second opinion — it should only read and report.
+          toolAllowlist: HEADLESS_DEFAULT_ALLOWLIST,
+        });
+
+        const trimmedTranscript = transcript.trim().slice(0, 4000);
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output:
+            `Reviewer subagent (${reviewModel}) finished — outcome: ${record.outcome}, ${record.roundsUsed} round(s).\n\n` +
+            `Findings:\n${trimmedTranscript}${transcript.trim().length > 4000 ? "\n\n…(truncated)" : ""}`,
         };
       }
 
@@ -3184,6 +3529,52 @@ export async function executeTool(
         const id = argStr(call.args["id"]);
         if (!id) throw new Error("Missing id argument");
         const output = await tauriInvoke<string>("minimize_window", { id });
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      case "uia_list_elements": {
+        const windowId = argStr(call.args["window_id"]);
+        if (!windowId) throw new Error("Missing window_id argument");
+        const controlType = argStr(call.args["control_type"]) || undefined;
+        const elements = await tauriInvoke<
+          Array<{ name: string; control_type: string; automation_id: string; is_enabled: boolean; supported_actions: string[] }>
+        >("uia_list_elements", { windowId, controlType });
+        const output = elements.length
+          ? elements
+              .map(
+                (e, i) =>
+                  `${i + 1}. "${e.name}" [${e.control_type}]${e.automation_id ? ` #${e.automation_id}` : ""}${e.is_enabled ? "" : " (disabled)"} — actions: ${e.supported_actions.join(", ") || "none"}`,
+              )
+              .join("\n")
+          : "(no matching elements found)";
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      case "uia_click_element": {
+        const windowId = argStr(call.args["window_id"]);
+        const name = argStr(call.args["name"]);
+        if (!windowId || !name) throw new Error("Missing window_id/name argument");
+        const controlType = argStr(call.args["control_type"]) || undefined;
+        const output = await tauriInvoke<string>("uia_click_element", { windowId, name, controlType });
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      case "uia_read_element_text": {
+        const windowId = argStr(call.args["window_id"]);
+        const name = argStr(call.args["name"]);
+        if (!windowId || !name) throw new Error("Missing window_id/name argument");
+        const controlType = argStr(call.args["control_type"]) || undefined;
+        const output = await tauriInvoke<string>("uia_read_element_text", { windowId, name, controlType });
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      case "uia_set_element_text": {
+        const windowId = argStr(call.args["window_id"]);
+        const name = argStr(call.args["name"]);
+        const value = argStr(call.args["value"]);
+        if (!windowId || !name) throw new Error("Missing window_id/name argument");
+        const controlType = argStr(call.args["control_type"]) || undefined;
+        const output = await tauriInvoke<string>("uia_set_element_text", { windowId, name, value, controlType });
         return { toolCallId: call.id, name: call.name, output };
       }
 

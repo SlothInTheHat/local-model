@@ -28,6 +28,42 @@ export async function listModels(): Promise<OllamaModel[]> {
   return data.models ?? [];
 }
 
+export interface RunningModel {
+  name: string;
+  /** Total size of the loaded model, in bytes. */
+  size: number;
+  /** How much of `size` is resident in GPU VRAM, in bytes. 0 means fully on CPU. */
+  size_vram: number;
+}
+
+/** GET /api/ps — models currently loaded in memory (empty if nothing has run
+ *  recently). Per-model size_vram vs size is Ollama's own signal for whether
+ *  that model is running on GPU, partially offloaded, or CPU-only. */
+export async function listRunningModels(): Promise<RunningModel[]> {
+  const res = await fetch(`${getOllamaBaseUrl()}/api/ps`);
+  if (!res.ok) throw new Error(`Ollama not reachable: ${res.status}`);
+  const data = await res.json();
+  return data.models ?? [];
+}
+
+/**
+ * Forces Ollama to load `model` into memory with a minimal (1-token)
+ * generation, so a listRunningModels() call right after reflects it
+ * immediately — /api/ps is otherwise empty whenever nothing has generated
+ * recently, which is most of the time between actual chat messages. Used by
+ * the Models tab's "Check GPU now" button so GPU-usage status doesn't depend
+ * on the user happening to be mid-conversation.
+ */
+export async function probeModelLoad(model: string): Promise<void> {
+  const res = await fetch(`${getOllamaBaseUrl()}/api/generate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model, prompt: "hi", stream: false, options: { num_predict: 1 } }),
+  });
+  if (!res.ok) throw new Error(`Ollama not reachable: ${res.status}`);
+  await res.json(); // drain the body; the generated text itself is irrelevant
+}
+
 export interface PullUpdate {
   status: string;
   percent: number; // 0-100; 0 when status has no progress info

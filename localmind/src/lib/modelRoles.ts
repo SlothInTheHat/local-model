@@ -35,7 +35,7 @@ import { streamChatForModel } from "./chatProvider";
  */
 export const DIGEST_MAX_CHARS = 2000;
 
-export type ModelRole = "primary" | "digest" | "vision" | "embed";
+export type ModelRole = "primary" | "digest" | "vision" | "embed" | "knowledge" | "router";
 
 export interface RoleResolution {
   model: string | null;
@@ -138,6 +138,30 @@ function autoResolveEmbed(): string | null {
   return useMemoryStore.getState().embedModel || null;
 }
 
+/**
+ * Unpinned default is deliberately just `primary` — unlike `digest` (which
+ * auto-picks a small model) there's no safe automatic guess for "stronger
+ * model for knowledge-base questions" (auto-picking the single largest
+ * installed model could silently load something far slower than the user
+ * expects). This role only changes behavior once the user explicitly pins a
+ * model to it in Settings; until then a knowledge-flavored question runs on
+ * the same model as everything else, exactly like before this role existed.
+ */
+function autoResolveKnowledge(): string | null {
+  return autoResolvePrimary();
+}
+
+/**
+ * Unlike every other role, `router` has NO auto-fallback to `primary` — it's
+ * either explicitly pinned (delegating tool-calling rounds to that model,
+ * see runAgentSession's routing phase in agentRuntime.ts) or the feature is
+ * simply off. Falling back to primary would make the router "delegate" to
+ * itself, a silent no-op that only adds latency for nothing.
+ */
+function autoResolveRouter(): string | null {
+  return null;
+}
+
 export function resolveRoleWithReason(role: ModelRole): RoleResolution {
   // `embed` is deliberately never pinnable through settings.modelRoles: the
   // model actually used for embeddings is owned solely by src/store/memory.ts
@@ -169,11 +193,36 @@ export function resolveRoleWithReason(role: ModelRole): RoleResolution {
       const fallback = autoResolvePrimary();
       return fallback ? { model: fallback, source: "fallback" } : { model: null, source: "none" };
     }
+    case "knowledge": {
+      const model = autoResolveKnowledge();
+      return model ? { model, source: "auto" } : { model: null, source: "none" };
+    }
+    case "router": {
+      const model = autoResolveRouter();
+      return model ? { model, source: "auto" } : { model: null, source: "none" };
+    }
   }
 }
 
 export function resolveRole(role: ModelRole): string | null {
   return resolveRoleWithReason(role).model;
+}
+
+/**
+ * Cheap heuristic for "this message is asking about the user's class notes /
+ * uploaded knowledge-base documents" — used to route a chat-agent turn to the
+ * `knowledge` role instead of `primary` when the user has pinned a stronger
+ * model there. Deliberately generous: a false positive just means an
+ * unnecessary-but-harmless model switch for that one turn, not a wrong
+ * answer, so this errs toward matching rather than narrowly requiring exact
+ * phrasing (see the observed failure this role was added for: a small model
+ * reached for grep_files instead of search_knowledge on "what do my class
+ * notes say about X" and gave up after an empty result).
+ */
+const KNOWLEDGE_QUERY_RE = /\b(my|our|the) (class |lecture )?notes\b|\bclass notes\b|\blecture notes\b|\bmy (readings?|slides|textbook|coursework)\b|\baccording to (my|the) (notes|readings|textbook|slides)\b/i;
+
+export function looksLikeKnowledgeQuery(text: string): boolean {
+  return KNOWLEDGE_QUERY_RE.test(text);
 }
 
 /**

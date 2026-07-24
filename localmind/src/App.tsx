@@ -9,6 +9,7 @@ import { listModels, pullModel } from "./lib/ollama";
 import type { ChatMessage } from "./lib/ollama";
 import { searchWeb } from "./lib/search";
 import { runAgentSession, DEFAULT_MAX_ROUNDS, buildIdentitySystemPrompt } from "./lib/agentRuntime";
+import { resolveRole, looksLikeKnowledgeQuery } from "./lib/modelRoles";
 import { streamChatForModel, formatModelRef } from "./lib/chatProvider";
 import { classifyIntent, heuristicIntent } from "./lib/intentRouter";
 import { setSystemInfoContext } from "./lib/tools";
@@ -29,7 +30,7 @@ import { useSessionResultsStore } from "./store/sessionResults";
 import { useChatSeedStore } from "./store/chatSeed";
 import { speakText } from "./lib/speech";
 import { startTaskRunner, SAFE_QUEUE_ALLOWLIST } from "./lib/taskRunner";
-import { initScheduler } from "./lib/scheduler";
+import { initScheduler, seedSelfImprovementJob } from "./lib/scheduler";
 import { initMcpAutoConnect } from "./lib/mcpAutoConnect";
 import { initTrayIntegration } from "./lib/trayIntegration";
 import { syncConversationsToFts } from "./lib/sessionSearch";
@@ -482,6 +483,15 @@ export default function App() {
   // a provider, saving a model list) without an app restart. initOllama only
   // reads providers once at boot; this merges provider models live, preserving
   // the discovered Ollama names (refs without "::") already in the list.
+  // Provider API keys are deliberately excluded from this store's own
+  // localStorage snapshot (credential-isolation fix — see store/providers.ts)
+  // and live in the OS credential vault instead, so they need an explicit
+  // hydration pass once at startup rather than coming back for free via
+  // zustand's persist rehydration.
+  useEffect(() => {
+    void useProvidersStore.getState().loadApiKeys();
+  }, []);
+
   const providerConfigs = useProvidersStore((s) => s.providers);
   useEffect(() => {
     const providerModels = providerConfigs
@@ -529,7 +539,24 @@ export default function App() {
     // auto-connect (reconnect enabled servers on launch), and the tray's
     // close-to-tray setting sync. All idempotent.
     initScheduler();
-    initMcpAutoConnect();
+    // MCP server env (credentials/tokens) is excluded from this store's own
+    // localStorage snapshot (credential-isolation fix — see store/mcp.ts)
+    // and lives in the OS credential vault instead, so it must be hydrated
+    // before auto-connect tries to actually launch any stdio server — a
+    // server started with an empty env would fail auth on every reconnect.
+    void useMcpStore.getState().loadServerEnvs().then(() => initMcpAutoConnect());
+    // Self-improvement/proactive-notice job (roadmap Phase 1 + 8): seeded once
+    // per install like any other scheduled job (editable/removable in Settings
+    // → Scheduled jobs), never re-inserted once selfImprovementJobSeeded flips
+    // true. Skipped entirely if the user has turned the feature off.
+    if (isTauriEnv()) {
+      const { selfImprovementEnabled, selfImprovementJobSeeded, markSelfImprovementJobSeeded } = useSettingsStore.getState();
+      if (selfImprovementEnabled && !selfImprovementJobSeeded) {
+        seedSelfImprovementJob()
+          .then(markSelfImprovementJobSeeded)
+          .catch((err) => console.error("[self-improvement] failed to seed default job:", err));
+      }
+    }
     initTrayIntegration();
     // Past-session search (WP4.3): index existing conversations once on
     // mount, then re-sync (debounced) whenever they change, so the search
@@ -1136,7 +1163,13 @@ export default function App() {
         forceAgentMode || (!agentMode)
           ? false
           : (await classifyIntent(text, selectedModel)) === "chat";
-      await runAgentLoop(convId, history, conversational);
+      // Route to the `knowledge` role instead of the main model when this
+      // looks like a class-notes/knowledge-base question — a no-op unless the
+      // user has actually pinned a different model to that role in Settings
+      // (resolveRole falls back to `primary` otherwise), so this only changes
+      // behavior for someone who opted in.
+      const knowledgeModel = looksLikeKnowledgeQuery(text) ? resolveRole("knowledge") : null;
+      await runAgentLoop(convId, history, conversational, knowledgeModel ?? undefined);
     } else {
       // Give the model baseline awareness of LocalMind/workspace/hardware —
       // without this, normal chat has zero context and acts like a generic chatbot.
@@ -1195,11 +1228,12 @@ export default function App() {
 
   // ─── Agent loop ───────────────────────────────────────────────────────────
 
-  async function runAgentLoop(convId: string, history: ChatMessage[], conversational = false) {
+  async function runAgentLoop(convId: string, history: ChatMessage[], conversational = false, modelOverride?: string) {
     const mcpTools = useMcpStore.getState().getEnabledTools();
     const enabledTools = await assembleSessionTools({ dirHandle, toolsEnabled, mcpTools });
 
-    const toolsSupported = supportsNativeTools(selectedModel);
+    const modelRef = modelOverride || selectedModel;
+    const toolsSupported = supportsNativeTools(modelRef);
     const effectiveHardware = vramOverride != null && hardware ? { ...hardware, vramGb: vramOverride } : hardware;
 
     addMessage(convId, { role: "assistant", content: "" });
@@ -1209,7 +1243,7 @@ export default function App() {
 
     try {
       const sessionResult = await runAgentSession(history, {
-        modelRef: selectedModel,
+        modelRef,
         hardware: effectiveHardware,
         numCtxOverride,
         dirHandle,

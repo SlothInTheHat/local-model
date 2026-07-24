@@ -50,8 +50,15 @@ const OBSERVATION_TOOLS = new Set([
   "get_current_datetime",
 ]);
 
-const REPEATABLE_TOOLS = new Set(["run_command", "web_search", "web_fetch", "install_deps", "schedule_task"]);
-const READ_ONLY_TOOLS = new Set(["read_file", "list_directory", "grep_files", "find_files"]);
+// save_workflow/delete_workflow are included here too: resaving or
+// re-deleting the exact same workflow twice in a session is unambiguously a
+// stuck-loop signal, same as rerunning an identical shell command — a real
+// session was observed cycling delete_workflow/save_workflow/list_workflows
+// repeatedly while confused about which of two similarly-named workflows was
+// current, and none of the rules below applied to any of those three tool
+// names, so the cycle ran unchecked.
+const REPEATABLE_TOOLS = new Set(["run_command", "web_search", "web_fetch", "install_deps", "schedule_task", "save_workflow", "delete_workflow"]);
+const READ_ONLY_TOOLS = new Set(["read_file", "list_directory", "grep_files", "find_files", "list_workflows"]);
 
 /**
  * Tools whose success means the model actually produced/changed something —
@@ -61,7 +68,7 @@ const READ_ONLY_TOOLS = new Set(["read_file", "list_directory", "grep_files", "f
  * general, just not the specific kind that ends a read-only investigation
  * loop).
  */
-const MUTATING_TOOLS = new Set(["write_file", "patch_file", "apply_patch", "delete_file", "create_folder", "run_command", "install_deps"]);
+const MUTATING_TOOLS = new Set(["write_file", "patch_file", "apply_patch", "delete_file", "create_folder", "run_command", "install_deps", "save_workflow", "delete_workflow", "run_workflow"]);
 
 /**
  * Tracks tool-call patterns across an agent session and surfaces hard blocks
@@ -109,6 +116,7 @@ export class StuckDetector {
     "grep_files", "find_files", "list_directory", "create_folder", "delete_file",
     "install_deps", "web_search", "web_fetch",
     "git_status", "git_diff", "git_log", "git_add", "git_commit",
+    "list_workflows", "save_workflow", "delete_workflow", "run_workflow",
   ]);
 
   private toolCallCounts = new Map<string, number>();

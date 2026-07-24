@@ -6,20 +6,9 @@ import {
 import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
-import { streamChatForModel } from "../lib/chatProvider";
 import { openWorkspace } from "../lib/fileSystem";
 import { useAgentStore } from "../store/agent";
-import { type BenchmarkDef, loadBenchmarks, saveBenchmark } from "../lib/benchmarks";
-
-interface BenchmarkResult {
-  name: string;
-  passed: boolean;
-  score: number;       // matched / required
-  latencyMs: number;
-  response: string;
-  error?: string;
-  ranAt: string;
-}
+import { type BenchmarkDef, type BenchmarkResult, loadBenchmarks, saveBenchmark, runBenchmarkDef } from "../lib/benchmarks";
 
 interface Props { selectedModel: string; }
 
@@ -82,44 +71,7 @@ export function BenchmarkRunner({ selectedModel }: Props) {
     abortRefs.current.set(def.name, ctrl);
     setRunning((prev) => new Set(prev).add(def.name));
 
-    const start = Date.now();
-    let response = "";
-    let errorMsg: string | undefined;
-
-    try {
-      const timer = setTimeout(() => ctrl.abort(), def.timeout_seconds * 1000);
-      for await (const chunk of streamChatForModel(
-        selectedModel,
-        [{ role: "user", content: def.prompt }],
-        ctrl.signal,
-      )) {
-        response += chunk;
-      }
-      clearTimeout(timer);
-    } catch (err) {
-      const e = err as Error;
-      if (e.name === "AbortError") {
-        errorMsg = `Timed out after ${def.timeout_seconds}s`;
-      } else {
-        errorMsg = e.message;
-      }
-    }
-
-    const latency = Date.now() - start;
-    const matched = def.keywords.filter((kw) =>
-      response.toLowerCase().includes(kw.toLowerCase()),
-    ).length;
-    const passed = !errorMsg && matched >= def.min_matches;
-
-    const result: BenchmarkResult = {
-      name: def.name,
-      passed,
-      score: matched,
-      latencyMs: latency,
-      response: response.slice(0, 2000),
-      error: errorMsg,
-      ranAt: new Date().toISOString(),
-    };
+    const result = await runBenchmarkDef(def, selectedModel, ctrl.signal);
 
     setResults((prev) => new Map(prev).set(def.name, result));
     setRunning((prev) => { const n = new Set(prev); n.delete(def.name); return n; });

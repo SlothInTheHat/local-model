@@ -1,5 +1,9 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { getCredential, setCredential } from "../lib/credentials";
+
+/** Credential-vault "service" namespace for provider API keys (see src/lib/credentials.ts). */
+const CRED_SERVICE = "provider-api-key";
 
 export interface ProviderConfig {
   id: string;
@@ -51,11 +55,20 @@ interface ProvidersState {
   setProvider: (id: string, patch: Partial<ProviderConfig>) => void;
   addProvider: (config: ProviderConfig) => void;
   removeProvider: (id: string) => void;
+  /** Updates a provider's API key both in memory and in the credential vault
+   *  (src/lib/credentials.ts) — use this instead of setProvider({apiKey}) so
+   *  the key actually persists somewhere other than in-memory-only. */
+  setProviderApiKey: (id: string, apiKey: string) => Promise<void>;
+  /** Hydrates every provider's apiKey from the credential vault. Call once at
+   *  startup (App.tsx) — apiKey is deliberately excluded from this store's
+   *  own persisted snapshot (see partialize below), so without this call
+   *  every provider's key would read back empty after a restart. */
+  loadApiKeys: () => Promise<void>;
 }
 
 export const useProvidersStore = create<ProvidersState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       providers: BUILTIN_PROVIDERS,
       setProvider: (id, patch) =>
         set((s) => ({
@@ -63,9 +76,36 @@ export const useProvidersStore = create<ProvidersState>()(
         })),
       addProvider: (config) =>
         set((s) => ({ providers: [...s.providers, config] })),
-      removeProvider: (id) =>
-        set((s) => ({ providers: s.providers.filter((p) => p.id !== id) })),
+      removeProvider: (id) => {
+        set((s) => ({ providers: s.providers.filter((p) => p.id !== id) }));
+        void setCredential(CRED_SERVICE, id, ""); // clears any saved key — no orphaned vault entry
+      },
+      setProviderApiKey: async (id, apiKey) => {
+        set((s) => ({
+          providers: s.providers.map((p) => (p.id === id ? { ...p, apiKey } : p)),
+        }));
+        await setCredential(CRED_SERVICE, id, apiKey);
+      },
+      loadApiKeys: async () => {
+        const ids = get().providers.map((p) => p.id);
+        const keys = await Promise.all(ids.map((id) => getCredential(CRED_SERVICE, id)));
+        set((s) => ({
+          providers: s.providers.map((p) => {
+            const i = ids.indexOf(p.id);
+            return i >= 0 && keys[i] ? { ...p, apiKey: keys[i] } : p;
+          }),
+        }));
+      },
     }),
-    { name: "localmind-providers" }
+    {
+      name: "localmind-providers",
+      // Never persist apiKey to localStorage — it lives in the credential
+      // vault instead. apiKey reads back "" until App.tsx's startup call to
+      // loadApiKeys() hydrates it from there (see setProviderApiKey/
+      // loadApiKeys above).
+      partialize: (s) => ({
+        providers: s.providers.map((p) => ({ ...p, apiKey: "" })),
+      }),
+    }
   )
 );

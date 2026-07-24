@@ -243,7 +243,7 @@ function GitLabSection() {
 // ─── Providers section ────────────────────────────────────────────────────────
 
 function ProvidersSection() {
-  const { providers, setProvider } = useProvidersStore();
+  const { providers, setProvider, setProviderApiKey } = useProvidersStore();
   const [showKeys, setShowKeys] = useState<Record<string, boolean>>({});
   const [modelEdits, setModelEdits] = useState<Record<string, string>>({});
 
@@ -290,7 +290,7 @@ function ProvidersSection() {
                     <input
                       type={showKeys[p.id] ? "text" : "password"}
                       value={p.apiKey}
-                      onChange={(e) => setProvider(p.id, { apiKey: e.target.value })}
+                      onChange={(e) => void setProviderApiKey(p.id, e.target.value)}
                       placeholder={p.id === "openrouter" ? "sk-or-…" : p.id === "openai" ? "sk-…" : "optional"}
                       className="w-full text-sm px-3 py-1.5 pr-8 rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground outline-none focus:ring-2 focus:ring-ring font-mono"
                     />
@@ -990,6 +990,16 @@ const PINNABLE_ROLES: Array<{ role: Exclude<ModelRole, "primary" | "embed">; lab
     label: "Vision",
     hint: "Handles image inputs (e.g. screenshots) — a follow-up feature consumes this. Needs a model that actually supports vision, not just any model.",
   },
+  {
+    role: "knowledge",
+    label: "Knowledge / research",
+    hint: "Used instead of your main model when a message looks like a question about your class notes/knowledge base (e.g. \"what do my notes say about X\") — tool selection between search_knowledge and workspace-file tools is exactly where a weaker model tends to struggle. Leave on Auto to keep using your main model; pin a stronger one (even if slower) if you've noticed it picking the wrong tool.",
+  },
+  {
+    role: "router",
+    label: "Tool router (delegate tool-picking)",
+    hint: "Off by default — no fallback. When pinned (typically to a fast cloud model, e.g. a DeepSeek/GPT-4o/Claude provider), that model handles ONLY the read-only lookup tool calls each turn (search_knowledge, grep_files, web_search, etc. — never write/run/delete tools) for up to a few rounds; your main model then writes the actual final answer from whatever it found. Local models were observed struggling specifically at picking the right tool among several, not at writing the answer once given the right information. Costs a cloud API call (and a network round-trip of latency) per turn that needs tools — leave unpinned to keep everything on your main model as before.",
+  },
 ];
 
 function describeResolution(role: ModelRole): { model: string | null; text: string } {
@@ -999,6 +1009,8 @@ function describeResolution(role: ModelRole): { model: string | null; text: stri
       model: null,
       text: role === "vision"
         ? "No vision model installed — pull llava or moondream to enable image tools."
+        : role === "router"
+        ? "Off — tool-picking stays on your main model."
         : "No model resolved.",
     };
   }
@@ -1028,7 +1040,7 @@ function ModelRolesSection() {
                 onChange={(e) => setModelRole(role, e.target.value || null)}
                 className="w-full text-sm px-3 py-1.5 rounded-md border border-border bg-background text-foreground outline-none focus:ring-2 focus:ring-ring"
               >
-                <option value="">Auto</option>
+                <option value="">{role === "router" ? "Off" : "Auto"}</option>
                 {availableModels.map((m) => (
                   <option key={m} value={m}>{m}</option>
                 ))}
@@ -1248,8 +1260,8 @@ function PrivacySecuritySection() {
 export function AppSettings() {
   const { gitName, gitEmail, setGitIdentity } = useProfileStore();
   const {
-    defaultSystemPrompt, theme, numCtxOverride, featureIdeasSteering, ollamaBaseUrl,
-    setDefaultSystemPrompt, setTheme, setNumCtxOverride, setFeatureIdeasSteering, setOllamaBaseUrl,
+    defaultSystemPrompt, theme, numCtxOverride, featureIdeasSteering, ollamaBaseUrl, selfImprovementEnabled,
+    setDefaultSystemPrompt, setTheme, setNumCtxOverride, setFeatureIdeasSteering, setOllamaBaseUrl, setSelfImprovementEnabled,
   } = useSettingsStore();
   const { hardware, vramOverride } = useModelStore();
   const { selectedModel, setSelectedModel } = useModelSelectionStore();
@@ -1551,6 +1563,22 @@ export function AppSettings() {
                     placeholder="e.g. Lean towards a JARVIS-style assistant: voice control, proactive automation, deeper OS integration."
                     className="w-full text-sm px-3 py-2 rounded-md border border-border bg-background text-foreground outline-none focus:ring-2 focus:ring-ring resize-none"
                   />
+                </Field>
+
+                {/* Self-improvement / proactive background pass */}
+                <Field
+                  label="Self-improvement pass"
+                  hint="A daily background job (auto-created once, editable/removable like any scheduled job under Scheduled jobs above) mines session history for recurring problems and, if it notices something worth telling you unprompted, sends a desktop notification. Read-only by default — it never edits your project without you reviewing a proposal first."
+                >
+                  <label className="flex items-center gap-2.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={selfImprovementEnabled}
+                      onChange={(e) => setSelfImprovementEnabled(e.target.checked)}
+                      className="size-4 rounded"
+                    />
+                    <span className="text-sm text-foreground">Run a daily self-improvement / proactive-notice pass</span>
+                  </label>
                 </Field>
               </CardContent>
             </Card>

@@ -76,6 +76,10 @@ export const SAFE_SCHED_ALLOWLIST: string[] = [
   "list_skills",
   "calculator",
   "todo_write",
+  // Read-only history scan (Phase 1 of the self-improvement roadmap) — safe
+  // to run unattended since it only searches past session transcripts and
+  // never mutates anything itself.
+  "find_recurring_issues",
   // update_project_memory / save_global_memory / save_skill are deliberately
   // NOT allowlisted: unattended runs must not write to the assistant's
   // long-term knowledge. A scheduled run was observed hijacked into
@@ -318,6 +322,42 @@ async function handleJobDue(job: JobDuePayload): Promise<void> {
     toast.error(`Scheduled task failed: ${label}`, { description: message });
     void notifyOs(`Scheduled task failed: ${label}`, message);
   }
+}
+
+async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const tauri = (window as unknown as Record<string, unknown>).__TAURI__;
+  if (!tauri) throw new Error("Not in Tauri desktop mode — launch with npm run tauri dev");
+  const core = (tauri as Record<string, unknown>).core as {
+    invoke?: (cmd: string, args?: unknown) => Promise<T>;
+  };
+  if (typeof core?.invoke !== "function") throw new Error("Tauri core.invoke unavailable");
+  return core.invoke(cmd, args);
+}
+
+/**
+ * The daily self-improvement / proactive-notice job's instruction (Phase 1 +
+ * Phase 8 of the self-improvement roadmap). Runs under SAFE_SCHED_ALLOWLIST
+ * like any other scheduled job — read-only plus notify_user, nothing that
+ * mutates the project without a human reviewing a propose_feature spec first.
+ */
+const SELF_IMPROVEMENT_TASK =
+  "Run today's self-improvement and proactive-notice pass. Do BOTH of the following:\n" +
+  "1. Call find_recurring_issues to check whether any failure pattern has recurred across recent sessions. If something concrete and fixable turns up, use propose_feature to draft a fix (fill in 'diff' with the exact before/after wording if it's a prompt/tool-description change) — otherwise say so and move on, that's a normal outcome.\n" +
+  "2. Separately, look for anything worth telling the user about RIGHT NOW, unprompted — e.g. call list_workflows and read_file on any workflow output file that changed since you last looked, and notice things like a new noteworthy entry, a workflow that's failed several runs in a row, or an approaching deadline visible in the data. Only if you find something genuinely specific and worth interrupting the user for, call notify_user with a concise message. If nothing stands out, do NOT call notify_user — staying silent is the correct, expected result on most days. Never fabricate a finding just to have something to report.";
+
+/**
+ * Inserts the default daily self-improvement + proactive-notice job — once
+ * per install. Callers (App.tsx) are responsible for only calling this when
+ * `selfImprovementJobSeeded` is still false and marking it true right after,
+ * since this function itself has no dedupe check and would otherwise insert
+ * a duplicate job on every launch.
+ */
+export async function seedSelfImprovementJob(): Promise<void> {
+  const schedule = "cron:0 9 * * *"; // once daily, 9am local time
+  const id = crypto.randomUUID();
+  const spec = buildJobSpec(SELF_IMPROVEMENT_TASK, schedule);
+  const nextRunAt = computeInitialNextRun(schedule);
+  await tauriInvoke("jobs_insert", { id, spec, nextRunAt, status: "active" });
 }
 
 /** Idempotence guard — initScheduler() may be called more than once safely. */

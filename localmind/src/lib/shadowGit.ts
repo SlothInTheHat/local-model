@@ -62,6 +62,23 @@ export async function diffShadowCommit(workspacePath: string, oid: string, path?
   return tauriInvoke<string>("shadow_git_diff", { workspaceRoot: workspacePath, commitOid: oid, path });
 }
 
+/**
+ * Unified diff spanning a range of shadow commits — baseOid's tree (or the
+ * empty tree if omitted) to headOid's tree (or current HEAD if omitted).
+ * Unlike diffShadowCommit (always one commit vs its immediate parent), this
+ * gives the *net* change across a whole run of commits as one diff — used by
+ * spawn_reviewer_subagent (tools.ts) to hand a fresh critic subagent
+ * everything a build task changed, not N separate per-commit fragments.
+ */
+export async function diffShadowRange(
+  workspacePath: string,
+  baseOid: string | undefined,
+  headOid: string | undefined,
+  path?: string,
+): Promise<string> {
+  return tauriInvoke<string>("shadow_git_diff_range", { workspaceRoot: workspacePath, baseOid, headOid, path });
+}
+
 export async function restoreShadowFile(workspacePath: string, oid: string, path: string): Promise<void> {
   await tauriInvoke("shadow_git_restore_file", { workspaceRoot: workspacePath, commitOid: oid, path });
 }

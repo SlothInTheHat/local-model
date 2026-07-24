@@ -1,12 +1,15 @@
-import { useRef, useState } from "react";
-import { Search, Sparkles } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Search, Sparkles, Download, RefreshCw } from "lucide-react";
+import { toast } from "sonner";
 import { supportsNativeTools } from "../lib/modelCapabilities";
 import { cn } from "./ui/utils";
 import { Input } from "./ui/input";
+import { Button } from "./ui/button";
 import { ScrollArea } from "./ui/scroll-area";
 import { Separator } from "./ui/separator";
 import { pullModel, deleteModel, listModels } from "../lib/ollama";
 import { MODEL_LIBRARY, LIBRARY_UPDATED, getCompatibility, type ModelSpec } from "../lib/modelLibrary";
+import { getLiveModelLibrary, getLiveLibraryFetchedAt, type LiveLibraryEntry } from "../lib/liveModelLibrary";
 import { useChatStore } from "../store/chat";
 import { useModelStore } from "../store/models";
 import { HardwareSummary } from "./HardwareSummary";
@@ -35,15 +38,61 @@ function makeStubSpec(name: string): ModelSpec {
   };
 }
 
+function timeAgo(ms: number): string {
+  const mins = Math.round((Date.now() - ms) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
 export function ModelManager({ onUseModel }: Props) {
   const [tab, setTab] = useState<Tab>("recommended");
   const [search, setSearch] = useState("");
   const [toolsOnly, setToolsOnly] = useState(false);
+  const [pullByName, setPullByName] = useState("");
+  const [liveEntries, setLiveEntries] = useState<LiveLibraryEntry[]>([]);
+  const [liveFetchedAt, setLiveFetchedAt] = useState<number | null>(null);
+  const [liveLoading, setLiveLoading] = useState(false);
 
   const { availableModels, setModels } = useChatStore();
   const { hardware, vramOverride, pullProgress, setPullProgress, clearPullProgress } =
     useModelStore();
   const aborts = useRef<Record<string, AbortController>>({});
+
+  // Best-effort live refresh from ollama.com/library (see liveModelLibrary.ts)
+  // — supplements the curated MODEL_LIBRARY below with anything Ollama has
+  // added since it was last hand-updated. Cached for a day; a failed/blocked
+  // fetch just means this section stays empty, never breaks the tab.
+  useEffect(() => {
+    setLiveLoading(true);
+    getLiveModelLibrary()
+      .then((entries) => {
+        setLiveEntries(entries);
+        setLiveFetchedAt(getLiveLibraryFetchedAt());
+      })
+      .finally(() => setLiveLoading(false));
+  }, []);
+
+  async function handleRefreshLiveLibrary() {
+    setLiveLoading(true);
+    try {
+      const entries = await getLiveModelLibrary(true);
+      setLiveEntries(entries);
+      setLiveFetchedAt(getLiveLibraryFetchedAt());
+      if (entries.length === 0) toast.error("Couldn't reach ollama.com/library — showing the curated catalog only.");
+    } finally {
+      setLiveLoading(false);
+    }
+  }
+
+  async function handlePullByName() {
+    const name = pullByName.trim();
+    if (!name) return;
+    setPullByName("");
+    await handleInstall(name);
+  }
 
   const effectiveHw = hardware
     ? vramOverride != null ? { ...hardware, vramGb: vramOverride } : hardware
@@ -137,6 +186,17 @@ export function ModelManager({ onUseModel }: Props) {
   // Total installed count (catalog matches + uncataloged) for the badge
   const totalInstalled = catalogInstalledIds.size + uncatalogedSpecs.length;
 
+  // Live-catalog entries (ollama.com/library) not already covered by the
+  // curated MODEL_LIBRARY or already installed — "more from ollama.com" that
+  // the curated list hasn't been hand-updated to include yet. Family-matched
+  // against curated ids' prefix before ":" so e.g. curated "llama3.2:3b"
+  // correctly absorbs a live "llama3.2" entry instead of duplicating it.
+  const curatedFamilies = new Set(MODEL_LIBRARY.map((s) => s.id.split(":")[0]));
+  const liveOnly = liveEntries.filter((e) => !curatedFamilies.has(e.id) && !isInstalled(e.id));
+  const liveOnlyFiltered = q
+    ? liveOnly.filter((e) => `${e.id} ${e.description} ${e.capabilityTags.join(" ")}`.toLowerCase().includes(q))
+    : liveOnly;
+
   const baseList: ModelSpec[] =
     tab === "installed"
       ? [
@@ -174,6 +234,11 @@ export function ModelManager({ onUseModel }: Props) {
         <div className="text-[10px] text-muted-foreground flex items-center gap-3">
           <span>Installed list: <span className="text-success font-medium">live from Ollama</span></span>
           <span>Catalog: curated · updated {LIBRARY_UPDATED}</span>
+          <span>
+            {liveFetchedAt
+              ? `+ ${liveEntries.length} live from ollama.com · ${timeAgo(liveFetchedAt)}`
+              : liveLoading ? "Checking ollama.com…" : "Live catalog unavailable"}
+          </span>
         </div>
       </div>
 
@@ -239,6 +304,35 @@ export function ModelManager({ onUseModel }: Props) {
             </button>
           </div>
 
+          {/* Pull any model by exact name — not limited to the curated catalog below.
+              Works for anything in Ollama's real registry, e.g. a name copied from
+              ollama.com/library that we haven't hand-added yet. */}
+          <div className="flex items-center gap-2">
+            <div className="relative flex-1">
+              <Download className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
+              <Input
+                value={pullByName}
+                onChange={(e) => setPullByName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") void handlePullByName(); }}
+                placeholder="Pull any model by exact name, e.g. granite3.2:8b…"
+                className="pl-9"
+              />
+            </div>
+            <Button size="sm" variant="outline" disabled={!pullByName.trim()} onClick={() => void handlePullByName()}>
+              Pull
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="shrink-0"
+              disabled={liveLoading}
+              onClick={() => void handleRefreshLiveLibrary()}
+              title="Re-check ollama.com/library for new models"
+            >
+              <RefreshCw className={cn("size-3.5", liveLoading && "animate-spin")} />
+            </Button>
+          </div>
+
           {/* Model grid */}
           {filtered.length === 0 ? (
             <div className="text-center text-muted-foreground text-sm py-12">
@@ -260,6 +354,65 @@ export function ModelManager({ onUseModel }: Props) {
                 />
               ))}
             </div>
+          )}
+
+          {/* More from ollama.com — live-scraped entries not yet in the curated
+              catalog above. Shown only in "All" (compatibility/RAM-VRAM numbers
+              are unknown for these, so they can't be sorted/filtered the way
+              the curated grid is) and only while the free-text field above
+              can pull them by exact name. */}
+          {tab === "all" && liveOnlyFiltered.length > 0 && (
+            <>
+              <Separator />
+              <div>
+                <div className="flex items-center gap-2 mb-3">
+                  <h3 className="text-sm font-medium">More from ollama.com</h3>
+                  <span className="text-[10px] text-muted-foreground">
+                    not yet in the curated catalog above — sizes/RAM requirements unknown until you pull one
+                  </span>
+                </div>
+                <div className="space-y-2">
+                  {liveOnlyFiltered.map((entry) => {
+                    const pullTargets = entry.sizeTags.length > 0
+                      ? entry.sizeTags.map((t) => `${entry.id}:${t}`)
+                      : [entry.id];
+                    return (
+                      <div key={entry.id} className="flex items-center gap-3 rounded-lg border border-border px-3 py-2.5">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-sm font-medium truncate">{entry.id}</span>
+                            {entry.capabilityTags.map((t) => (
+                              <span key={t} className="inline-flex items-center rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                                {t}
+                              </span>
+                            ))}
+                          </div>
+                          {entry.description && (
+                            <p className="text-xs text-muted-foreground truncate">{entry.description}</p>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {pullTargets.slice(0, 4).map((target) => {
+                            const label = target.includes(":") ? target.split(":")[1] : "latest";
+                            const pull = pullProgress[target];
+                            return pull ? (
+                              <span key={target} className="text-[11px] text-muted-foreground px-2">
+                                {pull.error ? "error" : `${Math.round(pull.percent)}%`}
+                              </span>
+                            ) : (
+                              <Button key={target} size="sm" variant="outline" className="h-7 text-xs"
+                                onClick={() => void handleInstall(target)}>
+                                {label}
+                              </Button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </>
           )}
         </div>
       </ScrollArea>

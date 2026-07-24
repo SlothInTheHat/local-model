@@ -18,6 +18,19 @@ import type { AppView } from "../types/app";
 import { useTaskQueueStore } from "../store/taskQueue";
 import { usePendingSkillsStore } from "../store/pendingSkills";
 import { commitAfterToolCall } from "./shadowGit";
+import { resolveRole } from "./modelRoles";
+
+// ─── Tauri invoke shim (mirrors the pattern used in src/lib/tools.ts / AppSettings.tsx) ──
+
+async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const tauri = (window as unknown as Record<string, unknown>).__TAURI__;
+  if (!tauri) throw new Error("Not in Tauri desktop mode");
+  const core = (tauri as Record<string, unknown>).core as {
+    invoke?: (cmd: string, args?: unknown) => Promise<T>;
+  };
+  if (typeof core?.invoke !== "function") throw new Error("Tauri core.invoke unavailable");
+  return core.invoke(cmd, args);
+}
 
 export const DEFAULT_MAX_ROUNDS = 50;
 
@@ -353,6 +366,10 @@ interface RuntimeState {
   cachedSkills: Skill[] | null;
   skillsDirty: boolean;
   cachedGlobalMemories: string | null;
+  /** Knowledge-base collections (class notes/documents), fetched once per
+   *  session and reused — collections don't change mid-session the way
+   *  memory-search results or the file tree do. null = not yet fetched. */
+  cachedCollections: Array<{ id: string; label: string; doc_count: number }> | null;
   /** The user-message text that cachedGlobalMemories was last searched
    *  against — lets buildCurrentStateBlock re-search only when the LATEST
    *  user message actually changes, instead of once per whole session. Kept
@@ -472,10 +489,20 @@ async function buildCurrentStateBlock(
   // global-memory + open-file blocks below.
   if (config.dirHandle && !config.conversational && !config.suppressStaleProjectState) {
     const todos = await readTodosFromDisk(config.dirHandle);
-    config.onTodosChanged?.(todos);
-    if (todos.length > 0) {
-      const todoLines = todos.map((t) => {
-        const mark = t.status === "completed" ? "[x]" : t.status === "cancelled" ? "[-]" : t.status === "in_progress" ? "[>]" : "[ ]";
+    config.onTodosChanged?.(todos); // full list (incl. completed) still goes to the UI panel
+
+    // Only inject PENDING/IN-PROGRESS items into the model's context — a
+    // fully checked-off todo list from a past, unrelated task carries zero
+    // actionable signal and is pure hijack bait: a session was observed
+    // drifting into finishing an old, already-unrelated app (never asked for
+    // in the current message) with a stale, 100%-complete todo list as the
+    // only plausible source of that tangent. Completed items are still shown
+    // in the UI panel via onTodosChanged above; they're just not reprinted
+    // into the prompt every round.
+    const activeTodos = todos.filter((t) => t.status !== "completed" && t.status !== "cancelled");
+    if (activeTodos.length > 0) {
+      const todoLines = activeTodos.map((t) => {
+        const mark = t.status === "in_progress" ? "[>]" : "[ ]";
         return `${mark} ${t.content}`;
       });
       lines.push("", "Todo list:", ...todoLines);
@@ -551,6 +578,25 @@ async function buildCurrentStateBlock(
     lines.push("", state.cachedGlobalMemories);
   }
 
+  // Knowledge-base (class notes/documents) collections — fetched here
+  // (once per session; collections don't change mid-session) but the actual
+  // instruction is pushed at the very END of this function, not here. Small
+  // models weight context by recency far more than a mid-block aside, and a
+  // note buried between memory/skills blocks was observed getting outweighed
+  // by a trained "I can't access your files" refusal reflex even with tools
+  // available — see the failure this exists to fix.
+  let knowledgeCollections: Array<{ id: string; label: string; doc_count: number }> = [];
+  if (!config.suppressStaleProjectState) {
+    if (state.cachedCollections === null) {
+      try {
+        state.cachedCollections = await tauriInvoke<Array<{ id: string; label: string; doc_count: number }>>("collections_all");
+      } catch {
+        state.cachedCollections = [];
+      }
+    }
+    knowledgeCollections = state.cachedCollections;
+  }
+
   const openFile = config.getCurrentOpenFile?.();
   if (openFile && openFile.path && openFile.content) {
     const fileLines = openFile.content.split("\n");
@@ -572,6 +618,22 @@ async function buildCurrentStateBlock(
       "",
       "Pending tasks queued for this tab (from another tab's agent — the user can start these via the banner, or you may begin one now if it fits the current task):",
       ...pendingTasks.map((t) => `- (from ${t.sourceView}) ${t.task}`),
+    );
+  }
+
+  // Pushed LAST, deliberately: this is the single highest-recency line the
+  // model sees before the actual conversation history, which matters more
+  // than description quality for smaller models specifically — a version of
+  // this note placed earlier in the block was observed being overridden by a
+  // "I cannot access your personal files" refusal reflex even though
+  // search_knowledge was available and offered. Named and forbade that exact
+  // completion directly rather than only describing the right tool, since
+  // the failure was the model not even attempting a tool call.
+  if (knowledgeCollections.length > 0) {
+    const names = knowledgeCollections.map((c) => `${c.label || c.id} (${c.doc_count} docs)`).join(", ");
+    lines.push(
+      "",
+      `IMPORTANT — knowledge base available: ${knowledgeCollections.length} collection(s) — ${names}. If the user's message is about their notes, lectures, readings, or coursework, you MUST call search_knowledge (list_collections first if unsure which collection) BEFORE answering. Do NOT use grep_files/find_files for this — those only search this workspace's own project files, not the knowledge base. Do NOT respond that you cannot access the user's files/notes without first calling search_knowledge — that tool exists specifically to read them.`
     );
   }
 
@@ -686,9 +748,24 @@ async function executeToolGuarded(
   if (policy.requiresApproval && !liveFlag(config.autoApproveAll)) {
     const approved = await config.onApprovalNeeded(call);
     if (!approved) {
+      // suppressStaleProjectState is true for every headless run (scheduler,
+      // task queue, subagent, workflow — see headlessRunner.ts) and only
+      // those runs auto-deny via a fixed allowlist with no human involved.
+      // A model that reads "Denied by user" here was observed narrating it
+      // back as "the user denied this" and then thrashing/asking the user to
+      // reconsider — there is no user to reconsider anything in this run.
+      // Distinguishing the message stops that misattribution and points
+      // straight at the actual recovery (inline the logic, don't retry).
+      const isUnattended = !!config.suppressStaleProjectState;
+      const errorMsg = isUnattended
+        ? `Denied — '${call.name}' is not permitted in this unattended run (no human is present to approve it; this run's allowlist is fixed)`
+        : "Denied by user";
+      const toolContent = isUnattended
+        ? `DENIED (unattended run): ${call.name} is not on this run's allowlist — this is a permanent constraint for the whole run, not a one-off refusal, so retrying it will never succeed. Do not ask the user to reconsider — there is no user watching this run. If the task needs what this call would have done (e.g. running a script), work out the underlying logic yourself in plain reasoning and apply it directly with read_file/write_file/patch_file instead.`
+        : "Tool call denied by user.";
       return {
-        result: { toolCallId: call.id, name: call.name, output: "", error: "Denied by user" },
-        toolContent: "Tool call denied by user.",
+        result: { toolCallId: call.id, name: call.name, output: "", error: errorMsg },
+        toolContent,
         blocked: true,
         sideEffect: false,
       };
@@ -799,6 +876,7 @@ export async function runAgentSession(
     skillsDirty: true,
     cachedGlobalMemories: null,
     lastGlobalMemoryQuery: null,
+    cachedCollections: null,
     taskQuery: deriveTaskQuery(priorHistory),
     changedFiles: new Set<string>(),
   };
@@ -835,6 +913,34 @@ export async function runAgentSession(
     config.toolsSupported ? { ...config, tools: toolsForModel } : config,
   );
 
+  // Tool-router delegation (opt-in, see modelRoles.ts's `router` role): a
+  // pinned model — typically a fast/cheap cloud one — drives the FIRST few
+  // rounds' tool selection instead of config.modelRef, restricted to
+  // read-only lookup tools (risk:"read" — search_knowledge, grep_files,
+  // web_search, etc., never write/run/delete). Once it stops calling tools
+  // (or hits the round cap below), control hands off to the normal
+  // config.modelRef for every remaining round — including writing the
+  // actual final answer — with the full history of whatever the router
+  // found already in context. Exists because local models were observed
+  // struggling specifically at picking the right tool among several
+  // similar-sounding ones, not at synthesizing an answer once handed good
+  // results; unpinned (the default), this resolves to null and the whole
+  // session behaves exactly as before this feature existed.
+  const routerModel = config.toolsSupported ? resolveRole("router") : null;
+  const routerTools = toolsForModel.filter((t) => t.risk === "read");
+  const ROUTER_MAX_ROUNDS = 4;
+  let routingPhaseActive = !!routerModel && routerTools.length > 0;
+  let routerRoundsUsed = 0;
+  // A SEPARATE system prompt for router rounds, built from routerTools —
+  // reusing `systemPrompt` (built from the full toolsForModel) would have its
+  // "Tools available this session" listing (buildCapabilityBlock) advertise
+  // write/run/delete tools the router round doesn't actually have access to,
+  // which invites exactly the confused "why didn't my tool call work" outcome
+  // this feature exists to avoid.
+  const routerSystemPrompt = routingPhaseActive
+    ? buildSystemPrompt({ ...config, tools: routerTools, modelRef: routerModel! })
+    : "";
+
   try {
     if (!config.toolsSupported) {
       round = 1;
@@ -851,15 +957,25 @@ export async function runAgentSession(
 
     while (round < config.maxRounds) {
       round++;
-      config.onRoundStart?.(round, config.maxRounds);
+      const isRouterRound = routingPhaseActive;
+      // Suppressed during router rounds: App.tsx's onRoundStart opens a fresh
+      // message bubble per round, but a router round's text is never shown
+      // (see the text_delta handling below) — opening bubbles nothing ever
+      // writes into would leave empty gaps in the transcript.
+      if (!isRouterRound) config.onRoundStart?.(round, config.maxRounds);
 
       const stateBlock = await buildCurrentStateBlock(config, state, round, history);
+      const routerRoundNote = isRouterRound
+        ? "\n\nYou are in a TOOL-LOOKUP phase, not the main agent for this task: use ONLY the read-only tools available to you to gather what's needed to answer the user. You cannot write/modify/run anything right now (those tools aren't offered this round) — don't attempt to. Once you've found the relevant information, STOP calling tools; a different model takes over from there to write the actual answer."
+        : "";
+
+      const activeSystemPrompt = isRouterRound ? routerSystemPrompt : systemPrompt;
 
       // WP4.1: fold old history into a compact work-log stub before the
       // projected token load overflows numCtx (see compactHistoryIfOverBudget
       // for the cut-boundary rule). No LLM call here — mid-loop model calls
       // cause VRAM thrash on 16GB-class targets.
-      const compaction = compactHistoryIfOverBudget(systemPrompt, stateBlock, history, numCtx);
+      const compaction = compactHistoryIfOverBudget(activeSystemPrompt, stateBlock, history, numCtx);
       if (compaction.compacted) {
         history = compaction.history;
         console.info(
@@ -868,25 +984,28 @@ export async function runAgentSession(
       }
 
       const messagesForRound: ChatMessage[] = [
-        { role: "system", content: `${systemPrompt}\n\n${stateBlock}` },
+        { role: "system", content: `${activeSystemPrompt}\n\n${stateBlock}${routerRoundNote}` },
         ...history,
       ];
 
       lastRoundHadToolCalls = false;
       let roundText = "";
 
-      for await (const event of runAgentTurnForModel(config.modelRef, messagesForRound, toolsForModel, config.signal, { numCtx })) {
+      const modelForThisRound = isRouterRound ? routerModel! : config.modelRef;
+      const toolsForThisRound = isRouterRound ? routerTools : toolsForModel;
+
+      for await (const event of runAgentTurnForModel(modelForThisRound, messagesForRound, toolsForThisRound, config.signal, { numCtx })) {
         if (config.signal.aborted) throw new DOMException("Aborted", "AbortError");
 
         if (event.type === "text_delta" && event.content) {
           if (event.content.startsWith("\x00CLEAN:")) {
             const clean = event.content.slice("\x00CLEAN:".length);
-            config.onTextReplace?.(clean);
+            if (!isRouterRound) config.onTextReplace?.(clean);
             roundText = clean;
           } else {
             const cleaned = event.content.replace(/<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>/g, "");
             if (cleaned) {
-              config.onTextDelta?.(cleaned);
+              if (!isRouterRound) config.onTextDelta?.(cleaned);
               roundText += cleaned;
             }
           }
@@ -911,7 +1030,7 @@ export async function runAgentSession(
               if (call.name === "install_deps") state.memoryDirty = true;
               for (const p of pathsFromCall(call)) state.changedFiles.add(p);
             }
-            if (blocked && result.error === "Denied by user") {
+            if (blocked && (result.error === "Denied by user" || result.error?.startsWith("Denied — "))) {
               hadDeniedToolCalls = true;
             }
             if (!blocked && call.name === "update_project_memory" && !result.error) {
@@ -936,8 +1055,30 @@ export async function runAgentSession(
             ];
           }
         } else if (event.type === "error") {
-          config.onTextDelta?.(`\n\n*[Agent error: ${event.error}]*`);
+          // A router-round error (bad API key, rate limit, network blip on
+          // the cloud provider) must not surface as a broken-looking chat
+          // response — fall back to the local model for the rest of the
+          // session instead of showing a confusing cloud-API error mid-answer.
+          if (isRouterRound) {
+            routingPhaseActive = false;
+          } else {
+            config.onTextDelta?.(`\n\n*[Agent error: ${event.error}]*`);
+          }
         }
+      }
+
+      if (isRouterRound) {
+        routerRoundsUsed++;
+        if (!lastRoundHadToolCalls || routerRoundsUsed >= ROUTER_MAX_ROUNDS) {
+          // Routing phase over — either the router stopped calling tools (it
+          // thinks it has what's needed) or it's used its round budget.
+          // Discard whatever text it produced this round (it's the router's
+          // own draft answer, not what should reach the user) and hand off:
+          // the next iteration runs config.modelRef normally, with the full
+          // tool-call history the router gathered already in `history`.
+          routingPhaseActive = false;
+        }
+        continue; // never run the primary-model-only nudge/completion-review checks below on a router round
       }
 
       if (!lastRoundHadToolCalls) {

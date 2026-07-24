@@ -20,12 +20,13 @@ import { indexSession } from "./sessionSearch";
  * NOTE: MCP / dynamic (.localmind/tools/*.json) tools are intentionally NOT
  * included in the headless toolset for now — only the static built-ins above.
  *
- * spawn_subagent is excluded too — this is the recursion guard for WP2.3: a
- * headless session (subagent, task-queue run, or scheduled run) must never be
- * able to spawn its own subagents. Belt-and-suspenders with the approval
- * allowlist: even if a headless session's tool list were ever widened to
- * include spawn_subagent again, HEADLESS_DEFAULT_ALLOWLIST below does not
- * contain it, so runHeadlessTask's onApprovalNeeded would auto-deny the call.
+ * spawn_subagent / spawn_reviewer_subagent are excluded too — this is the
+ * recursion guard for WP2.3: a headless session (subagent, task-queue run,
+ * or scheduled run) must never be able to spawn its own subagents.
+ * Belt-and-suspenders with the approval allowlist: even if a headless
+ * session's tool list were ever widened to include them again,
+ * HEADLESS_DEFAULT_ALLOWLIST below does not contain either name, so
+ * runHeadlessTask's onApprovalNeeded would auto-deny the call.
  *
  * save_global_memory / update_project_memory are excluded because unattended
  * runs must not write to the assistant's long-term knowledge (a scheduled run
@@ -34,7 +35,7 @@ import { indexSession } from "./sessionSearch";
  * the allowlist. save_skill needs no entry here: it requires approval and is
  * not allowlisted, so the requiresApproval-or-allowlisted filter drops it.
  */
-const HEADLESS_EXCLUDED_TOOLS = new Set(["switch_view", "switch_model", "send_task_to_tab", "register_tool", "spawn_subagent", "save_global_memory", "update_project_memory"]);
+const HEADLESS_EXCLUDED_TOOLS = new Set(["switch_view", "switch_model", "send_task_to_tab", "register_tool", "spawn_subagent", "spawn_reviewer_subagent", "save_global_memory", "update_project_memory"]);
 
 // Computed lazily (NOT a module-top-level const): headlessRunner is imported at
 // app startup by taskRunner/scheduler, and referencing TOOL_DEFINITIONS at load
