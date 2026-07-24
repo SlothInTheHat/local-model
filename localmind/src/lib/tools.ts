@@ -1,5 +1,6 @@
-import { evaluate } from "mathjs";
+import { evaluate, compile } from "mathjs";
 import { searchWeb } from "./search";
+import { useArtifactStore } from "../store/artifacts";
 import { fileExists } from "./fileSystem";
 import { TauriDirectoryHandle } from "./tauriFs";
 import { speakText, SPEAK_TEXT_MAX_CHARS } from "./speech";
@@ -153,14 +154,18 @@ export type ToolName =
   | "list_workflows"
   | "run_workflow"
   | "delete_workflow"
-  | "notify_user";
+  | "notify_user"
+  | "render_canvas"
+  | "plot_graph"
+  | "render_table"
+  | "show_webpage";
 
 export interface ToolDef {
   // string allows MCP tools with dynamic "serverId__toolName" names
   name: string;
   description: string;
   parameters: Record<string, unknown>;
-  group?: "files" | "shell" | "git" | "web" | "media" | "state" | "app" | "external";
+  group?: "files" | "shell" | "git" | "web" | "media" | "state" | "app" | "external" | "ui";
   risk?: "read" | "mutate" | "execute" | "ui";
   /** Allowed in Plan (read-only) mode. */
   planModeAllowed?: boolean;
@@ -1481,6 +1486,83 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
     requiresApproval: false,
   },
   {
+    name: "render_canvas",
+    description: "Render a complete, self-contained interactive HTML/CSS/JS page inline in the chat, in a live sandboxed preview — for diagrams, mini-simulations, custom visualizations, small games, or anything else you can build with HTML/CSS/JS that a static markdown reply can't show. LocalMind is fully offline: never reference an external CDN, font, image, or script URL — inline every style and script directly in the document, and inline any needed images as base64 data: URIs. For a plain function graph use plot_graph instead (better default styling, no need to hand-write plotting code); for tabular data use render_table instead (built-in sort/filter, no iframe needed).",
+    parameters: {
+      type: "object",
+      properties: {
+        html: { type: "string", description: "A complete HTML document (or a body-only fragment — it will be wrapped automatically). Must be fully self-contained: inline <style> and <script>, no external resource references." },
+        title: { type: "string", description: "Optional short title shown above the preview." },
+      },
+      required: ["html"],
+    },
+    group: "ui",
+    risk: "ui",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "plot_graph",
+    description: "Plot one or more math expressions in x (e.g. 'sin(x)*x', 'x^2 - 3') and/or raw (x,y) data series as an interactive, pannable/zoomable graph inline in the chat — the Desmos-style graphing tool. Prefer this over render_canvas for anything that's fundamentally a function/data plot; it looks better and needs no plotting code from you.",
+    parameters: {
+      type: "object",
+      properties: {
+        expressions: { type: "array", items: { type: "string" }, description: "Math expressions in terms of x, evaluated with mathjs syntax (e.g. 'sin(x)', 'x^2/4 - 2')." },
+        series: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              label: { type: "string" },
+              points: { type: "array", items: { type: "array", items: { type: "number" } }, description: "Array of [x, y] pairs." },
+            },
+          },
+          description: "Optional: raw (x,y) data series to plot alongside/instead of expressions.",
+        },
+        xMin: { type: "number", description: "Optional, default -10." },
+        xMax: { type: "number", description: "Optional, default 10." },
+        title: { type: "string" },
+      },
+    },
+    group: "ui",
+    risk: "ui",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "render_table",
+    description: "Display structured tabular data inline in the chat as a real interactive table with sorting and filtering — use this instead of a markdown table whenever the data has more than a handful of rows or the user would benefit from sorting/filtering it (e.g. comparing several options, listing search results with multiple attributes).",
+    parameters: {
+      type: "object",
+      properties: {
+        columns: { type: "array", items: { type: "string" }, description: "Column headers, in order." },
+        rows: { type: "array", items: { type: "array" }, description: "Each row is an array of cell values in the same order as columns." },
+        title: { type: "string" },
+      },
+      required: ["columns", "rows"],
+    },
+    group: "ui",
+    risk: "ui",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "show_webpage",
+    description: "Display a live external webpage inline in the chat, e.g. documentation or a reference page you found via web_search. Tries to embed the actual live page; many sites block being embedded (banks, Google, and others send headers that prevent this) — when that happens this automatically falls back to a clean read-only text view of the page's content instead, so it always shows something useful either way.",
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "Full URL, starting with http:// or https://." },
+        title: { type: "string" },
+      },
+      required: ["url"],
+    },
+    group: "web",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
     name: "spawn_subagent",
     description:
       "Delegate a sub-task to a separate, autonomous headless agent session that runs against the current workspace and reports back its result. Use this to fan out an independent chunk of work (e.g. 'summarize this directory', 'analyze src/ and report structure') without consuming your own context on it. The subagent gets read-only tools (read_file, list_directory, grep_files, find_files, web_search, web_fetch, get_system_info, git_status, git_diff, git_log, list_skills, calculator) — it can investigate but cannot write/delete files or run shell commands, and it cannot spawn further subagents. Requires an open workspace.",
@@ -2031,6 +2113,121 @@ async function noMatchKnowledgeHint(): Promise<string> {
   } catch {
     return ""; // not in Tauri desktop mode, or no knowledge backend — no hint, no error either
   }
+}
+
+// ─── Chat artifacts (render_canvas / plot_graph / render_table / show_webpage) ──
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/** Wraps a bare fragment in a minimal document if the model didn't already
+ *  provide a full <html> document — render_canvas explicitly allows either. */
+function wrapHtmlDocument(html: string): string {
+  return /<html[\s>]/i.test(html) ? html : `<!doctype html><html><head><meta charset="utf-8"></head><body>${html}</body></html>`;
+}
+
+/**
+ * Builds a self-contained, interactive (wheel-zoom + drag-pan) SVG plot as a
+ * standalone HTML document — no charting library needed, mathjs (already a
+ * dependency, used elsewhere by the calculator tool) does all the math on
+ * this side; the artifact only ships the already-sampled points plus a small
+ * inline viewer script.
+ */
+function buildPlotHtml(
+  curves: { label: string; points: [number, number][] }[],
+  opts: { title?: string; xMin: number; xMax: number },
+): string {
+  const width = 640, height = 400, pad = 40;
+  const allY = curves.flatMap((c) => c.points.map((p) => p[1]));
+  const yMin = allY.length ? Math.min(...allY) : -1;
+  const yMax = allY.length ? Math.max(...allY) : 1;
+  const yPad = (yMax - yMin) * 0.1 || 1;
+  const y0 = yMin - yPad, y1 = yMax + yPad;
+  const colors = ["#2563eb", "#dc2626", "#16a34a", "#d97706", "#7c3aed", "#0891b2"];
+
+  const sx = (x: number) => pad + ((x - opts.xMin) / (opts.xMax - opts.xMin || 1)) * (width - 2 * pad);
+  const sy = (y: number) => height - pad - ((y - y0) / (y1 - y0 || 1)) * (height - 2 * pad);
+
+  const paths = curves.map((c, i) => {
+    const d = c.points.map((p, j) => `${j === 0 ? "M" : "L"} ${sx(p[0]).toFixed(2)} ${sy(p[1]).toFixed(2)}`).join(" ");
+    return `<path d="${d}" fill="none" stroke="${colors[i % colors.length]}" stroke-width="2" />`;
+  }).join("\n      ");
+
+  const legend = curves.map((c, i) =>
+    `<div style="display:flex;align-items:center;gap:6px;"><span style="width:10px;height:10px;background:${colors[i % colors.length]};border-radius:2px;display:inline-block;"></span>${escapeHtml(c.label)}</div>`
+  ).join("\n      ");
+
+  const xAxisY = y0 <= 0 && 0 <= y1 ? sy(0) : null;
+  const yAxisX = opts.xMin <= 0 && 0 <= opts.xMax ? sx(0) : null;
+
+  return `<!doctype html><html><head><meta charset="utf-8"><style>
+  body { margin:0; font-family:system-ui,-apple-system,sans-serif; background:#fff; color:#111; }
+  .wrap { padding:12px; }
+  h3 { margin:0 0 8px; font-size:13px; font-weight:600; }
+  svg { touch-action:none; cursor:grab; }
+  .legend { display:flex; gap:14px; margin-top:8px; flex-wrap:wrap; font-size:12px; color:#444; }
+</style></head>
+<body>
+  <div class="wrap">
+    ${opts.title ? `<h3>${escapeHtml(opts.title)}</h3>` : ""}
+    <svg id="chart" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+      <rect x="0" y="0" width="${width}" height="${height}" fill="#fafafa" stroke="#e5e5e5"/>
+      ${xAxisY !== null ? `<line x1="${pad}" y1="${xAxisY}" x2="${width - pad}" y2="${xAxisY}" stroke="#ccc"/>` : ""}
+      ${yAxisX !== null ? `<line x1="${yAxisX}" y1="${pad}" x2="${yAxisX}" y2="${height - pad}" stroke="#ccc"/>` : ""}
+      ${paths}
+    </svg>
+    <div class="legend">${legend}</div>
+  </div>
+  <script>
+    const svg = document.getElementById('chart');
+    let vb = [0, 0, ${width}, ${height}];
+    function apply() { svg.setAttribute('viewBox', vb.join(' ')); }
+    svg.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const scale = e.deltaY > 0 ? 1.1 : 0.9;
+      const [x, y, w, h] = vb;
+      const mx = x + (e.offsetX / svg.clientWidth) * w;
+      const my = y + (e.offsetY / svg.clientHeight) * h;
+      vb = [mx - (mx - x) * scale, my - (my - y) * scale, w * scale, h * scale];
+      apply();
+    }, { passive: false });
+    let dragging = false, last = null;
+    svg.addEventListener('mousedown', (e) => { dragging = true; last = [e.clientX, e.clientY]; });
+    window.addEventListener('mouseup', () => { dragging = false; });
+    window.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      const [x, y, w, h] = vb;
+      const dx = (e.clientX - last[0]) / svg.clientWidth * w;
+      const dy = (e.clientY - last[1]) / svg.clientHeight * h;
+      vb = [x - dx, y - dy, w, h];
+      last = [e.clientX, e.clientY];
+      apply();
+    });
+  </script>
+</body></html>`;
+}
+
+/**
+ * Strips script/style/nav/header/footer/iframe blocks and inline event-
+ * handler attributes from fetched HTML for show_webpage's reader-view
+ * fallback. This is cleanliness, not the actual security boundary — the
+ * result always renders in a sandbox="" iframe (no script execution allowed
+ * at all) regardless of what a regex strip misses.
+ */
+function stripToReadable(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<nav[\s\S]*?<\/nav>/gi, "")
+    .replace(/<header[\s\S]*?<\/header>/gi, "")
+    .replace(/<footer[\s\S]*?<\/footer>/gi, "")
+    .replace(/<iframe[\s\S]*?<\/iframe>/gi, "")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, "")
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/\son\w+\s*=\s*"[^"]*"/gi, "")
+    .replace(/\son\w+\s*=\s*'[^']*'/gi, "")
+    .replace(/javascript:/gi, "");
 }
 
 // ─── Executor ────────────────────────────────────────────────────────────────
@@ -3353,6 +3550,117 @@ export async function executeTool(
           toolCallId: call.id,
           name: call.name,
           output: `Notification sent: "${title}" — ${message}`,
+        };
+      }
+
+      case "render_canvas": {
+        const html = argStr(call.args["html"]);
+        if (!html) throw new Error("Missing html argument");
+        const title = argStr(call.args["title"]) || undefined;
+        const id = useArtifactStore.getState().add({ kind: "canvas", title, html: wrapHtmlDocument(html) });
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `[[LM_ARTIFACT:${id}]] Rendered${title ? ` "${title}"` : " an"} interactive canvas.`,
+        };
+      }
+
+      case "plot_graph": {
+        const expressions = argStrArray(call.args["expressions"]);
+        const seriesArg = call.args["series"];
+        const title = argStr(call.args["title"]) || undefined;
+        const xMinArg = call.args["xMin"];
+        const xMaxArg = call.args["xMax"];
+        const xMin = typeof xMinArg === "number" ? xMinArg : -10;
+        const xMax = typeof xMaxArg === "number" ? xMaxArg : 10;
+
+        const curves: { label: string; points: [number, number][] }[] = [];
+        const SAMPLES = 400;
+        for (const expr of expressions) {
+          let node;
+          try {
+            node = compile(expr);
+          } catch {
+            throw new Error(`Could not parse expression "${expr}" — use mathjs syntax (e.g. "sin(x)*x", "x^2 - 3").`);
+          }
+          const points: [number, number][] = [];
+          for (let i = 0; i <= SAMPLES; i++) {
+            const x = xMin + (xMax - xMin) * (i / SAMPLES);
+            try {
+              const y = node.evaluate({ x });
+              if (typeof y === "number" && Number.isFinite(y)) points.push([x, y]);
+            } catch {
+              // Undefined at this x (e.g. 1/x at x=0) — skip the point, not the whole curve.
+            }
+          }
+          curves.push({ label: expr, points });
+        }
+        if (Array.isArray(seriesArg)) {
+          for (const s of seriesArg) {
+            if (s && typeof s === "object" && Array.isArray((s as Record<string, unknown>)["points"])) {
+              const rawPoints = (s as Record<string, unknown>)["points"] as unknown[];
+              const points = rawPoints.filter(
+                (p): p is [number, number] => Array.isArray(p) && p.length === 2 && typeof p[0] === "number" && typeof p[1] === "number"
+              );
+              curves.push({ label: String((s as Record<string, unknown>)["label"] ?? "series"), points });
+            }
+          }
+        }
+        if (curves.length === 0) throw new Error("Provide at least one expression or a data series to plot");
+
+        const html = buildPlotHtml(curves, { title, xMin, xMax });
+        const id = useArtifactStore.getState().add({ kind: "plot", title, html });
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `[[LM_ARTIFACT:${id}]] Plotted ${curves.map((c) => c.label).join(", ")}.`,
+        };
+      }
+
+      case "render_table": {
+        const columns = argStrArray(call.args["columns"]);
+        const rowsArg = call.args["rows"];
+        if (columns.length === 0) throw new Error("Missing columns argument");
+        if (!Array.isArray(rowsArg)) throw new Error("Missing rows argument (array of arrays)");
+        const rows = rowsArg.filter((r): r is unknown[] => Array.isArray(r));
+        const title = argStr(call.args["title"]) || undefined;
+        const id = useArtifactStore.getState().add({ kind: "table", title, columns, rows });
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `[[LM_ARTIFACT:${id}]] Rendered a ${rows.length}-row table${title ? ` "${title}"` : ""}.`,
+        };
+      }
+
+      case "show_webpage": {
+        const url = argStr(call.args["url"]).trim();
+        if (!url) throw new Error("Missing url argument");
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+          throw new Error("url must start with http:// or https://");
+        }
+        const title = argStr(call.args["title"]) || undefined;
+
+        let blocked = false;
+        let readableHtml = "";
+        try {
+          const res = await tauriInvoke<{ status: number; headers: [string, string][]; body: string }>(
+            "http_fetch_with_headers",
+            { url },
+          );
+          const headerMap = new Map(res.headers.map(([k, v]) => [k.toLowerCase(), v.toLowerCase()]));
+          const xfo = headerMap.get("x-frame-options") ?? "";
+          const csp = headerMap.get("content-security-policy") ?? "";
+          blocked = xfo.includes("deny") || xfo.includes("sameorigin") || csp.includes("frame-ancestors");
+          readableHtml = stripToReadable(res.body);
+        } catch (err) {
+          throw new Error(`Could not reach ${url}: ${(err as Error).message}`);
+        }
+
+        const id = useArtifactStore.getState().add({ kind: "webpage", title, url, blocked, html: readableHtml });
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `[[LM_ARTIFACT:${id}]] ${blocked ? `Showing a reader view of ${url} (this site blocks being embedded directly).` : `Showing ${url} inline.`}`,
         };
       }
 

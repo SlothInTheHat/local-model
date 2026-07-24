@@ -541,6 +541,67 @@ fn http_fetch(
     }
 }
 
+#[derive(serde::Serialize)]
+struct HttpFetchWithHeaders {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+/// Like http_fetch, but also returns response headers — needed for checks
+/// that depend on security headers (X-Frame-Options, CSP frame-ancestors)
+/// that a browser's own `fetch()` cannot read cross-origin even when the body
+/// itself is accessible: the CORS spec exposes only a small safelisted set of
+/// response headers to JS unless the server explicitly opts in via
+/// Access-Control-Expose-Headers, which a site has no reason to do for its
+/// own security headers. Rust's HTTP client has no such restriction. Used by
+/// show_webpage (src/lib/tools.ts) to decide whether a site can actually be
+/// iframed before trying, rather than only discovering it blocked itself
+/// after rendering a blank frame.
+#[tauri::command]
+fn http_fetch_with_headers(url: String) -> Result<HttpFetchWithHeaders, String> {
+    use std::io::Read;
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(20))
+        .build();
+
+    let result = agent
+        .get(&url)
+        .set(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        )
+        .call();
+
+    match result {
+        Ok(resp) => {
+            let status = resp.status();
+            let headers: Vec<(String, String)> = resp
+                .headers_names()
+                .into_iter()
+                .filter_map(|name| resp.header(&name).map(|v| (name.to_lowercase(), v.to_string())))
+                .collect();
+            let mut reader = resp.into_reader().take(HTTP_FETCH_MAX_BYTES);
+            let mut body = String::new();
+            reader
+                .read_to_string(&mut body)
+                .map_err(|e| format!("http_fetch_with_headers: failed reading response body: {e}"))?;
+            Ok(HttpFetchWithHeaders { status, headers, body })
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let headers: Vec<(String, String)> = resp
+                .headers_names()
+                .into_iter()
+                .filter_map(|name| resp.header(&name).map(|v| (name.to_lowercase(), v.to_string())))
+                .collect();
+            let body = resp.into_string().unwrap_or_default();
+            Ok(HttpFetchWithHeaders { status: code, headers, body })
+        }
+        Err(e) => Err(format!("http_fetch_with_headers: request failed: {e}")),
+    }
+}
+
 // ─── Native file system commands (used instead of File System Access API) ────
 
 #[derive(Serialize)]
@@ -1672,6 +1733,7 @@ pub fn run() {
             session_insert,
             session_search,
             http_fetch,
+            http_fetch_with_headers,
             set_close_to_tray,
             show_result_widget,
             open_application,

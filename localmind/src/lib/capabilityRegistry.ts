@@ -7,7 +7,7 @@ import { useAgentStore } from "../store/agent";
 import { loadDynamicTools, toOllamaTool } from "./dynamicTools";
 
 /** Stable render order for the tool-group section — mirrors ToolDef["group"]. */
-const GROUP_ORDER: NonNullable<ToolDef["group"]>[] = ["files", "shell", "git", "web", "media", "state", "app"];
+const GROUP_ORDER: NonNullable<ToolDef["group"]>[] = ["files", "shell", "git", "web", "media", "state", "app", "ui"];
 
 /**
  * Renders the tab list from VIEW_DESCRIPTIONS in APP_VIEWS order, e.g.

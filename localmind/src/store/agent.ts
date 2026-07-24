@@ -119,6 +119,10 @@ const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   run_workflow: true,
   delete_workflow: true,
   notify_user: true,
+  render_canvas: true,
+  plot_graph: true,
+  render_table: true,
+  show_webpage: true,
 };
 
 export const useAgentStore = create<AgentState>()(

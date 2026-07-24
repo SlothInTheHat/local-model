@@ -7,10 +7,58 @@ import { Markdown } from "./Markdown";
 import type { ChatMessage } from "../lib/ollama";
 import { useMemoryStore } from "../store/memory";
 import { openSourceFile } from "../lib/openFile";
+import { useArtifactStore } from "../store/artifacts";
+import { ArtifactCard } from "./ArtifactCard";
+import { useDebugPromptsStore, type DebugPromptEntry } from "../store/debugPrompts";
+
+const ARTIFACT_TOOL_NAMES = new Set(["render_canvas", "plot_graph", "render_table", "show_webpage"]);
+const ARTIFACT_MARKER_RE = /^\[\[LM_ARTIFACT:([^\]]+)\]\]\s*/;
 
 interface Props {
   messages: ChatMessage[];
   isStreaming: boolean;
+  conversationId?: string | null;
+}
+
+/** Debug mode's collapsible per-round chip, reusing ToolResultChip's exact
+ *  visual idiom — a rail at the top rather than an inline row interleaved
+ *  among real message bubbles, since there's no reliable "right position"
+ *  for a synthetic per-round entry among rounds that may each add a variable
+ *  number of real messages (text + N tool calls). */
+function DebugPromptChip({ entry }: { entry: DebugPromptEntry }) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div className="flex flex-col">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="flex items-center gap-1 py-0.5 text-xs text-muted-foreground hover:text-foreground transition-colors w-fit"
+      >
+        {expanded ? <ChevronDown className="size-3 shrink-0" /> : <ChevronRight className="size-3 shrink-0" />}
+        <span className="font-mono">Round {entry.round} prompt</span>
+      </button>
+      {expanded && (
+        <pre className="mt-1 mb-1 text-xs overflow-x-auto max-w-full whitespace-pre-wrap font-mono text-muted-foreground/80 max-h-96 overflow-y-auto">
+          {entry.systemMessage}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+function DebugPromptRail({ conversationId }: { conversationId: string }) {
+  const entries = useDebugPromptsStore((s) => s.byConversation[conversationId]) ?? [];
+  if (entries.length === 0) return null;
+  return (
+    <div className="mb-4 space-y-0.5 border border-dashed border-warning/40 rounded-md p-2 bg-warning/5">
+      <div className="text-[10px] uppercase tracking-wide text-warning font-medium px-1 pb-1">
+        Debug mode — prompts sent this conversation
+      </div>
+      {entries.map((e, i) => (
+        <DebugPromptChip key={i} entry={e} />
+      ))}
+    </div>
+  );
 }
 
 // Organic blob bubble radii — cycled by message position, from the Nucleus
@@ -19,7 +67,8 @@ const USER_R = ["20px 20px 3px 20px", "22px 20px 5px 20px", "20px 24px 3px 20px"
 const AI_R = ["3px 20px 20px 20px", "5px 22px 20px 20px", "3px 20px 24px 20px"];
 const MSG_IN_ANIMATION = "msgIn 0.28s cubic-bezier(0.34, 1.3, 0.64, 1)";
 
-export function ChatMessages({ messages, isStreaming }: Props) {
+export function ChatMessages({ messages, isStreaming, conversationId }: Props) {
+  const debugModeEnabled = useDebugPromptsStore((s) => s.enabled);
   const scrollRef = useRef<HTMLDivElement>(null);
   // true = keep scrolling to the bottom as content streams in
   const atBottomRef = useRef(true);
@@ -76,6 +125,7 @@ export function ChatMessages({ messages, isStreaming }: Props) {
       className="flex-1 min-h-0 overflow-y-auto"
     >
       <div className="max-w-3xl mx-auto px-6 py-6 space-y-6">
+        {debugModeEnabled && conversationId && <DebugPromptRail conversationId={conversationId} />}
         {messages.map((msg, i) => {
           // Tool-result rows carry no name of their own — the preceding
           // assistant message is the empty `tool_calls` carrier that named it.
@@ -117,7 +167,10 @@ function ToolResultChip({ content, label: labelOverride }: { content: string; la
   // Extract tool name from "[Tool result: <name>]" prefix (legacy system-message shape)
   const match = content.match(/^\[Tool result:\s*([^\]]+)\]/);
   const label = labelOverride ?? (match ? match[1].trim() : "Tool result");
-  const body = match ? content.slice(match[0].length).trim() : content;
+  // Strip an artifact marker too (fallback path only — the referenced record
+  // was evicted/missing, see ChatMessages' artifactId lookup above) so the
+  // expanded body shows the plain summary, not the raw [[LM_ARTIFACT:id]] tag.
+  const body = (match ? content.slice(match[0].length).trim() : content).replace(ARTIFACT_MARKER_RE, "");
 
   return (
     <div className="inline-flex flex-col max-w-full">
@@ -261,6 +314,18 @@ const MessageRow = memo(function MessageRow({
   // which early return (system/tool/user/assistant) this row takes.
   const [citePopover, setCitePopover] = useState<CitePopoverState | null>(null);
 
+  // Artifact lookup (render_canvas/plot_graph/render_table/show_webpage tool
+  // results) — computed unconditionally alongside the other hooks above for
+  // the same reason (hook count must stay constant regardless of which
+  // early-return branch this row ultimately takes). Missing/evicted artifact
+  // (store isn't persisted — see store/artifacts.ts) resolves to undefined,
+  // and the "tool" branch below falls back to the plain text chip.
+  const artifactId = useMemo(() => {
+    const m = ARTIFACT_MARKER_RE.exec(msg.content ?? "");
+    return m ? m[1] : null;
+  }, [msg.content]);
+  const artifact = useArtifactStore((s) => (artifactId ? s.byId[artifactId] : undefined));
+
   // Tool result system messages — render as collapsible chip
   if (msg.role === "system" && msg.content.startsWith("[Tool result:")) {
     return (
@@ -283,7 +348,17 @@ const MessageRow = memo(function MessageRow({
 
   // Tool results (and internal agent-loop nudges, which also arrive as
   // role:"tool" — see toolChipLabel) — collapsed chip, never a prose bubble.
+  // Exception: an artifact-producing tool (render_canvas/plot_graph/
+  // render_table/show_webpage) renders the actual live preview instead, when
+  // the referenced record is still in the (unpersisted) artifact store.
   if (msg.role === "tool") {
+    if (toolName && ARTIFACT_TOOL_NAMES.has(toolName) && artifact) {
+      return (
+        <div className="flex justify-start w-full max-w-2xl">
+          <ArtifactCard artifact={artifact} />
+        </div>
+      );
+    }
     return (
       <div className="flex justify-start">
         <ToolResultChip content={msg.content} label={toolChipLabel(msg.content, toolName)} />
@@ -394,7 +469,7 @@ const MessageRow = memo(function MessageRow({
           ) : (
             <>
               <div onClick={handleCiteClick}>
-                <Markdown>{rendered || " "}</Markdown>
+                <Markdown isStreaming={isLast && isStreaming}>{rendered || " "}</Markdown>
               </div>
               {isLast && isStreaming && (
                 <span className="inline-block w-0.5 h-4 bg-foreground/40 animate-pulse ml-0.5 align-middle" />

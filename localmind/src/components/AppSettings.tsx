@@ -12,6 +12,7 @@ import { useProvidersStore } from "../store/providers";
 import { useModelStore } from "../store/models";
 import { useAgentStore, KNOWN_FOLDER_NAMES, type KnownFolderName } from "../store/agent";
 import { useVoiceStore } from "../store/voice";
+import { useDebugPromptsStore } from "../store/debugPrompts";
 import { loadSpeechVoices, pickBestSpeechVoice, speakUtterance } from "../lib/speech";
 import {
   getPiperStatus, setupPiper, downloadPiperVoice, speakWithPiper,
@@ -1097,6 +1098,7 @@ const TOOL_GROUP_LABELS: Record<string, string> = {
   state: "App state & automation",
   app: "Desktop & OS",
   external: "External (MCP)",
+  ui: "Chat display (artifacts)",
 };
 
 function KnownFolderToggle({ name }: { name: KnownFolderName }) {
@@ -1265,6 +1267,8 @@ export function AppSettings() {
   } = useSettingsStore();
   const { hardware, vramOverride } = useModelStore();
   const { selectedModel, setSelectedModel } = useModelSelectionStore();
+  const debugModeEnabled = useDebugPromptsStore((s) => s.enabled);
+  const setDebugModeEnabled = useDebugPromptsStore((s) => s.setEnabled);
 
   const [localName, setLocalName] = useState(gitName);
   const [localEmail, setLocalEmail] = useState(gitEmail);
@@ -1578,6 +1582,22 @@ export function AppSettings() {
                       className="size-4 rounded"
                     />
                     <span className="text-sm text-foreground">Run a daily self-improvement / proactive-notice pass</span>
+                  </label>
+                </Field>
+
+                {/* Debug mode — see the exact prompt sent to the model */}
+                <Field
+                  label="Debug mode"
+                  hint="Shows the exact system prompt + current-state text sent to the model each round, as a collapsible rail above the chat — useful for understanding why the agent did (or didn't) do something. Off by default since it's a lot of raw text most of the time."
+                >
+                  <label className="flex items-center gap-2.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={debugModeEnabled}
+                      onChange={(e) => setDebugModeEnabled(e.target.checked)}
+                      className="size-4 rounded"
+                    />
+                    <span className="text-sm text-foreground">Show the exact prompt sent each round</span>
                   </label>
                 </Field>
               </CardContent>

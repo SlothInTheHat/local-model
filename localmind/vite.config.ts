@@ -40,6 +40,10 @@ export default defineConfig(async () => ({
           "vendor-math": ["mathjs"],
           monaco: ["@monaco-editor/react", "monaco-editor"],
           tiptap: ["@tiptap/react", "@tiptap/starter-kit", "@tiptap/extension-placeholder", "@tiptap/suggestion"],
+          // Dynamically import()'d from Markdown.tsx only once a ```mermaid
+          // fence actually appears in a message — most conversations never
+          // touch this chunk at all.
+          mermaid: ["mermaid"],
           docx: ["docx"],
           // KM1: pdf.js is only touched by the Knowledge Hub's PDF ingestion
           // path (src/lib/knowledge/pdf.ts) — split into its own chunk so it

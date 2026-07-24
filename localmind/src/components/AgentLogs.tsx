@@ -7,6 +7,28 @@ import type { AgentSession, LoggedEvent } from "../lib/agentLogger";
 import { useSessionResultsStore } from "../store/sessionResults";
 import type { SessionResult } from "../store/sessionResults";
 import { useAppViewStore } from "../store/appView";
+import { useChatStore } from "../store/chat";
+
+/**
+ * Groups a pre-sorted (most-recent-first) list of runs by conversationId,
+ * falling back to each item's own id when absent — a legacy record (or any
+ * origin with no parent conversation, e.g. a scheduled job) just becomes its
+ * own single-item group, unaffected. Insertion order into the Map preserves
+ * the input's recency order, so groups come out ordered by their most recent
+ * member without a second sort.
+ */
+function groupByConversation<T extends { conversationId?: string; id: string }>(
+  items: T[],
+): Array<{ key: string; items: T[] }> {
+  const map = new Map<string, T[]>();
+  for (const item of items) {
+    const key = item.conversationId ?? item.id;
+    const list = map.get(key) ?? [];
+    list.push(item);
+    map.set(key, list);
+  }
+  return Array.from(map.entries()).map(([key, groupItems]) => ({ key, items: groupItems }));
+}
 
 function relativeTime(ts: number): string {
   const diff = Date.now() - ts;
@@ -159,6 +181,60 @@ function SessionRow({ session, onDelete }: { session: AgentSession; onDelete: ()
   );
 }
 
+/** One row per conversation, grouping its turns' individual SessionRows
+ *  underneath — a conversation with only one turn skips the extra nesting
+ *  and renders as a plain SessionRow, same as before this grouping existed. */
+function ConversationGroup({
+  group,
+  onDeleteSession,
+}: {
+  group: { key: string; items: AgentSession[] };
+  onDeleteSession: (id: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const conv = useChatStore((s) => s.conversations.find((c) => c.id === group.key));
+
+  if (group.items.length === 1) {
+    return <SessionRow session={group.items[0]} onDelete={() => onDeleteSession(group.items[0].id)} />;
+  }
+
+  const totalTools = group.items.reduce(
+    (n, s) => n + s.events.filter((e) => e.data.type === "tool_call").length,
+    0,
+  );
+  const title = conv?.title ?? group.items[0]?.prompt ?? "Conversation";
+  const latest = group.items[0]?.startTime ?? 0;
+
+  return (
+    <div className="border-b last:border-b-0">
+      <button
+        type="button"
+        className="w-full flex items-start gap-2 px-4 py-3 hover:bg-muted/30 transition-colors text-left bg-muted/10"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <div className="mt-0.5 text-muted-foreground shrink-0">
+          {expanded ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-xs font-medium text-foreground truncate">{title}</p>
+          <div className="flex items-center gap-2 mt-1 flex-wrap">
+            <span className="text-[10px] text-muted-foreground">{relativeTime(latest)}</span>
+            <span className="text-[10px] text-muted-foreground">{group.items.length} turns</span>
+            <span className="text-[10px] text-muted-foreground">{totalTools} tool{totalTools !== 1 ? "s" : ""}</span>
+          </div>
+        </div>
+      </button>
+      {expanded && (
+        <div className="pl-3 border-t bg-muted/5 divide-y">
+          {group.items.map((s) => (
+            <SessionRow key={s.id} session={s} onDelete={() => onDeleteSession(s.id)} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function outcomeBadge(outcome: SessionResult["outcome"]): { label: string; className: string } {
   switch (outcome) {
     case "completed": return { label: "✓ done", className: "text-success" };
@@ -222,10 +298,54 @@ function UnattendedRunRow({ result }: { result: SessionResult }) {
   );
 }
 
+/** Parallel to ConversationGroup above, for SessionResult-backed unattended
+ *  runs — currently a near no-op in practice (no headless origin populates
+ *  conversationId yet, so every group is single-item), but future-proofs a
+ *  subagent spawned from within a chat conversation showing up nested under
+ *  it instead of as a disconnected row. */
+function UnattendedConversationGroup({
+  group,
+}: {
+  group: { key: string; items: SessionResult[] };
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const conv = useChatStore((s) => s.conversations.find((c) => c.id === group.key));
+
+  if (group.items.length === 1) {
+    return <UnattendedRunRow result={group.items[0]} />;
+  }
+
+  const title = conv?.title ?? group.items[0]?.task ?? "Conversation";
+
+  return (
+    <div className="border-b last:border-b-0">
+      <button
+        type="button"
+        className="w-full flex items-start gap-2 px-4 py-3 hover:bg-muted/30 transition-colors text-left bg-muted/10"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <div className="mt-0.5 text-muted-foreground shrink-0">
+          {expanded ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-xs font-medium text-foreground truncate">{title}</p>
+          <span className="text-[10px] text-muted-foreground">{group.items.length} runs</span>
+        </div>
+      </button>
+      {expanded && (
+        <div className="pl-3 border-t bg-muted/5 divide-y">
+          {group.items.map((r) => <UnattendedRunRow key={r.id} result={r} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function UnattendedRunsSection() {
   const { results, clear } = useSessionResultsStore();
   const setView = useAppViewStore((s) => s.setView);
   const sorted = [...results].sort((a, b) => b.startedAt - a.startedAt);
+  const groups = groupByConversation(sorted);
 
   return (
     <div className="border-b shrink-0">
@@ -250,7 +370,7 @@ function UnattendedRunsSection() {
         <p className="text-[11px] text-muted-foreground px-4 py-3">No scheduled/queued/subagent runs yet.</p>
       ) : (
         <div className="max-h-64 overflow-y-auto divide-y">
-          {sorted.map((r) => <UnattendedRunRow key={r.id} result={r} />)}
+          {groups.map((g) => <UnattendedConversationGroup key={g.key} group={g} />)}
         </div>
       )}
     </div>
@@ -301,9 +421,9 @@ export function AgentLogs() {
 
       <div className="border-b bg-muted/20 px-4 py-2 shrink-0">
         <p className="text-xs text-muted-foreground">
-          Every coding agent session is logged here. Click a session to expand it, then use{" "}
-          <strong>Copy analysis prompt</strong> to get a structured prompt you can paste into Claude
-          to find weaknesses and improve the agent's behavior.
+          Every agent session — Chat and Code Editor alike — is logged here, grouped by conversation.
+          Click a turn to expand it, then use <strong>Copy analysis prompt</strong> to get a structured
+          prompt you can paste into Claude to find weaknesses and improve the agent's behavior.
         </p>
       </div>
 
@@ -315,13 +435,13 @@ export function AgentLogs() {
             <ScrollText className="size-8 text-muted-foreground/40" />
             <p className="text-sm text-muted-foreground">No sessions yet</p>
             <p className="text-xs text-muted-foreground">
-              Sessions are recorded automatically every time you use the Code Editor agent.
+              Sessions are recorded automatically every time you use the agent — in Chat or the Code Editor.
             </p>
           </div>
         ) : (
           <div className="divide-y">
-            {sessions.map((s) => (
-              <SessionRow key={s.id} session={s} onDelete={() => void handleDelete(s.id)} />
+            {groupByConversation(sessions).map((g) => (
+              <ConversationGroup key={g.key} group={g} onDeleteSession={(id) => void handleDelete(id)} />
             ))}
           </div>
         )}

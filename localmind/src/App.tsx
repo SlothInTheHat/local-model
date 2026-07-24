@@ -10,6 +10,8 @@ import type { ChatMessage } from "./lib/ollama";
 import { searchWeb } from "./lib/search";
 import { runAgentSession, DEFAULT_MAX_ROUNDS, buildIdentitySystemPrompt } from "./lib/agentRuntime";
 import { resolveRole, looksLikeKnowledgeQuery } from "./lib/modelRoles";
+import { useDebugPromptsStore } from "./store/debugPrompts";
+import { startSession, endSession, logRound, logToolCall, logToolResult, logAgentText } from "./lib/agentLogger";
 import { streamChatForModel, formatModelRef } from "./lib/chatProvider";
 import { classifyIntent, heuristicIntent } from "./lib/intentRouter";
 import { setSystemInfoContext } from "./lib/tools";
@@ -399,6 +401,10 @@ export default function App() {
   // Ref to track current convId across async agent continuations
   const activeConvIdRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  // Background agentLogger.ts session for the Logs tab — mirrors CodeEditor.tsx's
+  // logSessionRef exactly, generalizing that Code-Editor-only mechanism to the
+  // main Chat tab too (see runAgentLoop below).
+  const logSessionRef = useRef<string | null>(null);
   // Track last recommendation shown to avoid repeating the same toast
   const lastRecRef = useRef<string>("");
   const prevIsStreamingRef = useRef(false);
@@ -1241,6 +1247,11 @@ export default function App() {
     const controller = new AbortController();
     abortRef.current = controller;
 
+    const lastUserMsg = [...history].reverse().find((m) => m.role === "user")?.content ?? "";
+    logSessionRef.current = startSession(lastUserMsg, modelRef, dirHandle?.name, convId);
+    const toolStartTimes = new Map<string, number>();
+    let hadSideEffectsForLog = false;
+
     try {
       const sessionResult = await runAgentSession(history, {
         modelRef,
@@ -1259,13 +1270,17 @@ export default function App() {
 
         onTextDelta: (chunk) => {
           appendToLastMessage(convId, chunk);
+          if (logSessionRef.current) logAgentText(logSessionRef.current, chunk);
         },
 
         onTextReplace: (cleanText) => {
           setLastMessageContent(convId, cleanText);
         },
 
-        onToolCallStart: () => {},
+        onToolCallStart: (call) => {
+          if (logSessionRef.current) logToolCall(logSessionRef.current, call.name, call.args);
+          toolStartTimes.set(call.id, Date.now());
+        },
 
         onApprovalNeeded: (call) => {
           if (autoApproveRemainingRef.current) return Promise.resolve(true);
@@ -1276,7 +1291,12 @@ export default function App() {
           });
         },
 
-        onToolCallResolved: (call, _label, _result, _summary, toolContent) => {
+        onToolCallResolved: (call, _label, result, _summary, toolContent) => {
+          if (logSessionRef.current) {
+            const toolMs = Date.now() - (toolStartTimes.get(call.id) ?? Date.now());
+            toolStartTimes.delete(call.id);
+            logToolResult(logSessionRef.current, call.name, result.output, result.error, toolMs);
+          }
           addMessage(convId, {
             role: "assistant",
             content: "",
@@ -1286,11 +1306,20 @@ export default function App() {
         },
 
         onRoundStart: (round) => {
+          if (logSessionRef.current) logRound(logSessionRef.current, round);
           if (round > 1) addMessage(convId, { role: "assistant", content: "" });
         },
 
+        onDebugPrompt: useDebugPromptsStore.getState().enabled
+          ? ({ round, systemMessage }) => {
+              useDebugPromptsStore.getState().addEntry(convId, { round, systemMessage, capturedAt: Date.now() });
+            }
+          : undefined,
+
         signal: controller.signal,
       });
+
+      hadSideEffectsForLog = sessionResult.hadSideEffects;
 
       if (sessionResult.hitRoundLimit) {
         addMessage(convId, {
@@ -1322,6 +1351,10 @@ export default function App() {
         setStreaming(false);
         clearPendingToolCalls();
         abortRef.current = null;
+      }
+      if (logSessionRef.current) {
+        endSession(logSessionRef.current, hadSideEffectsForLog);
+        logSessionRef.current = null;
       }
     }
   }
@@ -1541,7 +1574,7 @@ export default function App() {
                 </div>
               )}
 
-              <ChatMessages messages={activeConv?.messages ?? []} isStreaming={isStreaming} />
+              <ChatMessages messages={activeConv?.messages ?? []} isStreaming={isStreaming} conversationId={activeId} />
 
               {/* Pending tool call approvals */}
               {pendingToolCalls.length > 0 && (

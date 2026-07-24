@@ -31,6 +31,11 @@ export interface SessionResult {
   /** The Workflow.id (src/store/workflows.ts) this run belongs to, if any — lets the
    *  Workflows dashboard filter run history per workflow. Absent for every other origin. */
   workflowId?: string;
+  /** Groups this run under a parent conversation in the Logs tab, for origins
+   *  that can be spawned from within an interactive chat (e.g. a subagent).
+   *  Absent for most origins (scheduler/workflow/task-queue runs have no
+   *  parent conversation) — those just render as their own single-run group. */
+  conversationId?: string;
 }
 
 interface SessionResultsState {

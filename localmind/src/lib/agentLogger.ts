@@ -44,6 +44,10 @@ export interface AgentSession {
   events: LoggedEvent[];
   completed: boolean;
   rounds: number;
+  /** Groups multiple per-message sessions under one parent conversation in
+   *  the Logs tab (AgentLogs.tsx) — absent for pre-migration records, which
+   *  just render as their own single-session group. */
+  conversationId?: string;
 }
 
 // ─── IndexedDB storage ────────────────────────────────────────────────────────
@@ -114,7 +118,7 @@ const activeSessions = new Map<string, AgentSession>();
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-export function startSession(prompt: string, model: string, workspace?: string): string {
+export function startSession(prompt: string, model: string, workspace?: string, conversationId?: string): string {
   const id = crypto.randomUUID();
   const session: AgentSession = {
     id,
@@ -125,6 +129,7 @@ export function startSession(prompt: string, model: string, workspace?: string):
     events: [],
     completed: false,
     rounds: 0,
+    conversationId,
   };
   activeSessions.set(id, session);
   void writeSession(session);

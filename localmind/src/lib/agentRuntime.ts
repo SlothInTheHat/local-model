@@ -166,6 +166,16 @@ export interface AgentRuntimeConfig {
   onTodosChanged?: (todos: TodoItem[]) => void;
   onMemoryChanged?: (memory: string) => void;
   onActivity?: (label: string | null) => void;
+  /**
+   * Debug mode only — fired right after this round's system message is
+   * assembled, before it's sent to the model. Carries the EXACT text sent
+   * (the assembled system+state-block string is otherwise built fresh every
+   * round and never stored anywhere — completely invisible today). Callers
+   * must never fold this into the conversation's own message array: that
+   * array is re-sent to the model every round, so leaking debug content into
+   * it would corrupt the model's own context.
+   */
+  onDebugPrompt?: (info: { round: number; systemMessage: string }) => void;
 
   signal: AbortSignal;
 }
@@ -945,6 +955,7 @@ export async function runAgentSession(
     if (!config.toolsSupported) {
       round = 1;
       config.onRoundStart?.(round, config.maxRounds);
+      config.onDebugPrompt?.({ round, systemMessage: systemPrompt });
       for await (const chunk of streamChatForModel(
         config.modelRef,
         [{ role: "system", content: systemPrompt }, ...history],
@@ -983,10 +994,12 @@ export async function runAgentSession(
         );
       }
 
+      const roundSystemMessage = `${activeSystemPrompt}\n\n${stateBlock}${routerRoundNote}`;
       const messagesForRound: ChatMessage[] = [
-        { role: "system", content: `${activeSystemPrompt}\n\n${stateBlock}${routerRoundNote}` },
+        { role: "system", content: roundSystemMessage },
         ...history,
       ];
+      config.onDebugPrompt?.({ round, systemMessage: roundSystemMessage });
 
       lastRoundHadToolCalls = false;
       let roundText = "";
