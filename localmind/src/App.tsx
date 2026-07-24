@@ -27,6 +27,7 @@ import { useAppViewStore } from "./store/appView";
 import { useModelSelectionStore } from "./store/modelSelection";
 import { useSessionResultsStore } from "./store/sessionResults";
 import { useChatSeedStore } from "./store/chatSeed";
+import { speakText } from "./lib/speech";
 import { startTaskRunner, SAFE_QUEUE_ALLOWLIST } from "./lib/taskRunner";
 import { initScheduler } from "./lib/scheduler";
 import { initMcpAutoConnect } from "./lib/mcpAutoConnect";
@@ -447,8 +448,7 @@ export default function App() {
           .replace(/```[\s\S]*?```/g, "code block")
           .replace(/[#*`_~[\]()>]/g, "")
           .slice(0, 3000);
-        speechSynthesis.cancel();
-        speechSynthesis.speak(new SpeechSynthesisUtterance(plain));
+        void speakText(plain);
       }
     }
   }, [isStreaming]); // eslint-disable-line react-hooks/exhaustive-deps

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Eye, EyeOff, CheckCircle2, XCircle, RefreshCw, Settings, User, GitBranch, Globe, Plug, Clock, Trash2, Lightbulb, Check, Monitor, Keyboard, FolderOpen, Cpu, Sparkles, Copy, Network, Layers, Mic, ShieldCheck } from "lucide-react";
+import { Eye, EyeOff, CheckCircle2, XCircle, RefreshCw, Settings, User, GitBranch, Globe, Plug, Clock, Trash2, Lightbulb, Check, Monitor, Keyboard, FolderOpen, Cpu, Sparkles, Copy, Network, Layers, Mic, ShieldCheck, Volume2, Play } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { Card, CardContent } from "./ui/card";
@@ -11,6 +11,13 @@ import { useSettingsStore, DEFAULT_OLLAMA_BASE_URL } from "../store/settings";
 import { useProvidersStore } from "../store/providers";
 import { useModelStore } from "../store/models";
 import { useAgentStore, KNOWN_FOLDER_NAMES, type KnownFolderName } from "../store/agent";
+import { useVoiceStore } from "../store/voice";
+import { loadSpeechVoices, pickBestSpeechVoice, speakUtterance } from "../lib/speech";
+import {
+  getPiperStatus, setupPiper, downloadPiperVoice, speakWithPiper,
+  CURATED_PIPER_VOICES, encodePiperVoiceSelection, decodePiperVoiceSelection,
+  type PiperStatus,
+} from "../lib/piper";
 import { useModelSelectionStore } from "../store/modelSelection";
 import { useChatStore } from "../store/chat";
 import { useMemoryStore } from "../store/memory";
@@ -598,6 +605,8 @@ function FeatureProposalsSection() {
 // config.
 const IPC_ENDPOINT = "http://127.0.0.1:41777";
 
+const VOICE_SAMPLE_TEXT = "Hi, this is what I sound like. I'm LocalMind, your local AI assistant.";
+
 function DesktopIntegrationSection() {
   const { closeToTray, setCloseToTray, whisperModel, setWhisperModel, dictationEngine, setDictationEngine } =
     useSettingsStore();
@@ -607,6 +616,85 @@ function DesktopIntegrationSection() {
   const [showIpcToken, setShowIpcToken] = useState(false);
   const [ipcCopied, setIpcCopied] = useState(false);
   const tauri = isTauriEnv();
+
+  const { selectedVoiceName, setSelectedVoiceName } = useVoiceStore();
+  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [samplePlaying, setSamplePlaying] = useState(false);
+
+  const [piperStatus, setPiperStatus] = useState<PiperStatus | null>(null);
+  const [piperBusy, setPiperBusy] = useState(false);
+  const [piperVoiceToDownload, setPiperVoiceToDownload] = useState(CURATED_PIPER_VOICES[0].id);
+
+  function refreshPiperStatus() {
+    if (!tauri) return;
+    void getPiperStatus().then(setPiperStatus).catch(() => setPiperStatus(null));
+  }
+
+  useEffect(() => {
+    if (!tauri) return;
+    let cancelled = false;
+    void loadSpeechVoices().then((v) => {
+      if (!cancelled) setVoices(v);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [tauri]);
+
+  useEffect(refreshPiperStatus, [tauri]);
+
+  async function handlePiperSetup() {
+    setPiperBusy(true);
+    try {
+      const msg = await setupPiper();
+      toast.success(msg);
+      refreshPiperStatus();
+    } catch (e) {
+      toast.error(`Piper setup failed: ${(e as Error).message}`);
+    } finally {
+      setPiperBusy(false);
+    }
+  }
+
+  async function handlePiperDownload() {
+    setPiperBusy(true);
+    try {
+      const msg = await downloadPiperVoice(piperVoiceToDownload);
+      toast.success(msg);
+      refreshPiperStatus();
+    } catch (e) {
+      toast.error(`Voice download failed: ${(e as Error).message}`);
+    } finally {
+      setPiperBusy(false);
+    }
+  }
+
+  const sortedVoices = [...voices].sort((a, b) => {
+    const aEn = a.lang.toLowerCase().startsWith("en") ? 0 : 1;
+    const bEn = b.lang.toLowerCase().startsWith("en") ? 0 : 1;
+    if (aEn !== bEn) return aEn - bEn;
+    return a.name.localeCompare(b.name);
+  });
+  const autoVoice = pickBestSpeechVoice(voices);
+
+  async function playVoiceSample() {
+    if (samplePlaying) return;
+    setSamplePlaying(true);
+    try {
+      const piperVoice = decodePiperVoiceSelection(selectedVoiceName);
+      if (piperVoice) {
+        await speakWithPiper(VOICE_SAMPLE_TEXT, piperVoice);
+      } else {
+        const voice = (selectedVoiceName ? voices.find((v) => v.name === selectedVoiceName) : null) ?? autoVoice;
+        window.speechSynthesis.cancel();
+        await speakUtterance(VOICE_SAMPLE_TEXT, voice);
+      }
+    } catch (e) {
+      toast.error(`Couldn't play sample: ${(e as Error).message}`);
+    } finally {
+      setSamplePlaying(false);
+    }
+  }
 
   useEffect(() => {
     if (!tauri) return;
@@ -727,6 +815,106 @@ function DesktopIntegrationSection() {
                 noticeably longer per dictation.
               </p>
             </Field>
+          </div>
+        )}
+
+        {tauri && (
+          <div className="pt-3 border-t border-border space-y-2">
+            <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+              <Volume2 className="size-4" />
+              Voice output (text-to-speech)
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              Used by the speak_text tool for hands-free responses. "Online (Natural)" voices sound the most
+              natural but are cloud-rendered by Microsoft (need an internet connection) — install one under Windows
+              Settings → Time & Language → Speech if none is listed below.
+            </p>
+            <Field label="Voice">
+              <div className="flex gap-2">
+                <select
+                  value={selectedVoiceName ?? ""}
+                  onChange={(e) => setSelectedVoiceName(e.target.value || null)}
+                  className="flex-1 min-w-0 text-sm px-3 py-1.5 rounded-md border border-border bg-background text-foreground outline-none focus:ring-2 focus:ring-ring"
+                >
+                  <option value="">{`Auto (best available${autoVoice ? `: ${autoVoice.name}` : ""})`}</option>
+                  {(piperStatus?.voices.length ?? 0) > 0 && (
+                    <optgroup label="Piper (offline neural)">
+                      {piperStatus!.voices.map((id) => (
+                        <option key={id} value={encodePiperVoiceSelection(id)}>{id}</option>
+                      ))}
+                    </optgroup>
+                  )}
+                  {sortedVoices.length > 0 && (
+                    <optgroup label="System">
+                      {sortedVoices.map((v) => (
+                        <option key={v.name} value={v.name}>{`${v.name} (${v.lang})`}</option>
+                      ))}
+                    </optgroup>
+                  )}
+                </select>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-1.5 shrink-0"
+                  disabled={samplePlaying || (voices.length === 0 && (piperStatus?.voices.length ?? 0) === 0)}
+                  onClick={() => void playVoiceSample()}
+                >
+                  <Play className="size-3.5" /> {samplePlaying ? "Playing…" : "Play sample"}
+                </Button>
+              </div>
+              {voices.length === 0 && (
+                <p className="text-[11px] text-muted-foreground italic">
+                  No system voices found yet — this can take a moment on first load.
+                </p>
+              )}
+            </Field>
+
+            <div className="pt-2 border-t border-border/60 space-y-1.5">
+              <p className="text-xs font-medium text-foreground">
+                Piper — offline neural voices (much less robotic than the system ones above)
+              </p>
+              {!piperStatus ? (
+                <p className="text-[11px] text-muted-foreground italic">Checking status…</p>
+              ) : !piperStatus.venv_ready ? (
+                <>
+                  <p className="text-[11px] text-muted-foreground">
+                    {piperStatus.python_available
+                      ? "Not set up yet. This installs piper-tts (GPL-3.0) into its own isolated Python environment under LocalMind's app data folder — nothing bundled into LocalMind itself."
+                      : "Requires Python 3.9+ installed and on PATH — none was found. Install it from python.org, then come back here."}
+                  </p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="gap-1.5"
+                    disabled={piperBusy || !piperStatus.python_available}
+                    onClick={() => void handlePiperSetup()}
+                  >
+                    {piperBusy ? "Setting up… (can take a minute)" : "Set up Piper"}
+                  </Button>
+                </>
+              ) : (
+                <div className="flex gap-2">
+                  <select
+                    value={piperVoiceToDownload}
+                    onChange={(e) => setPiperVoiceToDownload(e.target.value)}
+                    className="flex-1 min-w-0 text-sm px-3 py-1.5 rounded-md border border-border bg-background text-foreground outline-none focus:ring-2 focus:ring-ring"
+                  >
+                    {CURATED_PIPER_VOICES.filter((v) => !piperStatus.voices.includes(v.id)).map((v) => (
+                      <option key={v.id} value={v.id}>{v.label}</option>
+                    ))}
+                  </select>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="gap-1.5 shrink-0"
+                    disabled={piperBusy}
+                    onClick={() => void handlePiperDownload()}
+                  >
+                    {piperBusy ? "Downloading…" : "Download voice"}
+                  </Button>
+                </div>
+              )}
+            </div>
           </div>
         )}
 

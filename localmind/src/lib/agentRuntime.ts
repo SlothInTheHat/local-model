@@ -966,7 +966,15 @@ export async function runAgentSession(
         // as a text-only one, and there's no human here to notice either way
         // — observed live, this exact case (nudge already spent, next round
         // comes back empty) let a scheduled run end with zero side effects.
+        // Conversational (restricted-agent) turns are explicitly instructed to
+        // answer in plain text with NO tool calls (see buildConversationalSystemPrompt/
+        // the SCOPE CHECK step) — without this guard, a correct text-only answer
+        // to something like "what can you do?" looks identical to a build task
+        // that did nothing, so the nudge fired anyway and forced a pointless
+        // second round (onRoundStart(2) opens a new message bubble, and the
+        // model answers the same question again independently) — the double-response bug.
         const shouldNudgeInaction = liveFlag(config.agentBuildMode)
+          && !config.conversational
           && (!anyToolCallsThisSession || madeInfoCallsButNoMutation)
           && inactionNudgeCount < maxInactionNudges
           && (trimmed.length > 0 || config.expectSideEffects) && round < config.maxRounds;

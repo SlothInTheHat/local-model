@@ -2,6 +2,7 @@ import { evaluate } from "mathjs";
 import { searchWeb } from "./search";
 import { fileExists } from "./fileSystem";
 import { TauriDirectoryHandle } from "./tauriFs";
+import { speakText, SPEAK_TEXT_MAX_CHARS } from "./speech";
 import { mcpCallTool } from "./mcp";
 import { useMcpStore } from "../store/mcp";
 import { injectGitCredentials, sanitizeOutput } from "../store/profile";
@@ -824,7 +825,7 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
   },
   {
     name: "speak_text",
-    description: "Read text aloud through the system's built-in text-to-speech voice (offline, no network call). Use for hands-free/ambient responses when the user is asking for something to be read out rather than typed.",
+    description: "Read text aloud through the system's text-to-speech voice. Uses the best available voice, which on Windows is often a cloud-rendered neural voice (requires network) rather than a local one — falls back to a fully offline system voice if none is available. Use for hands-free/ambient responses when the user is asking for something to be read out rather than typed.",
     parameters: {
       type: "object",
       properties: {
@@ -3226,10 +3227,23 @@ export async function executeTool(
       }
 
       case "speak_text": {
-        const text = argStr(call.args["text"]);
-        if (!text) throw new Error("Missing text argument");
-        const output = await tauriInvoke<string>("speak_text", { text });
-        return { toolCallId: call.id, name: call.name, output };
+        const rawText = argStr(call.args["text"]);
+        if (!rawText) throw new Error("Missing text argument");
+        const truncated = rawText.length > SPEAK_TEXT_MAX_CHARS;
+        const text = truncated ? rawText.slice(0, SPEAK_TEXT_MAX_CHARS) : rawText;
+        try {
+          await speakText(text);
+          return {
+            toolCallId: call.id,
+            name: call.name,
+            output: truncated ? `Spoke the text aloud (truncated to ${SPEAK_TEXT_MAX_CHARS} characters).` : "Spoke the text aloud.",
+          };
+        } catch {
+          // Web Speech API unavailable/errored — fall back to the Rust/SAPI path
+          // (always available on Windows, lower voice quality).
+          const output = await tauriInvoke<string>("speak_text", { text });
+          return { toolCallId: call.id, name: call.name, output };
+        }
       }
 
       case "print_file": {

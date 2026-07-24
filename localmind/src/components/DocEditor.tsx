@@ -3,6 +3,13 @@ import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
 import { Markdown } from "tiptap-markdown";
+import { MathInline, MathBlock, setEditorContentWithMath } from "../lib/tiptapMath";
+import { CommentMark, reanchorComments, findCommentRange, removeCommentMark } from "../lib/tiptapComment";
+import { useDocCommentsStore } from "../store/docComments";
+import { DocFloatingComments } from "./DocFloatingComments";
+import { DocAiSuggestionCard } from "./DocAiSuggestionCard";
+import { DocSelectionMenu, type PresetAction } from "./DocSelectionMenu";
+import { MessageSquarePlus, MessageSquare } from "lucide-react";
 import {
   Bold,
   Italic,
@@ -25,7 +32,7 @@ import { streamChatForModel } from "../lib/chatProvider";
 import { useModelSelectionStore } from "../store/modelSelection";
 import { useAgentStore } from "../store/agent";
 import { openWorkspace, readFileFromHandle, writeFileToHandle } from "../lib/fileSystem";
-import { Document, Packer, Paragraph, HeadingLevel, TextRun } from "docx";
+import { docToBlocks, blocksToDocxBlob, blocksToPdfBlob } from "../lib/docExport";
 import { toast } from "sonner";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -97,7 +104,7 @@ function getMarkdown(editor: NonNullable<ReturnType<typeof useEditor>>): string 
 
 export function DocEditor() {
   const selectedModel = useModelSelectionStore((s) => s.selectedModel);
-  const { dirHandle, setWorkspace } = useAgentStore();
+  const { dirHandle, workspacePath, setWorkspace } = useAgentStore();
 
   const [openTabs, setOpenTabs] = useState<OpenDocTab[]>([]);
   const [activeTabPath, setActiveTabPath] = useState<string>("");
@@ -108,8 +115,18 @@ export function DocEditor() {
   const [isAiStreaming, setIsAiStreaming] = useState(false);
   const aiDropdownRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const commentsRowRef = useRef<HTMLDivElement>(null);
 
   const activeTab = openTabs.find((t) => t.path === activeTabPath) ?? null;
+
+  // ─── Comments ─────────────────────────────────────────────────────────────
+  const { getComments, addComment, addMessage, setResolved, deleteComment } = useDocCommentsStore();
+  const [commentsOpen, setCommentsOpen] = useState(false);
+  const [aiThinkingCommentId, setAiThinkingCommentId] = useState<string | null>(null);
+  const [selectionMenu, setSelectionMenu] = useState<{ x: number; y: number; from: number; to: number } | null>(null);
+  const [focusCommentId, setFocusCommentId] = useState<string | null>(null);
+  const [pendingSuggestion, setPendingSuggestion] = useState<{ from: number; to: number; text: string; loading: boolean } | null>(null);
+  const activeComments = activeTabPath ? getComments(workspacePath, activeTabPath) : [];
 
   const handleUpdate = useCallback(() => {
     setOpenTabs((prev) =>
@@ -124,6 +141,9 @@ export function DocEditor() {
         placeholder: "Open or create a file in the tree to start writing…",
       }),
       Markdown.configure({ html: false }),
+      MathInline,
+      MathBlock,
+      CommentMark,
     ],
     content: "",
     onUpdate: handleUpdate,
@@ -159,6 +179,17 @@ export function DocEditor() {
     return md;
   }
 
+  /** Loads content into the editor (math-conversion included) and reapplies
+   *  any unresolved comments' highlight marks for that specific file path —
+   *  every "load a document's content" call site should go through this
+   *  rather than setEditorContentWithMath directly, so comments never fall
+   *  out of sync with whichever file is actually on screen. */
+  function loadDocContent(path: string, content: string) {
+    if (!editor) return;
+    setEditorContentWithMath(editor, content);
+    reanchorComments(editor, getComments(workspacePath, path));
+  }
+
   async function handleOpenFile(_handle: FileSystemFileHandle, path: string) {
     if (!dirHandle || !editor) return;
 
@@ -167,7 +198,7 @@ export function DocEditor() {
     const existing = openTabs.find((t) => t.path === path);
     if (existing) {
       setActiveTabPath(path);
-      editor.commands.setContent(existing.content);
+      loadDocContent(path, existing.content);
       return;
     }
 
@@ -175,7 +206,7 @@ export function DocEditor() {
       const text = await readFileFromHandle(dirHandle, path);
       setOpenTabs((prev) => [...prev, { path, content: text, isDirty: false }]);
       setActiveTabPath(path);
-      editor.commands.setContent(text);
+      loadDocContent(path, text);
       toast.success(`Opened ${path.split("/").pop()}`);
     } catch (err) {
       toast.error(`Could not open file: ${(err as Error).message}`);
@@ -188,7 +219,7 @@ export function DocEditor() {
     const tab = openTabs.find((t) => t.path === path);
     if (!tab) return;
     setActiveTabPath(path);
-    editor.commands.setContent(tab.content);
+    loadDocContent(path, tab.content);
   }
 
   function handleCloseTab(path: string, e: React.MouseEvent) {
@@ -201,7 +232,7 @@ export function DocEditor() {
       const last = newTabs[newTabs.length - 1];
       if (last) {
         setActiveTabPath(last.path);
-        editor.commands.setContent(last.content);
+        loadDocContent(last.path, last.content);
       } else {
         setActiveTabPath("");
         editor.commands.setContent("");
@@ -269,7 +300,7 @@ export function DocEditor() {
         await writeFileToHandle(dirHandle, path, text);
         setOpenTabs((prev) => [...prev, { path, content: text, isDirty: false }]);
         setActiveTabPath(path);
-        editor?.commands.setContent(text);
+        loadDocContent(path, text);
         setTreeVersion((v) => v + 1);
         toast.info("Recovered your previous document as recovered-document.md");
       } catch {
@@ -282,38 +313,35 @@ export function DocEditor() {
 
   // ─── AI actions ───────────────────────────────────────────────────────────
 
-  async function runAiAction(action: AiAction) {
+  /** Runs a prompt against a specific range's text and stages the result as a
+   *  pending suggestion instead of applying it directly — the user has to
+   *  Accept or Reject (see acceptAiSuggestion/rejectAiSuggestion below) before
+   *  anything actually changes in the document. Takes an explicit range
+   *  rather than reading editor.state.selection at call time — callers
+   *  invoked from a context menu capture the selection at right-click time,
+   *  since opening the menu / typing a custom prompt can otherwise outlive the
+   *  moment the user actually made their selection. */
+  async function runAiPromptOnRange(instruction: string, range: { from: number; to: number }) {
     if (!editor) return;
     if (!selectedModel) {
       toast.error("No model selected — pick one in Settings or the Chat tab first.");
       return;
     }
-    setIsAiDropdownOpen(false);
-
-    const { from, to } = editor.state.selection;
-    const selectedText =
-      from !== to
-        ? editor.state.doc.textBetween(from, to, "\n")
-        : editor.getText();
-
+    const { from, to } = range;
+    const selectedText = from !== to ? editor.state.doc.textBetween(from, to, "\n") : editor.getText();
     if (!selectedText.trim()) return;
 
-    const systemPrompt = AI_ACTION_PROMPTS[action];
-    const messages = [
-      { role: "user" as const, content: systemPrompt + selectedText },
-    ];
+    const messages = [{ role: "user" as const, content: instruction + selectedText }];
 
     setIsAiStreaming(true);
+    setPendingSuggestion({ from, to, text: "", loading: true });
     abortRef.current = new AbortController();
 
     let result = "";
     try {
-      for await (const chunk of streamChatForModel(
-        selectedModel,
-        messages,
-        abortRef.current.signal
-      )) {
+      for await (const chunk of streamChatForModel(selectedModel, messages, abortRef.current.signal)) {
         result += chunk;
+        setPendingSuggestion({ from, to, text: result, loading: true });
       }
     } catch (err) {
       const e = err as Error;
@@ -323,15 +351,164 @@ export function DocEditor() {
       abortRef.current = null;
     }
 
-    if (!result) return;
+    if (!result.trim()) {
+      setPendingSuggestion(null);
+      return;
+    }
+    setPendingSuggestion({ from, to, text: result, loading: false });
+  }
 
-    // Replace selection or whole document — content is parsed as markdown
-    // (tiptap-markdown), so a model reply using **bold**/lists/etc. renders
-    // correctly instead of showing up as literal asterisks.
+  /** Applies a pending AI suggestion — the only place that actually writes an
+   *  AI text-action's result into the document, and only reachable via an
+   *  explicit user click. Content is parsed as markdown (tiptap-markdown), so
+   *  a model reply using bold/italic/list markdown renders correctly instead
+   *  of showing up as literal asterisks. */
+  function acceptAiSuggestion() {
+    if (!editor || !pendingSuggestion) return;
+    const { from, to, text } = pendingSuggestion;
     if (from !== to) {
-      editor.chain().focus().deleteRange({ from, to }).insertContentAt(from, result).run();
+      editor.chain().focus().deleteRange({ from, to }).insertContentAt(from, text).run();
     } else {
-      editor.commands.setContent(result);
+      loadDocContent(activeTabPath, text);
+    }
+    setPendingSuggestion(null);
+  }
+
+  function rejectAiSuggestion() {
+    setPendingSuggestion(null);
+  }
+
+  async function runAiAction(action: AiAction, range?: { from: number; to: number }) {
+    setIsAiDropdownOpen(false);
+    const effectiveRange = range ?? (editor ? editor.state.selection : { from: 0, to: 0 });
+    await runAiPromptOnRange(AI_ACTION_PROMPTS[action], effectiveRange);
+  }
+
+  async function runCustomAiPrompt(instruction: string, range: { from: number; to: number }) {
+    const trimmed = instruction.trim();
+    if (!trimmed) return;
+    await runAiPromptOnRange(
+      `${trimmed}\n\nApply this to the following text. Return only the result, no commentary:\n\n`,
+      range
+    );
+  }
+
+  // ─── Comments ─────────────────────────────────────────────────────────────
+
+  function handleAddComment(range?: { from: number; to: number }) {
+    if (!editor || !activeTabPath) return;
+    const { from, to } = range ?? editor.state.selection;
+    if (from === to) {
+      toast.error("Select some text first to comment on it.");
+      return;
+    }
+    const anchorText = editor.state.doc.textBetween(from, to, "\n");
+    if (!anchorText.trim()) return;
+    const id = crypto.randomUUID();
+    editor.chain().setTextSelection({ from, to }).focus().setMark("comment", { commentId: id }).run();
+    addComment(workspacePath, activeTabPath, {
+      id,
+      anchorText,
+      resolved: false,
+      messages: [],
+      createdAt: Date.now(),
+    });
+    setCommentsOpen(true);
+    // Auto-focus the new card's reply box — otherwise a comment starts as an
+    // empty thread with nothing for "Ask AI" to actually respond to, and it's
+    // easy to not notice you still need to click into the card and type.
+    setFocusCommentId(id);
+  }
+
+  /** Right-click on a selection -> custom context menu (Comment / Ask AI /
+   *  presets) instead of the browser's native menu. Only intercepts when
+   *  there's an actual selection — with nothing selected there's no clear
+   *  "act on this text" meaning, so the native menu is left alone. */
+  function handleEditorContextMenu(e: React.MouseEvent) {
+    if (!editor) return;
+    const { from, to } = editor.state.selection;
+    if (from === to) return;
+    e.preventDefault();
+    setSelectionMenu({ x: e.clientX, y: e.clientY, from, to });
+  }
+
+  function handleReplyToComment(commentId: string, text: string) {
+    if (!activeTabPath) return;
+    addMessage(workspacePath, activeTabPath, commentId, {
+      id: crypto.randomUUID(),
+      author: "user",
+      text,
+      createdAt: Date.now(),
+    });
+  }
+
+  function handleJumpToComment(commentId: string) {
+    if (!editor) return;
+    const found = findCommentRange(editor, commentId);
+    if (!found) {
+      toast.info("This comment's text isn't highlighted in the current document (it may have been edited).");
+      return;
+    }
+    editor.chain().focus().setTextSelection(found).scrollIntoView().run();
+  }
+
+  function handleDeleteComment(commentId: string) {
+    if (!activeTabPath) return;
+    if (editor) removeCommentMark(editor, commentId);
+    deleteComment(workspacePath, activeTabPath, commentId);
+  }
+
+  /** Resolving a comment removes its highlight (same as delete); reopening
+   *  tries to restore it by re-finding the anchor text. Previously only
+   *  delete stripped the mark, so a resolved comment's text stayed
+   *  highlighted with nothing left to attach it to. */
+  function handleSetResolved(commentId: string, resolved: boolean) {
+    if (!activeTabPath) return;
+    if (editor) {
+      if (resolved) {
+        removeCommentMark(editor, commentId);
+      } else {
+        const comment = activeComments.find((c) => c.id === commentId);
+        if (comment) reanchorComments(editor, [{ ...comment, resolved: false }]);
+      }
+    }
+    setResolved(workspacePath, activeTabPath, commentId, resolved);
+  }
+
+  async function handleAskAiOnComment(commentId: string) {
+    if (!activeTabPath) return;
+    if (!selectedModel) {
+      toast.error("No model selected — pick one in Settings or the Chat tab first.");
+      return;
+    }
+    const comment = activeComments.find((c) => c.id === commentId);
+    if (!comment) return;
+
+    setAiThinkingCommentId(commentId);
+    try {
+      const threadText = comment.messages.map((m) => `${m.author === "ai" ? "AI" : "User"}: ${m.text}`).join("\n");
+      const prompt = [
+        "You're weighing in on a comment left on part of a document. Be concise and specific — a sentence or two, not an essay.",
+        `The commented text: "${comment.anchorText}"`,
+        threadText ? `Discussion so far:\n${threadText}` : "No replies yet — the user just wants your take on this part of the text.",
+      ].join("\n\n");
+
+      let result = "";
+      for await (const chunk of streamChatForModel(selectedModel, [{ role: "user", content: prompt }])) {
+        result += chunk;
+      }
+      if (result.trim()) {
+        addMessage(workspacePath, activeTabPath, commentId, {
+          id: crypto.randomUUID(),
+          author: "ai",
+          text: result.trim(),
+          createdAt: Date.now(),
+        });
+      }
+    } catch (err) {
+      toast.error(`AI reply failed: ${(err as Error).message}`);
+    } finally {
+      setAiThinkingCommentId(null);
     }
   }
 
@@ -354,50 +531,28 @@ export function DocEditor() {
     void navigator.clipboard.writeText(getMarkdown(editor));
   }
 
-  async function exportDocx() {
-    if (!editor) return;
-    const nodes = editor.state.doc.content;
-    const children: Paragraph[] = [];
-
-    nodes.forEach((node) => {
-      if (node.type.name === "heading") {
-        const level = (node.attrs as { level: number }).level;
-        const text = node.textContent;
-        children.push(
-          new Paragraph({
-            text,
-            heading:
-              level === 1
-                ? HeadingLevel.HEADING_1
-                : level === 2
-                ? HeadingLevel.HEADING_2
-                : HeadingLevel.HEADING_3,
-          })
-        );
-      } else {
-        // paragraph / bullet / code block — treat as paragraph with runs
-        const runs: TextRun[] = [];
-        node.content.forEach((child) => {
-          const isBold = child.marks.some((m) => m.type.name === "bold");
-          const isItalic = child.marks.some((m) => m.type.name === "italic");
-          runs.push(new TextRun({ text: child.text ?? "", bold: isBold, italics: isItalic }));
-        });
-        if (runs.length > 0) {
-          children.push(new Paragraph({ children: runs }));
-        } else if (node.textContent) {
-          children.push(new Paragraph({ text: node.textContent }));
-        }
-      }
-    });
-
-    const doc = new Document({ sections: [{ children }] });
-    const blob = await Packer.toBlob(doc);
+  function downloadBlob(blob: Blob, filename: string) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = activeTabPath ? activeTabPath.replace(/\.md$/i, ".docx") : "document.docx";
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
+  }
+
+  async function exportDocx() {
+    if (!editor) return;
+    const blocks = docToBlocks(editor.state.doc);
+    const blob = await blocksToDocxBlob(blocks);
+    downloadBlob(blob, activeTabPath ? activeTabPath.replace(/\.md$/i, ".docx") : "document.docx");
+  }
+
+  function exportPdf() {
+    if (!editor) return;
+    const blocks = docToBlocks(editor.state.doc);
+    const title = activeTabPath ? activeTabPath.split("/").pop()?.replace(/\.md$/i, "") : undefined;
+    const blob = blocksToPdfBlob(blocks, title);
+    downloadBlob(blob, activeTabPath ? activeTabPath.replace(/\.md$/i, ".pdf") : "document.pdf");
   }
 
   if (!editor) return null;
@@ -545,6 +700,26 @@ export function DocEditor() {
             )}
           </div>
 
+          {/* Comments */}
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 text-xs px-2 gap-1"
+            onClick={() => handleAddComment()}
+            disabled={!activeTab}
+            title="Comment on the selected text"
+          >
+            <MessageSquarePlus className="size-3.5" />
+            Comment
+          </Button>
+          <ToolbarButton
+            active={commentsOpen}
+            onClick={() => setCommentsOpen((v) => !v)}
+            title={`Toggle comments panel${activeComments.filter((c) => !c.resolved).length > 0 ? ` (${activeComments.filter((c) => !c.resolved).length} open)` : ""}`}
+          >
+            <MessageSquare className="size-3.5" />
+          </ToolbarButton>
+
           <div className="flex-1" />
 
           {/* Save indicator */}
@@ -589,9 +764,20 @@ export function DocEditor() {
             <Download className="size-3" />
             .docx
           </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 text-xs px-2 gap-1"
+            onClick={exportPdf}
+            title="Download .pdf"
+            disabled={!activeTab}
+          >
+            <Download className="size-3" />
+            .pdf
+          </Button>
         </div>
 
-        {/* Editor content */}
+        {/* Editor content + floating margin comments */}
         <div className="flex-1 min-h-0 overflow-y-auto relative">
           {!activeTab && (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-center p-8 pointer-events-none">
@@ -606,10 +792,50 @@ export function DocEditor() {
               </div>
             </div>
           )}
-          <div className={cn("max-w-3xl mx-auto", !activeTab && "invisible")}>
-            <EditorContent editor={editor} />
+          <div ref={commentsRowRef} className={cn("flex justify-center gap-4 relative", !activeTab && "invisible")}>
+            <div className="max-w-3xl w-full" onContextMenu={handleEditorContextMenu}>
+              <EditorContent editor={editor} />
+            </div>
+            {pendingSuggestion && editor && (
+              <DocAiSuggestionCard
+                editor={editor}
+                containerRef={commentsRowRef}
+                suggestion={pendingSuggestion}
+                onAccept={acceptAiSuggestion}
+                onReject={rejectAiSuggestion}
+              />
+            )}
+            {commentsOpen && activeTab && editor && (
+              <DocFloatingComments
+                editor={editor}
+                containerRef={commentsRowRef}
+                comments={activeComments}
+                onResolve={handleSetResolved}
+                onDelete={handleDeleteComment}
+                onReply={(id, text) => { handleReplyToComment(id, text); setFocusCommentId(null); }}
+                onAskAi={(id) => void handleAskAiOnComment(id)}
+                onJumpTo={handleJumpToComment}
+                aiThinkingCommentId={aiThinkingCommentId}
+                focusCommentId={focusCommentId}
+              />
+            )}
           </div>
         </div>
+
+        {selectionMenu && editor && (
+          <DocSelectionMenu
+            x={selectionMenu.x}
+            y={selectionMenu.y}
+            onComment={() => handleAddComment({ from: selectionMenu.from, to: selectionMenu.to })}
+            onCustomPrompt={(instruction) => void runCustomAiPrompt(instruction, { from: selectionMenu.from, to: selectionMenu.to })}
+            presets={(Object.entries(AI_ACTION_LABELS) as [AiAction, string][]).map(([action, label]): PresetAction => ({
+              key: action,
+              label,
+              onClick: () => void runAiAction(action, { from: selectionMenu.from, to: selectionMenu.to }),
+            }))}
+            onClose={() => setSelectionMenu(null)}
+          />
+        )}
       </div>
     </div>
   );

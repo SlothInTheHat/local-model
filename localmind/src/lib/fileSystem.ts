@@ -117,7 +117,10 @@ export async function readFileFromHandle(
 export async function writeFileToHandle(
   dirHandle: FileSystemDirectoryHandle,
   path: string,
-  content: string
+  // Blob (which File extends) lets callers write a dropped/picked OS file's
+  // exact bytes straight through — createWritable().write() natively accepts
+  // Blob, so no text-vs-binary detection is needed on the caller's side.
+  content: string | Blob
 ): Promise<void> {
   const parts = path.split("/").filter(Boolean);
   const fileName = parts.pop();

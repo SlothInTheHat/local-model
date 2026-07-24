@@ -383,6 +383,9 @@ use transcribe::{transcribe_video, transcribe_audio_base64};
 mod pdf;
 use pdf::{pdf_merge, pdf_to_text};
 
+mod piper;
+use piper::{piper_status, piper_setup, piper_download_voice, piper_speak};
+
 mod db;
 use db::{
     memory_upsert, memory_all, memory_delete, memory_touch, memory_delete_by_doc,
@@ -1582,6 +1585,10 @@ pub fn run() {
             image_convert,
             pdf_merge,
             pdf_to_text,
+            piper_status,
+            piper_setup,
+            piper_download_voice,
+            piper_speak,
             open_upload_dialog,
             read_upload_bytes,
             memory_upsert,

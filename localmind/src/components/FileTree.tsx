@@ -27,6 +27,42 @@ interface PendingCreate {
   kind: "file" | "directory";
 }
 
+/**
+ * Writes OS files dragged from outside the app into the given workspace
+ * folder (empty targetPath = workspace root). Each dropped File is a Blob,
+ * so writeFileToHandle takes it directly — no text/binary detection needed,
+ * exact bytes are preserved either way (images, PDFs, etc. work same as .ts/.md).
+ */
+async function dropFilesInto(
+  dirHandle: FileSystemDirectoryHandle,
+  targetPath: string,
+  dataTransfer: DataTransfer,
+  onDone: () => void
+): Promise<void> {
+  const files = Array.from(dataTransfer.files);
+  if (files.length === 0) return;
+
+  let succeeded = 0;
+  const failures: string[] = [];
+  for (const file of files) {
+    const destPath = targetPath ? `${targetPath}/${file.name}` : file.name;
+    try {
+      await writeFileToHandle(dirHandle, destPath, file);
+      succeeded++;
+    } catch (err) {
+      failures.push(`${file.name}: ${(err as Error).message}`);
+    }
+  }
+
+  if (succeeded > 0) {
+    toast.success(`Added ${succeeded} file${succeeded !== 1 ? "s" : ""}${targetPath ? ` to ${targetPath}` : ""}`);
+  }
+  if (failures.length > 0) {
+    toast.error(`Failed to add ${failures.length} file${failures.length !== 1 ? "s" : ""}: ${failures.join("; ")}`);
+  }
+  onDone();
+}
+
 // ─── Inline create input ──────────────────────────────────────────────────────
 
 function InlineCreateInput({
@@ -113,8 +149,11 @@ function TreeNode({
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(entry.name);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [isDragOver, setIsDragOver] = useState(false);
   const renameInputRef = useRef<HTMLInputElement>(null);
   const paddingLeft = depth * 12 + 8;
+
+  const canReceiveDrop = entry.kind === "directory";
 
   // Auto-expand when a create is pending inside this folder
   useEffect(() => {
@@ -193,8 +232,31 @@ function TreeNode({
     <div>
       {/* Row */}
       <div
-        className="group relative flex items-center"
+        className={cn(
+          "group relative flex items-center",
+          isDragOver && "bg-accent ring-1 ring-ring rounded"
+        )}
         onMouseLeave={() => setConfirmDelete(false)}
+        onDragOver={(e) => {
+          if (!canReceiveDrop) return;
+          e.preventDefault();
+          e.stopPropagation();
+          e.dataTransfer.dropEffect = "copy";
+          setIsDragOver(true);
+        }}
+        onDragLeave={(e) => {
+          if (!canReceiveDrop) return;
+          e.stopPropagation();
+          setIsDragOver(false);
+        }}
+        onDrop={(e) => {
+          if (!canReceiveDrop) return;
+          e.preventDefault();
+          e.stopPropagation();
+          setIsDragOver(false);
+          setExpanded(true);
+          void dropFilesInto(dirHandle, entry.path, e.dataTransfer, onRefresh);
+        }}
       >
         <button
           type="button"
@@ -324,6 +386,7 @@ export function FileTree({ dirHandle, onOpenFile, onOpenDir, refreshKey, onRefre
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingCreate, setPendingCreate] = useState<PendingCreate | null>(null);
+  const [isRootDragOver, setIsRootDragOver] = useState(false);
 
   const refresh = useCallback(() => {
     if (!dirHandle) { setEntries([]); return; }
@@ -359,7 +422,20 @@ export function FileTree({ dirHandle, onOpenFile, onOpenDir, refreshKey, onRefre
   }
 
   return (
-    <div className="h-full overflow-y-auto">
+    <div
+      className={cn("h-full overflow-y-auto", isRootDragOver && "bg-accent/40")}
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "copy";
+        setIsRootDragOver(true);
+      }}
+      onDragLeave={() => setIsRootDragOver(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        setIsRootDragOver(false);
+        void dropFilesInto(dirHandle, "", e.dataTransfer, handleMutationDone);
+      }}
+    >
       {/* Header */}
       <div className="px-2 py-2 border-b flex items-center gap-1">
         <FolderOpen className="size-3.5 text-amber-500 shrink-0" />
