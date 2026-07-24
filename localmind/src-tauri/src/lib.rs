@@ -273,9 +273,20 @@ fn ensure_ollama_running() {
         .stderr(std::process::Stdio::null())
         .spawn();
 
-    if let Ok(child) = result {
-        if let Ok(mut guard) = lock.lock() {
-            *guard = Some(child);
+    match result {
+        Ok(child) => {
+            if let Ok(mut guard) = lock.lock() {
+                *guard = Some(child);
+            }
+        }
+        Err(e) => {
+            // Previously silent — a user with Ollama installed but not resolvable
+            // on PATH (even after effective_path()'s fallback) got no signal at
+            // all beyond the frontend's generic "is it installed?" after ~22s of
+            // retries. At minimum this is now visible in the dev console; the
+            // frontend's error message doesn't yet distinguish "not installed"
+            // from "installed but not found on PATH" — see initOllama in App.tsx.
+            eprintln!("[ollama] Failed to spawn 'ollama serve': {e}");
         }
     }
 }
@@ -313,6 +324,13 @@ pub(crate) fn effective_path() -> &'static str {
             // 2. Fallback: prepend well-known tool locations that exist on disk.
             let username = std::env::var("USERNAME").unwrap_or_default();
             let candidates = vec![
+                // Ollama's default Windows install location. Its installer normally
+                // adds this to the User PATH itself (so step 1 above usually already
+                // catches it), but that registry write can be missed (installed
+                // before login, PATH read failing/timing out, etc.) — when that
+                // happens ensure_ollama_running()'s spawn("ollama") silently fails
+                // with no fallback, which is exactly the bug this candidate closes.
+                format!(r"C:\Users\{username}\AppData\Local\Programs\Ollama"),
                 r"C:\Program Files\Git\cmd".to_string(),
                 r"C:\Program Files\Git\bin".to_string(),
                 r"C:\Program Files\nodejs".to_string(),
