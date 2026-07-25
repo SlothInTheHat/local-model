@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Cpu, MemoryStick, Monitor, Zap, RefreshCw, AlertCircle, CheckCircle2, PowerOff } from "lucide-react";
+import { Cpu, MemoryStick, Monitor, Zap, RefreshCw, AlertCircle, CheckCircle2, PowerOff, Copy, ChevronDown, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "./ui/button";
 import { Card, CardContent } from "./ui/card";
@@ -30,6 +30,8 @@ export function HardwareSummary() {
   const [runningModels, setRunningModels] = useState<RunningModel[] | null>(null);
   const [restarting, setRestarting] = useState(false);
   const [checkingGpu, setCheckingGpu] = useState(false);
+  const [ollamaLog, setOllamaLog] = useState<string[] | null>(null);
+  const [showOllamaLog, setShowOllamaLog] = useState(false);
   const selectedModel = useModelSelectionStore((s) => s.selectedModel);
 
   async function scan() {
@@ -69,6 +71,14 @@ export function HardwareSummary() {
     return () => { cancelled = true; clearInterval(id); };
   }, []);
 
+  async function fetchOllamaLog() {
+    try {
+      setOllamaLog(await tauriInvoke<string[]>("get_ollama_log"));
+    } catch {
+      setOllamaLog([]);
+    }
+  }
+
   async function handleRestartOllama() {
     setRestarting(true);
     try {
@@ -77,9 +87,21 @@ export function HardwareSummary() {
       setRunningModels(null);
     } catch (err) {
       toast.error((err as Error).message ?? "Failed to restart Ollama");
+      // Auto-reveal the real stdout/stderr from the launch attempt — a
+      // generic failure toast alone doesn't say WHY (ollama not found on
+      // PATH at all vs. found but crashed immediately vs. something else
+      // already bound to the port), and there's no dev console in a
+      // packaged build to see it otherwise.
+      await fetchOllamaLog();
+      setShowOllamaLog(true);
     } finally {
       setRestarting(false);
     }
+  }
+
+  function copyOllamaLog() {
+    void navigator.clipboard.writeText((ollamaLog ?? []).join("\n") || "(empty — Ollama has not been launched by LocalMind this session)");
+    toast.success("Ollama log copied");
   }
 
   // "Check GPU now": /api/ps only reports something while a model is
@@ -251,8 +273,44 @@ export function HardwareSummary() {
             <RefreshCw className={`size-3 ${restarting ? "animate-spin" : ""}`} />
             {restarting ? "Restarting…" : "Restart Ollama"}
           </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              const next = !showOllamaLog;
+              setShowOllamaLog(next);
+              if (next) void fetchOllamaLog();
+            }}
+            className="gap-1 h-7 text-xs px-2"
+            title="See Ollama's actual startup output — useful when it won't launch and the reason isn't obvious"
+          >
+            {showOllamaLog ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
+            Log
+          </Button>
         </div>
       </div>
+
+      {/* Raw stdout/stderr from every `ollama serve` launch attempt this
+          session — the only way to see WHY it won't start (not found on
+          PATH vs. found but crashed vs. port already taken by something
+          else) since a packaged build has no dev console. */}
+      {showOllamaLog && (
+        <div className="rounded-lg border border-border bg-muted/10 p-2 space-y-1.5">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] text-muted-foreground">Ollama launch log (this session)</span>
+            <Button size="sm" variant="ghost" className="h-6 text-[10px] gap-1" onClick={copyOllamaLog}>
+              <Copy className="size-2.5" /> Copy
+            </Button>
+          </div>
+          <pre className="text-[10px] font-mono text-muted-foreground/90 max-h-40 overflow-y-auto whitespace-pre-wrap">
+            {ollamaLog === null
+              ? "Loading…"
+              : ollamaLog.length === 0
+                ? "(empty — LocalMind hasn't attempted to launch Ollama this session, e.g. it was already running)"
+                : ollamaLog.join("\n")}
+          </pre>
+        </div>
+      )}
 
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-1.5 text-xs text-muted-foreground">

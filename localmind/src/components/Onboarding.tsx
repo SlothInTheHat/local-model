@@ -84,6 +84,7 @@ export function Onboarding({ ollamaError }: Props) {
                   Ollama
                 </a>{" "}
                 — install and start it, then come back here. You can still look around in the meantime.
+                If Ollama is already installed and this still won't go away, open the Models tab and click "Log" next to Restart Ollama to see the actual error.
               </span>
             </div>
           )}

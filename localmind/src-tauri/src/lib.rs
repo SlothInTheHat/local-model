@@ -241,6 +241,54 @@ fn fs_copy(from: String, to: String) -> Result<(), String> {
 /// Holds the Child handle if *we* spawned Ollama. None means it was already running.
 static OLLAMA_CHILD: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new();
 
+/// Recent stdout/stderr lines from every `ollama serve` spawn attempt this
+/// session, plus spawn-failure messages — capped FIFO so a long-running
+/// session with repeated watchdog retries can't grow this unbounded.
+///
+/// Previously `ollama serve`'s output went straight to `Stdio::null()` and
+/// spawn errors only reached `eprintln!` — both invisible to anyone running
+/// the packaged app (no dev console). A user reported Ollama still not
+/// detected after installing it, even after this app's own PATH-resolution
+/// fix, with no way for either of us to tell whether `ollama` couldn't be
+/// found on PATH at all, was found but crashed immediately (e.g. a custom
+/// OLLAMA_MODELS directory it can't write to), or something else entirely
+/// was already bound to port 11434. This buffer is what `get_ollama_log`
+/// exposes to the UI so that's diagnosable without a terminal.
+static OLLAMA_LOG: OnceLock<Mutex<std::collections::VecDeque<String>>> = OnceLock::new();
+const OLLAMA_LOG_CAP: usize = 50;
+
+fn push_ollama_log(line: String) {
+    let log = OLLAMA_LOG.get_or_init(|| Mutex::new(std::collections::VecDeque::new()));
+    if let Ok(mut guard) = log.lock() {
+        guard.push_back(line);
+        while guard.len() > OLLAMA_LOG_CAP {
+            guard.pop_front();
+        }
+    }
+}
+
+/// Spawns a thread that reads `reader` line-by-line into `OLLAMA_LOG`, tagged
+/// with `stream` ("stdout"/"stderr") — used for both stdout and stderr pipes
+/// of a freshly-spawned `ollama serve` so real startup errors (port already
+/// in use, can't create/write OLLAMA_MODELS, etc.) become visible instead of
+/// vanishing into `Stdio::null()`.
+fn pump_ollama_output<R: std::io::Read + Send + 'static>(reader: R, stream: &'static str) {
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(reader).lines().map_while(Result::ok) {
+            push_ollama_log(format!("[{stream}] {line}"));
+        }
+    });
+}
+
+#[tauri::command]
+fn get_ollama_log() -> Vec<String> {
+    match OLLAMA_LOG.get() {
+        Some(log) => log.lock().map(|g| g.iter().cloned().collect()).unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
 fn is_ollama_running() -> bool {
     use std::net::TcpStream;
     use std::time::Duration;
@@ -263,22 +311,30 @@ fn ensure_ollama_running() {
     // user installs Ollama needs to see that install immediately rather than
     // reusing whatever PATH was cached at LocalMind's own first startup.
     #[cfg(target_os = "windows")]
+    let path_used = compute_effective_path();
+    #[cfg(target_os = "windows")]
     let result = std::process::Command::new("ollama")
         .arg("serve")
-        .env("PATH", compute_effective_path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .env("PATH", &path_used)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn();
 
     #[cfg(not(target_os = "windows"))]
     let result = std::process::Command::new("ollama")
         .arg("serve")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn();
 
     match result {
-        Ok(child) => {
+        Ok(mut child) => {
+            if let Some(out) = child.stdout.take() {
+                pump_ollama_output(out, "stdout");
+            }
+            if let Some(err) = child.stderr.take() {
+                pump_ollama_output(err, "stderr");
+            }
             if let Ok(mut guard) = lock.lock() {
                 *guard = Some(child);
             }
@@ -287,10 +343,13 @@ fn ensure_ollama_running() {
             // Previously silent — a user with Ollama installed but not resolvable
             // on PATH (even after effective_path()'s fallback) got no signal at
             // all beyond the frontend's generic "is it installed?" after ~22s of
-            // retries. At minimum this is now visible in the dev console; the
-            // frontend's error message doesn't yet distinguish "not installed"
-            // from "installed but not found on PATH" — see initOllama in App.tsx.
+            // retries. Now visible via get_ollama_log() from the UI, not just
+            // the dev console.
             eprintln!("[ollama] Failed to spawn 'ollama serve': {e}");
+            #[cfg(target_os = "windows")]
+            push_ollama_log(format!("[spawn] Failed to launch 'ollama serve': {e} (PATH used: {path_used})"));
+            #[cfg(not(target_os = "windows"))]
+            push_ollama_log(format!("[spawn] Failed to launch 'ollama serve': {e}"));
         }
     }
 }
@@ -1767,6 +1826,7 @@ pub fn run() {
             list_processes,
             kill_process,
             restart_ollama,
+            get_ollama_log,
             get_disk_usage,
             empty_recycle_bin,
             adjust_volume,
