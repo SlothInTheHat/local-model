@@ -286,7 +286,14 @@ function ProvidersSection() {
             {p.enabled && (
               <>
                 {/* API key */}
-                <Field label="API Key" hint={p.id === "llamacpp" ? "Leave empty for local llama.cpp server (no auth needed)." : undefined}>
+                <Field
+                  label="API Key"
+                  hint={
+                    p.id === "llamacpp"
+                      ? "Leave empty — llama.cpp's own server has no auth. This is NOT the reason it fails to connect: you must separately install and run llama.cpp's server (llama-server) yourself at the address above — LocalMind doesn't install, bundle, or launch it the way it does for Ollama."
+                      : undefined
+                  }
+                >
                   <div className="relative">
                     <input
                       type={showKeys[p.id] ? "text" : "password"}

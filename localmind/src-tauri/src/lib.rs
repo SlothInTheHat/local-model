@@ -258,10 +258,14 @@ fn ensure_ollama_running() {
         return; // already up — user-managed instance, leave it alone
     }
 
+    // Uncached, resolved fresh on every call (not the cached effective_path())
+    // — this only runs while Ollama is confirmed down, so a retry after the
+    // user installs Ollama needs to see that install immediately rather than
+    // reusing whatever PATH was cached at LocalMind's own first startup.
     #[cfg(target_os = "windows")]
     let result = std::process::Command::new("ollama")
         .arg("serve")
-        .env("PATH", effective_path())
+        .env("PATH", compute_effective_path())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
@@ -350,11 +354,19 @@ static EFFECTIVE_PATH: OnceLock<String> = OnceLock::new();
 
 /// Build a PATH that merges system PATH with the user PATH (HKCU\Environment).
 /// On Windows, desktop apps launched outside a terminal only see system PATH,
-/// so git/node/python installed by the user are invisible. We call PowerShell
-/// once, cache the result, and inject it into every spawned command.
-pub(crate) fn effective_path() -> &'static str {
-    EFFECTIVE_PATH.get_or_init(|| {
-        let base = std::env::var("PATH").unwrap_or_default();
+/// so git/node/python installed by the user are invisible.
+///
+/// Split from `effective_path()` below so Ollama-detection retries (which
+/// only fire while Ollama is confirmed down — see `ensure_ollama_running`)
+/// can call this UNCACHED, fresh, every time. Confirmed real-world failure
+/// this fixes: `effective_path()`'s cache is populated once, at LocalMind's
+/// own first startup — if Ollama gets installed (or its installer's PATH
+/// write lands) any time after that first check, every later retry
+/// (watchdog every ~30s, or the manual "Restart Ollama" button) kept
+/// reusing the stale pre-install PATH forever, so the only fix was fully
+/// quitting and relaunching LocalMind — never surfaced to the user anywhere.
+fn compute_effective_path() -> String {
+    let base = std::env::var("PATH").unwrap_or_default();
 
         #[cfg(target_os = "windows")]
         {
@@ -423,8 +435,15 @@ pub(crate) fn effective_path() -> &'static str {
             }
         }
 
-        base
-    })
+    base
+}
+
+/// Cached wrapper around `compute_effective_path()` for frequent callers
+/// (e.g. `run_command`) where a fresh PowerShell subprocess on every call
+/// would be wasteful. Ollama-detection retries deliberately bypass this
+/// cache — see `compute_effective_path`'s doc comment.
+pub(crate) fn effective_path() -> &'static str {
+    EFFECTIVE_PATH.get_or_init(compute_effective_path)
 }
 
 mod mcp;
