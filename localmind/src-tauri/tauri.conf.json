@@ -64,6 +64,10 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
+    ],
+    "resources": [
+      "resources/transcribe/dist/transcribe_tool/**/*",
+      "resources/transcribe/ffmpeg/ffmpeg.exe"
     ]
   }
 }

@@ -202,6 +202,51 @@ with `LOCALMIND_IPC_URL` (e.g. for testing against a different port).
    a relayed answer. Then stop the desktop app and send another message —
    confirm you get a plain "LocalMind isn't running" reply, not a crash.
 
+## Building the bundled pipeline (for LocalMind's packaged installer)
+
+This section is unrelated to the Telegram bot above — it's for
+`src-tauri/src/transcribe.rs`'s `transcribe_video`/`transcribe_audio_base64`
+Tauri commands, which reuse `transcribe_cli.py`/`whisper_daemon.py` from this
+folder. In dev (`npm run tauri dev`), those commands just run this venv's
+Python directly — the steps below are only needed to produce the
+self-contained binaries that ship *inside* a packaged LocalMind installer
+(`npm run tauri build`), since end users have neither this venv nor
+necessarily ffmpeg installed.
+
+1. **Install PyInstaller into this venv** (one-time):
+   ```powershell
+   .venv\Scripts\python.exe -m pip install pyinstaller
+   ```
+2. **Build the combined CLI+daemon executable.** `transcribe_tool.py` wraps
+   both `transcribe_cli.py` and `whisper_daemon.py` behind one entry point
+   (`transcribe_tool.exe cli <path>` / `transcribe_tool.exe daemon`) so
+   ctranslate2/faster-whisper's ~230MB of native libs ship once instead of
+   twice:
+   ```powershell
+   .venv\Scripts\python.exe -m PyInstaller --onedir --noconfirm --name transcribe_tool `
+     --hidden-import transcribe_cli --hidden-import whisper_daemon `
+     --distpath ..\src-tauri\resources\transcribe\dist --workpath build\pyi-work --specpath build `
+     transcribe_tool.py
+   ```
+   Output lands at `src-tauri/resources/transcribe/dist/transcribe_tool/` —
+   gitignored (regenerate, don't commit).
+3. **Vendor a static ffmpeg.exe** into `src-tauri/resources/transcribe/ffmpeg/`
+   — a Windows "essentials" build from <https://www.gyan.dev/ffmpeg/builds/>
+   works (only `ffmpeg.exe` is needed, not `ffprobe`/`ffplay`). Also
+   gitignored.
+4. `npm run tauri build` (from the repo root) picks both up automatically via
+   `tauri.conf.json`'s `bundle.resources` and copies them into the packaged
+   app's resource directory. `transcribe.rs` checks there first, falling
+   back to this venv only if the bundled resources aren't present (i.e. a
+   dev checkout that hasn't run the steps above).
+
+Sanity-check the built executable directly before trusting a full app build
+(needs *some* ffmpeg on PATH for this specific manual check — the packaged
+app itself doesn't, since it uses the bundled one):
+```powershell
+resources\transcribe\dist\transcribe_tool\transcribe_tool.exe cli path\to\some.wav
+```
+
 ## Notes / limitations
 
 - Only the chat ID in `ALLOWED_CHAT_ID` can use the bot — this check is

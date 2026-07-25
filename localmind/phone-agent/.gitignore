@@ -3,3 +3,8 @@
 phone_agent.db
 *.log
 __pycache__/
+
+# PyInstaller work dir + spec file (see README's "Building the bundled
+# pipeline" section) — output goes to ../src-tauri/resources/transcribe/,
+# gitignored separately there.
+/build/

@@ -1,9 +1,24 @@
 //! Video/audio transcription for the desktop agent's `transcribe_video` tool.
 //!
-//! Locates the phone-agent Python pipeline (phone-agent/.venv + transcribe_cli.py)
-//! by walking up from the app's working/exe directory, then runs it on a video
-//! file and returns the transcript. Transcription is CPU-heavy (seconds to
-//! minutes), so the blocking work runs on a spawn_blocking thread.
+//! Two ways this pipeline can be found, checked in order:
+//!   1. **Bundled** (packaged installer): a single `transcribe_tool.exe` —
+//!      built by PyInstaller from `phone-agent/transcribe_tool.py`, which
+//!      wraps both `transcribe_cli.py` and `whisper_daemon.py` in one binary
+//!      so ctranslate2/faster-whisper's ~230MB of native libs ship once, not
+//!      twice — plus a bundled `ffmpeg.exe`, both under Tauri's resource dir
+//!      (see `tauri.conf.json`'s `bundle.resources` and
+//!      `phone-agent/README.md`'s "Building the bundled pipeline" section
+//!      for how these get produced). This is what a real end user's install
+//!      actually has; earlier versions of this app had NO equivalent at all,
+//!      so a packaged build silently could never transcribe anything.
+//!   2. **Dev** (`npm run tauri dev`, resources not built yet): the raw
+//!      `phone-agent/.venv` + `transcribe_cli.py`/`whisper_daemon.py`,
+//!      located by walking up from the app's working/exe directory — the
+//!      original mechanism, unchanged, so a normal dev checkout keeps
+//!      working without anyone needing to run the PyInstaller build step.
+//!
+//! Transcription is CPU-heavy (seconds to minutes), so the blocking work
+//! runs on a spawn_blocking thread.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -11,9 +26,33 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+use tauri::Manager;
 
-/// Find (venv_python, transcribe_cli.py) by walking up from anchor dirs.
-fn locate_pipeline() -> Option<(PathBuf, PathBuf)> {
+/// How to actually invoke the pipeline — resolved once per call by
+/// `locate_pipeline`, then turned into a `Command` for either "cli" or
+/// "daemon" mode by `pipeline_command`.
+enum Pipeline {
+    Bundled { exe: PathBuf, ffmpeg_dir: PathBuf },
+    Dev { python: PathBuf, script_dir: PathBuf },
+}
+
+/// Bundled resource paths, relative to Tauri's resource_dir(), matching
+/// `tauri.conf.json`'s `bundle.resources` globs exactly.
+fn bundled_exe_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let dir = app.path().resource_dir().ok()?;
+    let exe = dir.join("resources/transcribe/dist/transcribe_tool/transcribe_tool.exe");
+    exe.exists().then_some(exe)
+}
+
+fn bundled_ffmpeg_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let dir = app.path().resource_dir().ok()?;
+    let ffmpeg_dir = dir.join("resources/transcribe/ffmpeg");
+    ffmpeg_dir.join("ffmpeg.exe").exists().then_some(ffmpeg_dir)
+}
+
+/// Dev fallback: find (venv_python, phone-agent dir) by walking up from
+/// anchor dirs — unchanged from before the bundled path existed.
+fn locate_dev_pipeline() -> Option<(PathBuf, PathBuf)> {
     #[cfg(target_os = "windows")]
     let py_rel = Path::new("phone-agent/.venv/Scripts/python.exe");
     #[cfg(not(target_os = "windows"))]
@@ -37,7 +76,7 @@ fn locate_pipeline() -> Option<(PathBuf, PathBuf)> {
             let py = d.join(py_rel);
             let script = d.join(script_rel);
             if py.exists() && script.exists() {
-                return Some((py, script));
+                return Some((py, d.join("phone-agent")));
             }
             dir = d.parent();
         }
@@ -45,22 +84,68 @@ fn locate_pipeline() -> Option<(PathBuf, PathBuf)> {
     None
 }
 
-fn transcribe_blocking(video_path: String, whisper_model: Option<String>) -> Result<String, String> {
+fn locate_pipeline(app: &tauri::AppHandle) -> Option<Pipeline> {
+    if let (Some(exe), Some(ffmpeg_dir)) = (bundled_exe_path(app), bundled_ffmpeg_dir(app)) {
+        return Some(Pipeline::Bundled { exe, ffmpeg_dir });
+    }
+    let (python, script_dir) = locate_dev_pipeline()?;
+    Some(Pipeline::Dev { python, script_dir })
+}
+
+/// PATH to inject into a spawned pipeline process: bundled mode prepends the
+/// bundled ffmpeg's own directory (so it's found even if the user has no
+/// ffmpeg installed at all — the whole point of bundling it); dev mode uses
+/// the same PATH-augmentation the rest of this app relies on, unchanged.
+fn pipeline_path_env(pipeline: &Pipeline) -> String {
+    match pipeline {
+        Pipeline::Bundled { ffmpeg_dir, .. } => {
+            format!("{};{}", ffmpeg_dir.display(), crate::effective_path())
+        }
+        Pipeline::Dev { .. } => crate::effective_path().to_string(),
+    }
+}
+
+/// Build the `Command` for one pipeline invocation. `mode` is "cli" or
+/// "daemon"; `cli_arg` is the video path/URL for "cli" mode (ignored for
+/// "daemon", which takes no positional arg — it reads requests from stdin).
+fn pipeline_command(pipeline: &Pipeline, mode: &str, cli_arg: Option<&str>) -> Command {
+    let mut cmd = match pipeline {
+        Pipeline::Bundled { exe, .. } => {
+            let mut c = Command::new(exe);
+            c.arg(mode);
+            c
+        }
+        Pipeline::Dev { python, script_dir } => {
+            let script = if mode == "cli" { "transcribe_cli.py" } else { "whisper_daemon.py" };
+            let mut c = Command::new(python);
+            c.arg(script_dir.join(script));
+            c
+        }
+    };
+    if let Some(arg) = cli_arg {
+        cmd.arg(arg);
+    }
+    cmd.env("PATH", pipeline_path_env(pipeline));
+    cmd
+}
+
+fn transcribe_blocking(
+    app: &tauri::AppHandle,
+    video_path: String,
+    whisper_model: Option<String>,
+) -> Result<String, String> {
     let is_url = video_path.starts_with("http://") || video_path.starts_with("https://");
     if !is_url && !Path::new(&video_path).exists() {
         return Err(format!("Video file not found: {video_path}"));
     }
 
-    let (python, script) = locate_pipeline().ok_or_else(|| {
-        "Transcription pipeline not found. It requires the phone-agent Python setup \
-         (phone-agent/.venv and transcribe_cli.py) — see phone-agent/README.md."
+    let pipeline = locate_pipeline(app).ok_or_else(|| {
+        "Transcription pipeline not found. This should always be present in a packaged \
+         LocalMind install — if you're running from source, see phone-agent/README.md."
             .to_string()
     })?;
 
-    let mut cmd = Command::new(&python);
-    cmd.arg(&script)
-        .arg(&video_path)
-        .env("PATH", crate::effective_path()); // so ffmpeg is on PATH
+    let mut cmd = pipeline_command(&pipeline, "cli", Some(&video_path));
     if let Some(model) = whisper_model {
         if !model.trim().is_empty() {
             cmd.env("LOCALMIND_WHISPER_MODEL", model.trim());
@@ -85,10 +170,11 @@ fn transcribe_blocking(video_path: String, whisper_model: Option<String>) -> Res
 
 #[tauri::command]
 pub async fn transcribe_video(
+    app: tauri::AppHandle,
     video_path: String,
     whisper_model: Option<String>,
 ) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || transcribe_blocking(video_path, whisper_model))
+    tokio::task::spawn_blocking(move || transcribe_blocking(&app, video_path, whisper_model))
         .await
         .map_err(|e| format!("Transcription task panicked: {e}"))?
 }
@@ -97,13 +183,13 @@ pub async fn transcribe_video(
 //
 // `transcribe_blocking` above pays the cost of loading the whisper model on
 // every call (~2.5s measured on this machine, of a ~4.5s total dictation
-// round trip) because transcribe_cli.py starts a fresh Python process each
-// time. For dictation specifically — short clips, called repeatedly, latency-
-// sensitive — we instead keep a long-lived `phone-agent/whisper_daemon.py`
-// process around with the model already resident, and talk to it over a
-// line-delimited JSON stdin/stdout protocol. `transcribe_video` is untouched:
-// video files can be long, and this daemon is single-threaded by design, so
-// routing video through it would block dictation behind a long transcription.
+// round trip) because the pipeline starts a fresh process each time. For
+// dictation specifically — short clips, called repeatedly, latency-sensitive
+// — we instead keep a long-lived daemon process around with the model
+// already resident, and talk to it over a line-delimited JSON stdin/stdout
+// protocol. `transcribe_video` is untouched: video files can be long, and
+// this daemon is single-threaded by design, so routing video through it
+// would block dictation behind a long transcription.
 
 /// Generous but bounded: a long clip on `tiny`/`base` CPU is a few seconds,
 /// and the first call after (re)spawn also pays model load (~1.6s measured).
@@ -140,31 +226,8 @@ fn daemon_slot() -> &'static Mutex<Option<DaemonHandle>> {
     DAEMON.get_or_init(|| Mutex::new(None))
 }
 
-/// Locate `phone-agent/whisper_daemon.py`, reusing `locate_pipeline`'s
-/// venv/anchor-walking logic so the discovery rules stay in one place. The
-/// daemon script is a sibling of transcribe_cli.py.
-fn locate_daemon_script() -> Result<(PathBuf, PathBuf), String> {
-    let (python, cli_script) = locate_pipeline().ok_or_else(|| {
-        "Transcription pipeline not found (phone-agent/.venv + transcribe_cli.py missing)"
-            .to_string()
-    })?;
-    let daemon_script = cli_script
-        .parent()
-        .ok_or_else(|| "Could not resolve phone-agent directory".to_string())?
-        .join("whisper_daemon.py");
-    if !daemon_script.exists() {
-        return Err(format!(
-            "whisper_daemon.py not found at {}",
-            daemon_script.display()
-        ));
-    }
-    Ok((python, daemon_script))
-}
-
-fn spawn_daemon(python: &Path, daemon_script: &Path) -> Result<DaemonHandle, String> {
-    let mut child = Command::new(python)
-        .arg(daemon_script)
-        .env("PATH", crate::effective_path())
+fn spawn_daemon(pipeline: &Pipeline) -> Result<DaemonHandle, String> {
+    let mut child = pipeline_command(pipeline, "daemon", None)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -268,13 +331,15 @@ fn send_request(handle: &mut DaemonHandle, audio_path: &str, model: &str) -> Res
 /// failure kill the wedged/dead daemon and retry once with a fresh one
 /// (never in a loop — a second failure is surfaced to the caller, which
 /// falls back to the one-shot pipeline).
-fn daemon_transcribe(audio_path: &str, model: &str) -> Result<String, String> {
-    let (python, daemon_script) = locate_daemon_script()?;
+fn daemon_transcribe(app: &tauri::AppHandle, audio_path: &str, model: &str) -> Result<String, String> {
+    let pipeline = locate_pipeline(app).ok_or_else(|| {
+        "Transcription pipeline not found".to_string()
+    })?;
 
     let mut guard = daemon_slot().lock().unwrap_or_else(|e| e.into_inner());
 
     if guard.is_none() {
-        *guard = Some(spawn_daemon(&python, &daemon_script)?);
+        *guard = Some(spawn_daemon(&pipeline)?);
     }
 
     let first_attempt = send_request(guard.as_mut().expect("daemon just ensured"), audio_path, model);
@@ -285,7 +350,7 @@ fn daemon_transcribe(audio_path: &str, model: &str) -> Result<String, String> {
     eprintln!("[whisper_daemon] request failed, respawning once: {first_err}");
     kill_daemon(&mut guard);
 
-    let handle = spawn_daemon(&python, &daemon_script)?;
+    let handle = spawn_daemon(&pipeline)?;
     *guard = Some(handle);
     let retry = send_request(guard.as_mut().expect("daemon just respawned"), audio_path, model);
     if retry.is_err() {
@@ -334,6 +399,7 @@ impl Drop for TempFileGuard {
 }
 
 fn transcribe_audio_base64_blocking(
+    app: &tauri::AppHandle,
     audio_base64: String,
     mime_ext: String,
     whisper_model: Option<String>,
@@ -368,7 +434,7 @@ fn transcribe_audio_base64_blocking(
     // wedged twice — fall back to the existing one-shot pipeline rather than
     // failing the dictation outright: working slowly beats not working.
     let model = resolve_model(&whisper_model);
-    match daemon_transcribe(&path_str, &model) {
+    match daemon_transcribe(app, &path_str, &model) {
         Ok(text) => {
             if text.is_empty() {
                 Err("Transcription produced no text (the clip may contain no speech).".to_string())
@@ -380,7 +446,7 @@ fn transcribe_audio_base64_blocking(
             eprintln!(
                 "[dictation] warm daemon unavailable ({daemon_err}); falling back to one-shot transcription"
             );
-            transcribe_blocking(path_str, whisper_model)
+            transcribe_blocking(app, path_str, whisper_model)
         }
     }
 }
@@ -391,12 +457,13 @@ fn transcribe_audio_base64_blocking(
 /// short dictation clips).
 #[tauri::command]
 pub async fn transcribe_audio_base64(
+    app: tauri::AppHandle,
     audio_base64: String,
     mime_ext: String,
     whisper_model: Option<String>,
 ) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
-        transcribe_audio_base64_blocking(audio_base64, mime_ext, whisper_model)
+        transcribe_audio_base64_blocking(&app, audio_base64, mime_ext, whisper_model)
     })
     .await
     .map_err(|e| format!("Transcription task panicked: {e}"))?
