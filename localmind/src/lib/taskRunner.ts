@@ -8,6 +8,7 @@ import { useSettingsStore } from "../store/settings";
 import { runHeadlessTask } from "./headlessRunner";
 import { notifyOs } from "./osNotify";
 import { isGenerationBusy, generationGateState } from "./generationGate";
+import { getUnattendedBrowserTools } from "../store/mcp";
 
 /**
  * Tools auto-approved for unattended task-queue runs.
@@ -25,6 +26,16 @@ import { isGenerationBusy, generationGateState } from "./generationGate";
  * Anything requiring approval that isn't in this list is auto-DENIED by
  * runHeadlessTask, not skipped — the agent sees the denial and can route
  * around it (e.g. explain in its summary that it couldn't run tests).
+ *
+ * run_workflow is a deliberate, user-requested exception to "nothing that
+ * requires approval runs unattended": it only unlocks the ENTRY POINT that
+ * starts a workflow the user already authored and saved via save_workflow —
+ * the workflow's own steps run through runWorkflow() (workflowRunner.ts),
+ * which uses the separate, already-unattended-safe SAFE_SCHED_ALLOWLIST
+ * (scheduler.ts) for its internal tool calls. So this doesn't grant remote
+ * arbitrary tool execution, just "let a previously-approved automation be
+ * kicked off remotely" — the primary motivating case being the phone/
+ * Telegram relay (phone-agent/) triggering a saved workflow by text.
  */
 export const SAFE_QUEUE_ALLOWLIST: string[] = [
   "read_file",
@@ -47,6 +58,7 @@ export const SAFE_QUEUE_ALLOWLIST: string[] = [
   "patch_file",
   "apply_patch",
   "create_folder",
+  "run_workflow",
 ];
 
 /** Module-level concurrency-1 guard — only one task runs at a time. */
@@ -176,6 +188,11 @@ export async function processNextPending(): Promise<void> {
     const modelRef = useModelSelectionStore.getState().selectedModel;
     const hardware = useModelStore.getState().hardware;
     const numCtxOverride = useSettingsStore.getState().numCtxOverride;
+    // Browser MCP tools are the one MCP server trusted for unattended runs —
+    // see getUnattendedBrowserTools's doc comment. Computed fresh per task
+    // (not hoisted to module scope) since the server's connected/enabled
+    // status can change between queue drains.
+    const browserTools = getUnattendedBrowserTools();
 
     const runOnce = () =>
       runHeadlessTask({
@@ -187,7 +204,8 @@ export async function processNextPending(): Promise<void> {
         currentView: task.targetView,
         origin: "task-queue",
         agentBuildMode: true,
-        toolAllowlist: SAFE_QUEUE_ALLOWLIST,
+        toolAllowlist: [...SAFE_QUEUE_ALLOWLIST, ...browserTools.map((t) => t.name)],
+        extraTools: browserTools,
         // Per-task now: `send_task_to_tab` queues work to be DONE, so a run
         // that changes nothing is a genuine failure and keeps the historical
         // `true`. Conversational senders (the IPC/Telegram relay) set it false

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "atlas": {
+      "args": [
+        "mcp"
+      ],
+      "command": "C:/Users/lalwa/bin/atlas.exe"
+    }
+  }
+}

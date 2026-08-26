@@ -195,6 +195,20 @@ export async function runHeadlessTask(opts: HeadlessTaskOpts): Promise<HeadlessT
     toolsSupported: true,
     maxRounds: opts.maxRounds ?? DEFAULT_MAX_ROUNDS,
     expectSideEffects: opts.expectSideEffects ?? false,
+    // conversational was defined in AgentRuntimeConfig (lightweight system
+    // prompt, no todo/plan framing, and — critically — skips the inaction
+    // nudge below) but no caller ever set it, so every headless run got
+    // nudged toward calling a tool even when the message was a plain
+    // question with a correct zero-tool-call answer. Confirmed live: a
+    // phone-relayed question got nudged 2x into "you didn't call a tool, do
+    // it now," which degenerated the model into a generic canned greeting
+    // by the final round — exactly the failure buildConversationalSystemPrompt/
+    // shouldNudgeInaction's own doc comments describe this flag as existing
+    // to prevent. Only fires for explicit `expectSideEffects: false` (the
+    // IPC/Telegram relay's own signal for "this is a question, not a build
+    // task") — subagents/manual callers that leave expectSideEffects unset
+    // are unaffected, since `undefined === false` is false.
+    conversational: opts.expectSideEffects === false,
     // Every headless run is a fresh, self-contained instruction, not a
     // continuation of interactive project work — never let stale on-disk
     // todos/memory/skills from ordinary use of this workspace hijack it.

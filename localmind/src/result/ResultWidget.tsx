@@ -131,7 +131,18 @@ export function ResultWidget() {
       const deltaY = (e.clientY - dragRef.current.startY) * dpr;
       const newX = Math.round(dragRef.current.windowX + deltaX);
       const newY = Math.round(dragRef.current.windowY + deltaY);
-      void getCurrentWindow().setPosition(new PhysicalPosition(newX, newY));
+      // core:window:allow-set-position is required in capabilities/result.json
+      // — without it this rejects on every single mousemove during a drag.
+      // Caught (not left to propagate) purely for symmetry with the
+      // outerPosition() try/catch below; this window has no global
+      // unhandledrejection handler (see result/main.tsx's header comment), so
+      // an uncaught rejection here wouldn't wipe the widget the way it would
+      // in the main window — but a drag that silently no-ops on every move is
+      // still worth logging once to make a future permissions regression
+      // diagnosable instead of just "dragging doesn't work" again.
+      void getCurrentWindow()
+        .setPosition(new PhysicalPosition(newX, newY))
+        .catch((err) => console.error("[quick-result] setPosition failed:", err));
     }
     function onMouseUp(): void {
       dragRef.current = null;

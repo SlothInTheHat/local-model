@@ -5,7 +5,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { recommendModel } from "./lib/modelRecommender";
-import { listModels, pullModel } from "./lib/ollama";
+import { listModels, pullModel, isOllamaCorsBlocked } from "./lib/ollama";
 import type { ChatMessage } from "./lib/ollama";
 import { searchWeb } from "./lib/search";
 import { runAgentSession, DEFAULT_MAX_ROUNDS, buildIdentitySystemPrompt } from "./lib/agentRuntime";
@@ -101,6 +101,9 @@ const MemoryView = lazy(() =>
 const AgentLogs = lazy(() =>
   import("./components/AgentLogs").then((m) => ({ default: m.AgentLogs }))
 );
+const ResumeTailoring = lazy(() =>
+  import("./components/ResumeTailoring").then((m) => ({ default: m.ResumeTailoring }))
+);
 
 // Quick-invoke widget runs get a slightly wider allowlist than the task queue
 // / scheduler's SAFE_QUEUE_ALLOWLIST. Those fire when the user is genuinely
@@ -133,6 +136,21 @@ const QUICK_INVOKE_ALLOWLIST = [...SAFE_QUEUE_ALLOWLIST, "take_screenshot", "rea
 // needed for this to work.
 const QUICK_INVOKE_REGION_PREAMBLE =
   "The user has circled a specific region of their screen. Call take_screenshot to see it — it returns ONLY that circled region, already cropped. Answer about what is in it.\n\n";
+
+// No region was circled this time, but the prompt may still implicitly refer
+// to whatever's currently on screen ("solve this", "what does this say",
+// "summarize this") — with nothing telling the model take_screenshot even
+// exists as an option here, it has no way to know to reach for it, and a
+// small/weak model in particular will just answer blind or deflect (observed
+// live: "solve the question on screen" got "I'll display a webpage" back,
+// with no screenshot ever taken). Unlike QUICK_INVOKE_REGION_PREAMBLE this is
+// a conditional hint, not a command — plenty of quick-invoke prompts genuinely
+// have nothing to look at ("what's 2+2"), so the model is trusted to judge
+// relevance rather than being forced to screenshot every time. Naming
+// take_screenshot explicitly here also doubles as a BM25 tool-retrieval boost
+// (see toolFilter.ts) the same way the region preamble already relies on.
+const QUICK_INVOKE_SCREEN_HINT =
+  "(If this refers to something currently visible on the user's screen, call take_screenshot first to see it before answering. If it's a general question with nothing to look at, just answer directly.)\n\n";
 
 // ─── WP6.4a: IPC task result correlation ───────────────────────────────────
 //
@@ -260,6 +278,7 @@ export default function App() {
     selectConversation,
     addMessage,
     appendToLastMessage,
+    appendThinkingToLastMessage,
     setLastMessageContent,
     setStreaming,
     updateTitle,
@@ -284,6 +303,10 @@ export default function App() {
   const { view, mountedViews, setView } = useAppViewStore();
   const { selectedModel, setSelectedModel } = useModelSelectionStore();
   const [ollamaError, setOllamaError] = useState<string | null>(null);
+  // Set alongside ollamaError only in the CORS-blocked case (see
+  // isOllamaCorsBlocked's doc comment) — lets Onboarding show accurate next
+  // steps instead of "install and start Ollama" when it's already running.
+  const [ollamaCorsBlocked, setOllamaCorsBlocked] = useState(false);
   const [webSearchEnabled, setWebSearchEnabled] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -762,6 +785,13 @@ export default function App() {
     // and what's displayed) — an acceptable tradeoff for a one-line, clearly
     // worded sentence versus a bigger refactor to separate "sent" from
     // "shown" text.
+    // Deliberately NOT QUICK_INVOKE_SCREEN_HINT here (unlike the widget path
+    // below) — this task string is both what's sent AND what's displayed in
+    // the chat transcript (see the comment above), so an unconditional hint
+    // would clutter every quick-invoke chat message, not just screen-related
+    // ones. Chat mode has a cheap recovery path the widget doesn't: the user
+    // is looking at the now-open window and can just say "look at my screen"
+    // if the first answer misses, so it doesn't need the same up-front nudge.
     const task = hasRegion ? QUICK_INVOKE_REGION_PREAMBLE + prompt : prompt;
     // forceNewConversation=true: quick-invoke always starts a fresh
     // conversation rather than appending to whatever chat happens to be
@@ -897,11 +927,13 @@ export default function App() {
     await showResultWidget(true);
     // Widget display always shows the user's original, undecorated prompt —
     // only the `task` string handed to runHeadlessTask below gets the WP7.1
-    // region preamble prepended. Keeping emitQuickResult's `prompt` clean
-    // means the widget never shows the model-facing instructions as if the
-    // user had typed them.
+    // region preamble (or, with no region, QUICK_INVOKE_SCREEN_HINT) prepended.
+    // Keeping emitQuickResult's `prompt` clean means the widget never shows
+    // the model-facing instructions as if the user had typed them — unlike
+    // handleQuickInvokeChat above, this path has no visible-clutter cost to
+    // weigh, since nobody ever sees `task` itself, only the final answer.
     emitQuickResult({ status: "running", prompt });
-    const task = hasRegion ? QUICK_INVOKE_REGION_PREAMBLE + prompt : prompt;
+    const task = hasRegion ? QUICK_INVOKE_REGION_PREAMBLE + prompt : QUICK_INVOKE_SCREEN_HINT + prompt;
 
     try {
       const { record, transcript } = await runHeadlessTask({
@@ -982,9 +1014,20 @@ export default function App() {
         setModels(providerModels);
         setSelectedModel(providerModels[0]);
         setOllamaError(null);
+        setOllamaCorsBlocked(false);
         toast.info(`Ollama offline — ${providerModels.length} provider model${providerModels.length !== 1 ? "s" : ""} available`);
       } else {
-        setOllamaError("Cannot reach Ollama at localhost:11434 — is it installed?");
+        // Every browser-side attempt above failed identically whether Ollama
+        // is actually down or just CORS-rejecting this webview's origin — ask
+        // Rust (no CORS concept at all) to tell the two apart before settling
+        // on which message to show. See isOllamaCorsBlocked's doc comment.
+        const corsBlocked = await isOllamaCorsBlocked();
+        setOllamaCorsBlocked(corsBlocked);
+        setOllamaError(
+          corsBlocked
+            ? "Ollama is running, but is rejecting requests from this app (CORS)."
+            : "Cannot reach Ollama at localhost:11434 — is it installed?"
+        );
       }
       return;
     }
@@ -1003,6 +1046,7 @@ export default function App() {
       if (!restored || !all.includes(restored)) setSelectedModel(all[0]);
     }
     setOllamaError(null);
+    setOllamaCorsBlocked(false);
 
     // Probe real tool/vision capabilities from Ollama in the background —
     // never blocks model-list loading; supportsNativeTools()/isVisionModel()
@@ -1203,7 +1247,7 @@ export default function App() {
     abortRef.current = controller;
 
     try {
-      for await (const chunk of streamChatForModel(selectedModel, history, controller.signal)) {
+      for await (const chunk of streamChatForModel(selectedModel, history, controller.signal, (t) => appendThinkingToLastMessage(convId, t))) {
         appendToLastMessage(convId, chunk);
       }
       const updatedConv = useChatStore.getState().conversations.find((c) => c.id === convId)!;
@@ -1273,6 +1317,10 @@ export default function App() {
           if (logSessionRef.current) logAgentText(logSessionRef.current, chunk);
         },
 
+        onThinkingDelta: (chunk) => {
+          appendThinkingToLastMessage(convId, chunk);
+        },
+
         onTextReplace: (cleanText) => {
           setLastMessageContent(convId, cleanText);
         },
@@ -1313,6 +1361,12 @@ export default function App() {
         onDebugPrompt: useDebugPromptsStore.getState().enabled
           ? ({ round, systemMessage }) => {
               useDebugPromptsStore.getState().addEntry(convId, { round, systemMessage, capturedAt: Date.now() });
+            }
+          : undefined,
+
+        onRetrievalMiss: useDebugPromptsStore.getState().enabled
+          ? ({ round, toolName, objective }) => {
+              useDebugPromptsStore.getState().addMiss(convId, { round, toolName, objective, capturedAt: Date.now() });
             }
           : undefined,
 
@@ -1656,11 +1710,22 @@ export default function App() {
                 </div>
               )}
 
+              {/* Resume Tailoring — same persistent-mount treatment as Code:
+                  holds an open file, in-progress chat, and a pending diff
+                  that shouldn't reset on an incidental tab switch. */}
+              {(view === "resume" || mountedViews.has("resume")) && (
+                <div className={view === "resume" ? "flex flex-col flex-1 min-w-0 min-h-0 overflow-hidden" : "hidden"}>
+                  <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>}>
+                    <ResumeTailoring selectedModel={selectedModel} isActive={view === "resume"} />
+                  </Suspense>
+                </div>
+              )}
+
               {/* Other views fully unmount on tab switch (no mountedViews
                   persistence, unlike chat/code above) — safe to key by view
                   for a subtle re-entry animation using the existing msgIn
                   keyframe (already defined globally, see src/index.css). */}
-              {view !== "chat" && view !== "code" && (
+              {view !== "chat" && view !== "code" && view !== "resume" && (
                 <div key={view} className="flex-1 min-h-0 flex flex-col overflow-hidden" style={{ animation: "msgIn 0.25s cubic-bezier(0.34, 1.2, 0.64, 1)" }}>
                   {view === "docs" ? (
                     <Suspense fallback={<div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading editor…</div>}>
@@ -1747,7 +1812,7 @@ export default function App() {
       {/* First-run welcome — explains the workspace concept and tab set,
           since a brand-new user otherwise lands in an empty chat view with
           no orientation at all. */}
-      {!hasCompletedOnboarding && <Onboarding ollamaError={ollamaError} />}
+      {!hasCompletedOnboarding && <Onboarding ollamaError={ollamaError} ollamaCorsBlocked={ollamaCorsBlocked} />}
     </div>
   );
 }

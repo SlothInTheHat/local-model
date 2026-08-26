@@ -1,5 +1,5 @@
 import { evaluate, compile } from "mathjs";
-import { searchWeb } from "./search";
+import { searchWeb, searchImages } from "./search";
 import { useArtifactStore } from "../store/artifacts";
 import { fileExists } from "./fileSystem";
 import { TauriDirectoryHandle } from "./tauriFs";
@@ -116,7 +116,9 @@ export type ToolName =
   | "remind_me"
   | "calculator"
   | "web_search"
+  | "search_images"
   | "run_command"
+  | "run_tool_script"
   | "get_system_info"
   | "get_current_datetime"
   | "git_status"
@@ -144,6 +146,8 @@ export type ToolName =
   | "find_recurring_issues"
   | "search_knowledge"
   | "list_collections"
+  | "search_resume_knowledge"
+  | "propose_resume_edit"
   | "read_clipboard"
   | "set_clipboard"
   | "open_application"
@@ -171,6 +175,26 @@ export interface ToolDef {
   planModeAllowed?: boolean;
   /** Needs user approval in Build mode (unless autoApproveAll). */
   requiresApproval?: boolean;
+  /**
+   * Alternate names a model might emit for this tool (hand-authored). Feeds
+   * per-round tool retrieval's alias hard-include match (toolFilter.ts) — if
+   * the current objective text names this tool by one of these, it's
+   * force-included regardless of rank score. Distinct from TOOL_ALIASES
+   * below (a flat wrong-name -> canonical-name map used for POST-HOC call
+   * normalization after the model already picked a tool) — that map is
+   * merged into this field automatically via effectiveAliases(), so most
+   * tools don't need to hand-populate this at all. Optional and empty on
+   * every tool by default; absence is not a regression, just no extra signal.
+   */
+  aliases?: string[];
+  /**
+   * Short situational phrasings of when this tool applies (e.g. "isolate
+   * subject from background"), folded into the indexed text alongside the
+   * description for per-round retrieval (toolBm25.ts) — never shown to the
+   * model verbatim. Optional; empty/absent tools just retrieve on
+   * name+description exactly as before this field existed.
+   */
+  useWhen?: string[];
 }
 
 /** Appended to file-tool path descriptions so the model knows absolute paths
@@ -452,6 +476,23 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
     requiresApproval: false,
   },
   {
+    name: "search_images",
+    description:
+      "Search for actual downloadable images (not web pages) and return direct file URLs — use this instead of web_search whenever the goal is to find AND download/save an image (a picture, icon, photo, graphic). web_search only returns page URLs and text snippets, never a usable image URL; this tool exists specifically to close that gap. Each result's 'url' is a real, direct, downloadable file link — pass it straight to download_file, no further searching/guessing needed. Backed by Wikimedia Commons, so results skew toward diagrams/icons/photos/public-domain or openly-licensed images rather than every possible image on the web.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "What the image should show, e.g. 'red arrow', 'golden retriever puppy'." },
+        limit: { type: "number", description: "Max results to return, default 8." },
+      },
+      required: ["query"],
+    },
+    group: "web",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
     name: "search_past_sessions",
     description:
       "Full-text search across past agent sessions and conversations (transcripts). Use to recall earlier decisions/work.",
@@ -515,6 +556,41 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       required: [],
     },
     group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "search_resume_knowledge",
+    description:
+      "Search the user's 'Resume' background-knowledge collection — additional projects, experience, and skills the user has recorded that are NOT necessarily on their current resume, kept fully separate from their class/study collections. Use this when tailoring a resume to a job listing to find real background material to draw from instead of inventing content. Returns passages with source citations. This tool is scoped to the Resume collection only and cannot search any other collection.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "The search query string." },
+        limit: { type: "number", description: "Max passages to return. Defaults to 6." },
+      },
+      required: ["query"],
+    },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "propose_resume_edit",
+    description:
+      "Propose a tailored edit to the currently open resume file for the user to review. Does NOT write to disk or change the file — it stages the full proposed replacement text as a side-by-side diff that the user must explicitly accept before anything is saved. Always pass the FULL new file content, not just the changed portion. Use this instead of write_file/patch_file, which are not available on this surface.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Relative path of the resume file being edited — must match the file currently open in the editor." },
+        new_content: { type: "string", description: "The full proposed replacement text for the file." },
+        summary: { type: "string", description: "One-line human-readable description of what changed, shown as the diff's header." },
+      },
+      required: ["path", "new_content", "summary"],
+    },
+    group: "files",
     risk: "read",
     planModeAllowed: true,
     requiresApproval: false,
@@ -659,6 +735,25 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
         },
       },
       required: ["cmd"],
+    },
+    group: "shell",
+    risk: "execute",
+    planModeAllowed: false,
+    requiresApproval: true,
+  },
+  {
+    name: "run_tool_script",
+    description:
+      "\"Code Mode\": run a short JavaScript program instead of calling tools one at a time. The program runs in an isolated sandbox with no network/DOM access — the ONLY things it can do are call the tool functions listed below (each available tool from this round is exposed as a plain function you call directly, e.g. `const r = read_file({ path: \"a.ts\" }); write_file({ path: \"b.ts\", content: r.output.toUpperCase() });` — no async/await needed, they return their result synchronously). Use this to collapse a multi-step sequence (read several files, transform, write results) into ONE call instead of one round-trip per step. `console.log(...)` is available for debugging. End with a `return` statement if you want a value back. Do NOT call run_tool_script from inside a script (not available there), and do not attempt network/window access — it isn't present in the sandbox.",
+    parameters: {
+      type: "object",
+      properties: {
+        code: {
+          type: "string",
+          description: "JavaScript source to run. Runs inside a function body (top-level `return` is allowed). Only call tool functions that were available to you this round — the sandbox does not expose every tool that exists, only the ones you were offered.",
+        },
+      },
+      required: ["code"],
     },
     group: "shell",
     risk: "execute",
@@ -1345,7 +1440,7 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
       properties: {
         task: {
           type: "string",
-          description: "The instruction for the scheduled agent run to execute, in natural English — NEVER shell code or commands. Examples: 'append the current date and time to notes.md', 'summarize my improvement queue and write to status.md'. Bad: 'echo $(date) >> file', 'date >> file', 'Get-Date'. The scheduled agent runs on the user's platform and will emit the correct commands; your job is to describe the goal in plain English.",
+          description: "The instruction for the scheduled agent run to execute — a natural-English description of THIS user's actual goal, never shell code/commands (bad: 'echo $(date) >> file', 'Get-Date') and never a copy of any example text you've seen elsewhere — write it fresh, describing what THIS specific request needs done. The scheduled agent runs on the user's platform and will emit the correct commands itself; your only job here is to state the goal in plain English.",
         },
         schedule: {
           type: "string",
@@ -1624,6 +1719,12 @@ export interface ToolResult {
   name: string;
   output: string;
   error?: string;
+  /** Optional structured fact about what this call produced/touched — set by
+   *  a small set of handlers that already compute this data before
+   *  flattening it into `output` prose. Feeds RuntimeState.resources in
+   *  agentRuntime.ts so later rounds can reference it without re-parsing
+   *  output text. Absent by default; most tools don't set it. */
+  resource?: { kind: "file" | "path" | "artifact"; path?: string; url?: string; id?: string; label: string };
 }
 
 // ─── Grep / Find helpers ──────────────────────────────────────────────────────
@@ -1741,6 +1842,7 @@ const TOOL_ALIASES: Record<string, string> = {
   install_dependencies: "install_deps", install_dependency: "install_deps", install_packages: "install_deps",
   write_to_file: "write_file", create_file: "write_file", save_file: "write_file",
   search_web: "web_search", google: "web_search", search: "web_search",
+  image_search: "search_images", search_image: "search_images", find_image: "search_images", find_images: "search_images",
   fetch_url: "web_fetch", fetch: "web_fetch",
   search_files: "grep_files", grep: "grep_files", find_in_files: "grep_files",
   find: "find_files", ls: "list_directory", list: "list_directory",
@@ -1757,6 +1859,32 @@ let _knownToolNames: Set<string> | null = null;
 function knownToolNames(): Set<string> {
   if (!_knownToolNames) _knownToolNames = new Set(TOOL_DEFINITIONS.map((t) => t.name));
   return _knownToolNames;
+}
+
+let _aliasesByCanonical: Map<string, string[]> | null = null;
+/** Inverts TOOL_ALIASES (wrong-name -> canonical) into (canonical -> wrong-names[]),
+ *  lazily, once. This is the "free first pass" backfill: ~15 tools already have
+ *  curated alternate names here from real observed model mistakes, reused as
+ *  retrieval signal with no new authoring required. */
+function aliasesByCanonical(): Map<string, string[]> {
+  if (!_aliasesByCanonical) {
+    const map = new Map<string, string[]>();
+    for (const [wrong, canonical] of Object.entries(TOOL_ALIASES)) {
+      const list = map.get(canonical) ?? [];
+      list.push(wrong);
+      map.set(canonical, list);
+    }
+    _aliasesByCanonical = map;
+  }
+  return _aliasesByCanonical;
+}
+
+/** A tool's full alias list for retrieval purposes: its own hand-authored
+ *  `aliases` field (if any) plus every TOOL_ALIASES entry that maps TO it —
+ *  so most tools get real alias coverage without ever populating the field. */
+export function effectiveAliases(tool: ToolDef): string[] {
+  const fromMap = aliasesByCanonical().get(tool.name) ?? [];
+  return tool.aliases && tool.aliases.length > 0 ? [...tool.aliases, ...fromMap] : fromMap;
 }
 
 /**
@@ -2300,6 +2428,24 @@ export async function executeTool(
         };
       }
 
+      case "search_images": {
+        const query = argStr(call.args["query"]);
+        if (!query) throw new Error("Missing query argument");
+        const limitArg = call.args["limit"];
+        const limit = typeof limitArg === "number" && limitArg > 0 ? Math.floor(limitArg) : 8;
+        const results = await searchImages(query, limit);
+        const output = results.length === 0
+          ? `No images found for "${query}". Try a different/simpler query, or fall back to web_search.`
+          : results
+              .map((r, i) => `${i + 1}. ${r.title} (${r.width}x${r.height}, ${r.mime})\n   url: ${r.url}`)
+              .join("\n\n");
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output,
+        };
+      }
+
       case "search_past_sessions": {
         const query = argStr(call.args["query"]);
         if (!query) throw new Error("Missing query argument");
@@ -2408,6 +2554,42 @@ export async function executeTool(
         return { toolCallId: call.id, name: call.name, output };
       }
 
+      case "search_resume_knowledge": {
+        const query = argStr(call.args["query"]);
+        if (!query) throw new Error("Missing query argument");
+        const limitArg = call.args["limit"];
+        const limit = typeof limitArg === "number" && limitArg > 0 ? Math.floor(limitArg) : 6;
+        // collection is intentionally hardcoded, never read from call.args —
+        // this is the isolation guarantee that keeps resume background
+        // material from ever mixing with class/study collections.
+        const hits = await searchMemory(query, limit, 0.3, { collection: "Resume", includeKnowledge: true });
+        const output = hits.length === 0
+          ? "No matching passages found in the Resume background collection. The user may not have uploaded background material yet — don't invent experience to fill the gap."
+          : hits
+              .map(({ entry }, i) => {
+                const anchor = `[Resume${entry.sourceUri ? " " + entry.sourceUri : ""}${entry.location ? " " + entry.location : ""}]`;
+                return `${i + 1}. ${anchor} ${entry.text}`;
+              })
+              .join("\n\n");
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      case "propose_resume_edit": {
+        const path = argStr(call.args["path"]);
+        const newContent = call.args["new_content"] != null ? String(call.args["new_content"]) : "";
+        const summary = argStr(call.args["summary"]) || "Proposed resume edit";
+        if (!path) throw new Error("Missing path argument");
+        if (!newContent) throw new Error("Missing new_content argument");
+        // No filesystem/memory I/O here on purpose — the UI reads path/new_content/summary
+        // straight from call.args in onToolCallResolved and renders a pending diff;
+        // nothing is written until the user clicks Accept.
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Proposed edit ready for review in the diff panel: ${summary}`,
+        };
+      }
+
       case "list_directory": {
         const { root, parts } = resolveFileRoot(argStr(call.args["path"]), dirHandle, workspacePath);
         let targetHandle = root;
@@ -2501,6 +2683,7 @@ export async function executeTool(
           toolCallId: call.id,
           name: call.name,
           output: `${verb}: ${path}${overwriteHint}`,
+          resource: { kind: "file", path: normalizedPath, label: `wrote ${normalizedPath}` },
         };
       }
 
@@ -2562,6 +2745,7 @@ export async function executeTool(
           toolCallId: call.id,
           name: call.name,
           output: `Patched ${path}.`,
+          resource: { kind: "file", path, label: `patched ${path}` },
         };
       }
 
@@ -2661,7 +2845,7 @@ export async function executeTool(
         const from = resolveNativeAbsolutePath(fromArg, workspacePath);
         const to = resolveNativeAbsolutePath(toArg, workspacePath);
         await tauriInvoke("fs_move", { from, to });
-        return { toolCallId: call.id, name: call.name, output: `Moved ${from} -> ${to}` };
+        return { toolCallId: call.id, name: call.name, output: `Moved ${from} -> ${to}`, resource: { kind: "file", path: to, label: `moved file to ${to}` } };
       }
 
       case "copy_file": {
@@ -2672,7 +2856,7 @@ export async function executeTool(
         const from = resolveNativeAbsolutePath(fromArg, workspacePath);
         const to = resolveNativeAbsolutePath(toArg, workspacePath);
         await tauriInvoke("fs_copy", { from, to });
-        return { toolCallId: call.id, name: call.name, output: `Copied ${from} -> ${to}` };
+        return { toolCallId: call.id, name: call.name, output: `Copied ${from} -> ${to}`, resource: { kind: "file", path: to, label: `copied file to ${to}` } };
       }
 
       case "rename_file": {
@@ -2687,7 +2871,7 @@ export async function executeTool(
         const parentDir = from.slice(0, from.lastIndexOf("/"));
         const to = `${parentDir}/${newName}`;
         await tauriInvoke("fs_move", { from, to });
-        return { toolCallId: call.id, name: call.name, output: `Renamed to ${to}` };
+        return { toolCallId: call.id, name: call.name, output: `Renamed to ${to}`, resource: { kind: "file", path: to, label: `renamed file to ${to}` } };
       }
 
       case "get_known_folder": {
@@ -2700,7 +2884,7 @@ export async function executeTool(
         const note = enabled
           ? ""
           : `\n(Not yet enabled for file access — ask the user to turn it on in Settings > Privacy & Security before using it with other file tools.)`;
-        return { toolCallId: call.id, name: call.name, output: path + note };
+        return { toolCallId: call.id, name: call.name, output: path + note, resource: { kind: "path", path, label: `${name} folder at ${path}` } };
       }
 
       case "download_file": {
@@ -2710,7 +2894,7 @@ export async function executeTool(
         if (!destArg) throw new Error("Missing dest_path argument");
         const destPath = resolveNativeAbsolutePath(destArg, workspacePath);
         const bytes = await tauriInvoke<number>("fetch_binary", { url, destPath });
-        return { toolCallId: call.id, name: call.name, output: `Downloaded ${bytes} bytes to ${destPath}` };
+        return { toolCallId: call.id, name: call.name, output: `Downloaded ${bytes} bytes to ${destPath}`, resource: { kind: "file", path: destPath, url, label: `downloaded file at ${destPath}` } };
       }
 
       case "remove_background": {
@@ -2726,7 +2910,7 @@ export async function executeTool(
         const resultBlob = await removeBackground(srcBlob);
         const resultBase64 = await blobToBase64(resultBlob);
         await tauriInvoke("fs_write_file_base64", { path: destPath, dataBase64: resultBase64 });
-        return { toolCallId: call.id, name: call.name, output: `Background removed: ${destPath}` };
+        return { toolCallId: call.id, name: call.name, output: `Background removed: ${destPath}`, resource: { kind: "file", path: destPath, label: `background-removed image at ${destPath}` } };
       }
 
       case "convert_image": {
@@ -2741,7 +2925,7 @@ export async function executeTool(
         const maxWidth = rawMaxW != null && Number.isFinite(Number(rawMaxW)) ? Math.floor(Number(rawMaxW)) : undefined;
         const maxHeight = rawMaxH != null && Number.isFinite(Number(rawMaxH)) ? Math.floor(Number(rawMaxH)) : undefined;
         await tauriInvoke("image_convert", { srcPath, destPath, maxWidth, maxHeight });
-        return { toolCallId: call.id, name: call.name, output: `Converted: ${destPath}` };
+        return { toolCallId: call.id, name: call.name, output: `Converted: ${destPath}`, resource: { kind: "file", path: destPath, label: `converted image at ${destPath}` } };
       }
 
       case "compress_files": {
@@ -2753,7 +2937,7 @@ export async function executeTool(
         const paths = inputPaths.map((p) => resolveNativeAbsolutePath(p, workspacePath));
         const destPath = resolveNativeAbsolutePath(destArg, workspacePath);
         await tauriInvoke("fs_compress", { paths, destPath });
-        return { toolCallId: call.id, name: call.name, output: `Created archive: ${destPath}` };
+        return { toolCallId: call.id, name: call.name, output: `Created archive: ${destPath}`, resource: { kind: "file", path: destPath, label: `created archive at ${destPath}` } };
       }
 
       case "extract_archive": {
@@ -2764,7 +2948,7 @@ export async function executeTool(
         const archivePath = resolveNativeAbsolutePath(archiveArg, workspacePath);
         const destDir = resolveNativeAbsolutePath(destArg, workspacePath);
         await tauriInvoke("fs_extract", { archivePath, destDir });
-        return { toolCallId: call.id, name: call.name, output: `Extracted to: ${destDir}` };
+        return { toolCallId: call.id, name: call.name, output: `Extracted to: ${destDir}`, resource: { kind: "path", path: destDir, label: `extracted archive to ${destDir}` } };
       }
 
       case "pdf_merge": {
@@ -2776,7 +2960,7 @@ export async function executeTool(
         const paths = inputPaths.map((p) => resolveNativeAbsolutePath(p, workspacePath));
         const destPath = resolveNativeAbsolutePath(destArg, workspacePath);
         await tauriInvoke("pdf_merge", { paths, destPath });
-        return { toolCallId: call.id, name: call.name, output: `Merged PDF: ${destPath}` };
+        return { toolCallId: call.id, name: call.name, output: `Merged PDF: ${destPath}`, resource: { kind: "file", path: destPath, label: `merged PDF at ${destPath}` } };
       }
 
       case "pdf_to_text": {
@@ -3118,11 +3302,13 @@ export async function executeTool(
         }
 
         const failed = results.filter((r) => r.startsWith("✗")).length;
+        const succeeded = results.length - failed;
         return {
           toolCallId: call.id,
           name: call.name,
           output: results.join("\n"),
           ...(failed > 0 ? { error: `${failed} patch${failed !== 1 ? "es" : ""} failed` } : {}),
+          ...(succeeded > 0 ? { resource: { kind: "file" as const, label: `patched ${succeeded} file${succeeded !== 1 ? "s" : ""}` } } : {}),
         };
       }
 
@@ -3177,6 +3363,7 @@ export async function executeTool(
           toolCallId: call.id,
           name: call.name,
           output: `Skill saved: .localmind/skills/${filename}`,
+          resource: { kind: "file", path: `.localmind/skills/${filename}`, label: `saved skill at .localmind/skills/${filename}` },
         };
       }
 
@@ -3277,6 +3464,7 @@ export async function executeTool(
           toolCallId: call.id,
           name: call.name,
           output: `Created folder: ${targetPath}`,
+          resource: { kind: "path", path: targetPath, label: `created folder at ${targetPath}` },
         };
       }
 
@@ -3562,6 +3750,7 @@ export async function executeTool(
           toolCallId: call.id,
           name: call.name,
           output: `[[LM_ARTIFACT:${id}]] Rendered${title ? ` "${title}"` : " an"} interactive canvas.`,
+          resource: { kind: "artifact", id, label: `rendered canvas${title ? ` "${title}"` : ""}` },
         };
       }
 
@@ -3614,6 +3803,7 @@ export async function executeTool(
           toolCallId: call.id,
           name: call.name,
           output: `[[LM_ARTIFACT:${id}]] Plotted ${curves.map((c) => c.label).join(", ")}.`,
+          resource: { kind: "artifact", id, label: `plotted ${curves.map((c) => c.label).join(", ")}` },
         };
       }
 
@@ -3629,6 +3819,7 @@ export async function executeTool(
           toolCallId: call.id,
           name: call.name,
           output: `[[LM_ARTIFACT:${id}]] Rendered a ${rows.length}-row table${title ? ` "${title}"` : ""}.`,
+          resource: { kind: "artifact", id, label: `rendered a ${rows.length}-row table${title ? ` "${title}"` : ""}` },
         };
       }
 
@@ -4049,6 +4240,7 @@ export async function executeTool(
           toolCallId: call.id,
           name: call.name,
           output: sections.join("\n\n"),
+          resource: { kind: "file", path: result.path, label: `screenshot at ${result.path}` },
         };
       }
 

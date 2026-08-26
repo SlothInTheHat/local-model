@@ -102,6 +102,19 @@ export default defineConfig(async () => ({
           "Accept-Language": "en-US,en;q=0.9",
         },
       },
+      // search_images (src/lib/tools.ts) — Wikimedia Commons' real, documented,
+      // stable search API, chosen over DuckDuckGo's image search specifically
+      // because DDG's returns no direct-URL JSON without an undocumented
+      // per-request token dance; Commons returns real imageinfo.url fields
+      // directly, no scraping.
+      "/commons-search": {
+        target: "https://commons.wikimedia.org",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/commons-search/, ""),
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        },
+      },
     },
   },
 }));

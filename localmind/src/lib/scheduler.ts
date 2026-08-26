@@ -11,6 +11,8 @@ import { runWorkflow } from "./workflowRunner";
 import { useWorkflowStore } from "../store/workflows";
 import { notifyOs } from "./osNotify";
 import { isGenerationBusy } from "./generationGate";
+import { isTauriEnv } from "./fileSystem";
+import { getUnattendedBrowserTools } from "../store/mcp";
 
 // ─── WP2.2: background cron scheduler (frontend half) ──────────────────────
 //
@@ -267,6 +269,11 @@ async function handleJobDue(job: JobDuePayload): Promise<void> {
     const modelRef = useModelSelectionStore.getState().selectedModel;
     const hardware = useModelStore.getState().hardware;
     const numCtxOverride = useSettingsStore.getState().numCtxOverride;
+    // Browser MCP tools are the one MCP server trusted for unattended runs —
+    // see getUnattendedBrowserTools's doc comment. Only applies to the raw
+    // (non-workflow) path below — a workflow already has its own opted-in
+    // extraTools/toolAllowlist mechanism via runWorkflow.
+    const browserTools = getUnattendedBrowserTools();
 
     const runOnce = () =>
       workflow
@@ -282,7 +289,8 @@ async function handleJobDue(job: JobDuePayload): Promise<void> {
             currentView: "chat",
             origin: "scheduler",
             agentBuildMode: true,
-            toolAllowlist: SAFE_SCHED_ALLOWLIST,
+            toolAllowlist: [...SAFE_SCHED_ALLOWLIST, ...browserTools.map((t) => t.name)],
+            extraTools: browserTools,
             expectSideEffects: true,
           });
 
@@ -375,10 +383,20 @@ let started = false;
  * or shell-executing tools.
  */
 export function initScheduler(): void {
-  if (started) return;
+  // Browser dev mode (`npm run dev`, no Tauri bridge) has no window.__TAURI__/
+  // __TAURI_INTERNALS__ — listen() would reject with "Cannot read properties
+  // of undefined (reading 'transformCallback')". Left unguarded and
+  // unhandled, that rejection reaches main.tsx's global unhandledrejection
+  // handler, which wipes #root with a red error screen — the exact same
+  // hazard the rest of this file's Tauri-boundary calls already guard
+  // against (see startIpcResultReporter's doc comment in App.tsx), just
+  // missed here since this call happens at mount rather than on demand.
+  if (started || !isTauriEnv()) return;
   started = true;
 
   void listen<JobDuePayload>("job-due", (event) => {
     void handleJobDue(event.payload);
+  }).catch((err) => {
+    console.error("[scheduler] job-due listener failed:", err);
   });
 }

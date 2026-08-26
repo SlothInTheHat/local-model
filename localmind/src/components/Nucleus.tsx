@@ -11,7 +11,7 @@ import type { AppView } from "../types/app";
 // 6 primary modes always visible; the rest live behind "More".
 
 const PRIMARY: AppView[] = ["chat", "code", "research", "models", "memory", "settings"];
-const MORE: AppView[] = ["docs", "terminal", "agents", "study", "image", "skills", "workflows", "history", "benchmarks", "compare", "logs"];
+const MORE: AppView[] = ["docs", "terminal", "agents", "study", "resume", "image", "skills", "workflows", "history", "benchmarks", "compare", "logs"];
 
 const MODE_LABEL: Record<AppView, string> = {
   chat: "Chat",
@@ -31,6 +31,7 @@ const MODE_LABEL: Record<AppView, string> = {
   compare: "Compare",
   memory: "Memory",
   logs: "Logs",
+  resume: "Resume",
 };
 
 function chipClass(active: boolean): string {

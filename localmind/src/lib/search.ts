@@ -129,6 +129,68 @@ async function fetchHtmlResults(query: string): Promise<Array<{ title: string; u
   } catch { return []; }
 }
 
+// ── Wikimedia Commons image search ──────────────────────────────────────────
+// Purpose-built for search_images (src/lib/tools.ts): the model has no other
+// path from "find a picture of X" to an actual downloadable file — web_search
+// only returns page URLs/snippets, never a direct image URL, so a
+// find-image-then-download_file chain had no real second step (confirmed
+// failure: repeated live sessions where the model got search-result TEXT
+// back and then just stopped, asking the user to pick/paste a URL itself).
+// Chose Commons over scraping DuckDuckGo's image search specifically because
+// Commons has a real, documented, stable JSON API returning genuine direct
+// file URLs (imageinfo.url) — no undocumented per-request token dance, no
+// HTML scraping to keep in sync with a redesign.
+
+export interface ImageResult {
+  title: string;
+  /** Direct, downloadable file URL — this is what download_file should be
+   *  called with, not the Commons page URL. */
+  url: string;
+  mime: string;
+  width: number;
+  height: number;
+}
+
+export async function searchImages(query: string, limit = 8): Promise<ImageResult[]> {
+  const params = new URLSearchParams({
+    action: "query",
+    generator: "search",
+    gsrsearch: `${query} filetype:bitmap`, // excludes SVG/vector — most tools expect raster
+    gsrnamespace: "6", // the File: namespace
+    gsrlimit: String(Math.min(limit, 20)),
+    prop: "imageinfo",
+    iiprop: "url|size|mime",
+    format: "json",
+    origin: "*",
+  });
+  try {
+    const text = await fetchBody(
+      `/commons-search/w/api.php?${params}`,
+      `https://commons.wikimedia.org/w/api.php?${params}`,
+    );
+    if (!text) return [];
+    const data = JSON.parse(text) as {
+      query?: { pages?: Record<string, { title?: string; imageinfo?: Array<{ url?: string; mime?: string; width?: number; height?: number }> }> };
+    };
+    const pages = data.query?.pages ?? {};
+    const results: ImageResult[] = [];
+    for (const page of Object.values(pages)) {
+      const info = page.imageinfo?.[0];
+      if (!info?.url) continue;
+      results.push({
+        title: (page.title ?? "").replace(/^File:/, ""),
+        url: info.url,
+        mime: info.mime ?? "",
+        width: info.width ?? 0,
+        height: info.height ?? 0,
+      });
+    }
+    return results;
+  } catch {
+    return [];
+  }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 export async function searchWeb(query: string): Promise<SearchContext> {

@@ -9,7 +9,7 @@ import { useMemoryStore } from "../store/memory";
 import { openSourceFile } from "../lib/openFile";
 import { useArtifactStore } from "../store/artifacts";
 import { ArtifactCard } from "./ArtifactCard";
-import { useDebugPromptsStore, type DebugPromptEntry } from "../store/debugPrompts";
+import { useDebugPromptsStore, type DebugPromptEntry, type RetrievalMissEntry } from "../store/debugPrompts";
 
 const ARTIFACT_TOOL_NAMES = new Set(["render_canvas", "plot_graph", "render_table", "show_webpage"]);
 const ARTIFACT_MARKER_RE = /^\[\[LM_ARTIFACT:([^\]]+)\]\]\s*/;
@@ -46,17 +46,54 @@ function DebugPromptChip({ entry }: { entry: DebugPromptEntry }) {
   );
 }
 
+/** A tool called outside its round's retrieved candidate set — see
+ *  toolFilter.ts's retrieveToolsForStep. Not necessarily an error (the call
+ *  still ran; LocalMind doesn't hard-block this), but worth seeing without
+ *  needing devtools open, since it's exactly the evidence a real tool-
+ *  selection miss would leave behind. */
+function RetrievalMissChip({ entry }: { entry: RetrievalMissEntry }) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div className="flex flex-col">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="flex items-center gap-1 py-0.5 text-xs text-destructive/80 hover:text-destructive transition-colors w-fit"
+      >
+        {expanded ? <ChevronDown className="size-3 shrink-0" /> : <ChevronRight className="size-3 shrink-0" />}
+        <span className="font-mono">Round {entry.round}: "{entry.toolName}" called outside retrieved set</span>
+      </button>
+      {expanded && (
+        <p className="mt-1 mb-1 text-xs text-muted-foreground pl-4">
+          Objective this round: {entry.objective ? `"${entry.objective}"` : "(none — original message)"}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function DebugPromptRail({ conversationId }: { conversationId: string }) {
-  const entries = useDebugPromptsStore((s) => s.byConversation[conversationId]) ?? [];
-  if (entries.length === 0) return null;
+  const promptEntries = useDebugPromptsStore((s) => s.byConversation[conversationId]) ?? [];
+  const missEntries = useDebugPromptsStore((s) => s.missesByConversation[conversationId]) ?? [];
+  if (promptEntries.length === 0 && missEntries.length === 0) return null;
+
+  // Interleave both entry types in the order they actually happened, rather
+  // than two separate blocks — a miss is meaningful right next to the round
+  // whose prompt produced it.
+  type Item = { capturedAt: number; kind: "prompt"; entry: DebugPromptEntry } | { capturedAt: number; kind: "miss"; entry: RetrievalMissEntry };
+  const items: Item[] = [
+    ...promptEntries.map((entry): Item => ({ capturedAt: entry.capturedAt, kind: "prompt", entry })),
+    ...missEntries.map((entry): Item => ({ capturedAt: entry.capturedAt, kind: "miss", entry })),
+  ].sort((a, b) => a.capturedAt - b.capturedAt);
+
   return (
     <div className="mb-4 space-y-0.5 border border-dashed border-warning/40 rounded-md p-2 bg-warning/5">
       <div className="text-[10px] uppercase tracking-wide text-warning font-medium px-1 pb-1">
         Debug mode — prompts sent this conversation
       </div>
-      {entries.map((e, i) => (
-        <DebugPromptChip key={i} entry={e} />
-      ))}
+      {items.map((item, i) =>
+        item.kind === "prompt" ? <DebugPromptChip key={i} entry={item.entry} /> : <RetrievalMissChip key={i} entry={item.entry} />,
+      )}
     </div>
   );
 }
@@ -447,6 +484,12 @@ const MessageRow = memo(function MessageRow({
   return (
     <div className="flex justify-start">
       <div className="max-w-2xl min-w-0 space-y-1">
+        {msg.thinking?.trim() && (
+          <details className="text-xs text-muted-foreground border border-border rounded-lg px-3 py-1.5 bg-muted/40">
+            <summary className="cursor-pointer select-none font-medium">Thinking</summary>
+            <p className="whitespace-pre-wrap mt-1.5 leading-relaxed">{msg.thinking}</p>
+          </details>
+        )}
         <div
           style={{ borderRadius: AI_R[index % 3], animation: MSG_IN_ANIMATION }}
           className={cn(

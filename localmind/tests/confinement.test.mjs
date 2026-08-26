@@ -4,12 +4,19 @@
  * The pure Rust logic (path containment + `&&` translation) is unit-tested in
  * src-tauri/src/lib.rs (`cargo test --lib`). This script:
  *   1. Asserts the JS-side path logic that create_folder relies on.
- *   2. Documents the manual, app-level refusal cases that can only be exercised
+ *   2. Asserts run_tool_script's QuickJS sandbox (src/lib/toolScript.ts) has
+ *      no ambient network/DOM globals — unlike fs_* / run_command, this one is
+ *      reachable from plain node (quickjs-emscripten is a real npm package,
+ *      not behind the __TAURI__ bridge), so it's a real assertion, not just a
+ *      manual checklist item.
+ *   3. Documents the manual, app-level refusal cases that can only be exercised
  *      inside the running Tauri app (fs_* / run_command are not reachable from
  *      plain node — they require the webview's __TAURI__ bridge).
  *
  * Run: `node tests/confinement.test.mjs`
  */
+
+import { newAsyncContext } from "quickjs-emscripten";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -32,7 +39,58 @@ assert(isAbsolute("/home/me/ws") === true, "POSIX absolute path is absolute");
 assert(isAbsolute("src/components") === false, "relative path is not absolute (gets workspace prefix)");
 assert(isAbsolute("newfolder") === false, "bare name is not absolute (gets workspace prefix)");
 
-// ── 2. Manual verification checklist (run inside `npm run tauri dev`) ──────────
+// ── 2. run_tool_script SDK generation only exposes the given tool names ────────
+// Mirrors buildScriptSdk in src/lib/toolScript.ts (duplicated here rather than
+// imported, same convention as isAbsolute above — keeps this script plain
+// Node with no TS build step).
+const VALID_JS_IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+function buildScriptSdk(tools) {
+  const names = tools
+    .map((t) => t.name)
+    .filter((name) => name !== "run_tool_script" && VALID_JS_IDENTIFIER.test(name));
+  return names
+    .map((name) => `function ${name}(args) { return JSON.parse(__invoke(${JSON.stringify(name)}, JSON.stringify(args || {}))); }`)
+    .join("\n");
+}
+
+console.log("\nrun_tool_script SDK generation:");
+{
+  const sdk = buildScriptSdk([{ name: "read_file" }, { name: "write_file" }, { name: "run_tool_script" }]);
+  assert(sdk.includes("function read_file("), "exposes a retrieved tool (read_file)");
+  assert(sdk.includes("function write_file("), "exposes a retrieved tool (write_file)");
+  assert(!sdk.includes("function run_tool_script("), "never exposes run_tool_script to itself (no self-recursion)");
+}
+{
+  const sdk = buildScriptSdk([{ name: "delete_file" }]);
+  assert(!sdk.includes("read_file") && !sdk.includes("write_file"), "does NOT expose tools outside the given (retrieved) subset");
+}
+{
+  // A malicious/malformed tool name must never become injectable script text.
+  const sdk = buildScriptSdk([{ name: "not; valid() //" }]);
+  assert(!sdk.includes("not; valid"), "rejects a non-identifier tool name instead of splicing it into the generated source");
+}
+
+// ── 3. run_tool_script sandbox has no ambient network/DOM globals ──────────────
+console.log("\nrun_tool_script sandbox confinement (live QuickJS context):");
+{
+  const context = await newAsyncContext();
+  try {
+    const result = context.evalCode(
+      `JSON.stringify({ fetch: typeof fetch, window: typeof window, XMLHttpRequest: typeof XMLHttpRequest, WebSocket: typeof WebSocket, importScripts: typeof importScripts, Worker: typeof Worker })`,
+    );
+    const globals = JSON.parse(context.unwrapResult(result).consume((h) => context.getString(h)));
+    assert(globals.fetch === "undefined", "no ambient fetch()");
+    assert(globals.window === "undefined", "no ambient window (so no window.__TAURI__ either)");
+    assert(globals.XMLHttpRequest === "undefined", "no ambient XMLHttpRequest");
+    assert(globals.WebSocket === "undefined", "no ambient WebSocket");
+    assert(globals.importScripts === "undefined", "no ambient importScripts");
+    assert(globals.Worker === "undefined", "no ambient Worker (can't spawn its way out)");
+  } finally {
+    context.dispose();
+  }
+}
+
+// ── 4. Manual verification checklist (run inside `npm run tauri dev`) ──────────
 // These exercise the Rust confinement layer end-to-end; they cannot run headless.
 console.log(`
 Manual refusal cases — verify inside the running desktop app:

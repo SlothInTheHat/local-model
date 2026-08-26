@@ -127,3 +127,21 @@ export const useMcpStore = create<McpState>()(
     }
   )
 );
+
+/**
+ * The "browser" MCP server's tools (id: "browser", the browser-automation
+ * preset — see mcpPresets.ts), when connected + enabled. This is the one MCP
+ * server explicitly trusted for unattended execution (task-queue runs,
+ * scheduled jobs) — see taskRunner.ts's SAFE_QUEUE_ALLOWLIST and
+ * scheduler.ts's SAFE_SCHED_ALLOWLIST, which merge this in rather than
+ * opening every MCP tool to unattended execution. Gmail/Drive/Calendar/etc.
+ * (and any other MCP server the user adds) stay excluded from headless runs
+ * by headlessRunner.ts's default policy — this is a deliberate, narrow
+ * carve-out for one specific, curated server, not a general "trust all MCP
+ * tools unattended" switch.
+ */
+export function getUnattendedBrowserTools(): ToolDef[] {
+  const server = useMcpStore.getState().servers.find((sv) => sv.id === "browser");
+  if (!server || !server.enabled || server.status !== "connected") return [];
+  return server.tools;
+}

@@ -80,7 +80,12 @@ const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   remind_me: true,
   calculator: true,
   web_search: true,
+  search_images: true,
   run_command: false,
+  // Also gated separately by settings.codeModeEnabled + supportsCodeMode() —
+  // see assembleSessionTools/agentRuntime.ts. Off here too so it never
+  // appears in the plain tools-enabled list by default.
+  run_tool_script: false,
   get_system_info: true,
   get_current_datetime: true,
   git_status: false,
@@ -108,6 +113,11 @@ const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   find_recurring_issues: true,
   search_knowledge: true,
   list_collections: true,
+  // Both default off and are never added to any essentialOnly allowlist
+  // except the Resume tab's own — this keeps them structurally unreachable
+  // from main chat / the generic tool-toggle settings UI.
+  search_resume_knowledge: false,
+  propose_resume_edit: false,
   read_clipboard: true,
   set_clipboard: true,
   open_application: true,

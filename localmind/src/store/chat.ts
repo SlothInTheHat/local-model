@@ -71,6 +71,7 @@ interface ChatState {
   deleteConversation: (id: string) => void;
   addMessage: (convId: string, msg: ChatMessage) => void;
   appendToLastMessage: (convId: string, text: string) => void;
+  appendThinkingToLastMessage: (convId: string, text: string) => void;
   setLastMessageContent: (convId: string, content: string) => void;
   setStreaming: (val: boolean) => void;
   updateTitle: (convId: string, title: string) => void;
@@ -126,6 +127,18 @@ export const useChatStore = create<ChatState>()(
             const last = msgs[msgs.length - 1];
             if (!last || last.role !== "assistant") return c;
             msgs[msgs.length - 1] = { ...last, content: last.content + text };
+            return { ...c, messages: msgs };
+          }),
+        })),
+
+      appendThinkingToLastMessage: (convId, text) =>
+        set((s) => ({
+          conversations: s.conversations.map((c) => {
+            if (c.id !== convId) return c;
+            const msgs = [...c.messages];
+            const last = msgs[msgs.length - 1];
+            if (!last || last.role !== "assistant") return c;
+            msgs[msgs.length - 1] = { ...last, thinking: (last.thinking ?? "") + text };
             return { ...c, messages: msgs };
           }),
         })),

@@ -14,6 +14,7 @@ import { useModelStore } from "../store/models";
 import { useSettingsStore } from "../store/settings";
 import type { editor as MonacoEditorNS } from "monaco-editor";
 import { registerLocalMindMonacoThemes } from "../lib/monacoThemes";
+import { registerLatexLanguage } from "../lib/monacoLatex";
 import { ToolIcon } from "./ToolCallCard";
 import { CheckpointBrowser } from "./CheckpointBrowser";
 import { inlineHtmlResources } from "../lib/htmlPreview";
@@ -45,6 +46,7 @@ const EXTENSION_TO_LANGUAGE: Record<string, string> = {
   kt: "kotlin", swift: "swift", dart: "dart",
   lua: "lua", r: "r", scala: "scala",
   xml: "xml", bat: "bat", ps1: "powershell",
+  tex: "latex",
 };
 
 const ALL_LANGUAGES = [
@@ -1226,7 +1228,10 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
                       );
                     }
                   }}
-                  beforeMount={(monacoInstance) => registerLocalMindMonacoThemes(monacoInstance)}
+                  beforeMount={(monacoInstance) => {
+                    registerLocalMindMonacoThemes(monacoInstance);
+                    registerLatexLanguage(monacoInstance);
+                  }}
                   onMount={(ed) => {
                     editorRef.current = ed;
                     // Ctrl+Enter to run/preview

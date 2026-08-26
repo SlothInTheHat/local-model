@@ -14,6 +14,11 @@ interface Props {
    *  yet installed/running gets a clear next step instead of just an empty
    *  chat view and a banner they may not connect to "why is nothing working." */
   ollamaError: string | null;
+  /** True when ollamaError specifically means "Ollama is up but CORS-rejecting
+   *  this app's origin" (see isOllamaCorsBlocked in lib/ollama.ts) — the
+   *  guidance below branches on this since "install and start Ollama" is
+   *  actively wrong when Ollama is already running. */
+  ollamaCorsBlocked?: boolean;
 }
 
 const HIGHLIGHTS: { icon: React.ReactNode; title: string; body: string }[] = [
@@ -39,7 +44,7 @@ const HIGHLIGHTS: { icon: React.ReactNode; title: string; body: string }[] = [
   },
 ];
 
-export function Onboarding({ ollamaError }: Props) {
+export function Onboarding({ ollamaError, ollamaCorsBlocked }: Props) {
   const { complete } = useOnboardingStore();
   const { setWorkspace } = useAgentStore();
 
@@ -79,12 +84,28 @@ export function Onboarding({ ollamaError }: Props) {
             <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-warning/10 border border-warning/30 text-warning text-xs">
               <AlertCircle className="size-3.5 shrink-0 mt-0.5" />
               <span>
-                {ollamaError} LocalMind runs models through{" "}
-                <a href="https://ollama.com" target="_blank" rel="noreferrer" className="underline">
-                  Ollama
-                </a>{" "}
-                — install and start it, then come back here. You can still look around in the meantime.
-                If Ollama is already installed and this still won't go away, open the Models tab and click "Log" next to Restart Ollama to see the actual error.
+                {ollamaCorsBlocked ? (
+                  <>
+                    {ollamaError} This happens with an Ollama instance you started yourself (outside LocalMind) whose
+                    CORS policy doesn't allow this app's origin — LocalMind only sets this automatically for
+                    Ollama instances it launches itself. Fix: set the{" "}
+                    <code className="px-1 py-0.5 rounded bg-black/10 dark:bg-white/10">OLLAMA_ORIGINS</code>{" "}
+                    environment variable to include{" "}
+                    <code className="px-1 py-0.5 rounded bg-black/10 dark:bg-white/10">http://tauri.localhost</code>{" "}
+                    (Windows) or{" "}
+                    <code className="px-1 py-0.5 rounded bg-black/10 dark:bg-white/10">tauri://localhost</code>{" "}
+                    (macOS/Linux) and restart Ollama, then come back here.
+                  </>
+                ) : (
+                  <>
+                    {ollamaError} LocalMind runs models through{" "}
+                    <a href="https://ollama.com" target="_blank" rel="noreferrer" className="underline">
+                      Ollama
+                    </a>{" "}
+                    — install and start it, then come back here. You can still look around in the meantime.
+                    If Ollama is already installed and this still won't go away, open the Models tab and click "Log" next to Restart Ollama to see the actual error.
+                  </>
+                )}
               </span>
             </div>
           )}

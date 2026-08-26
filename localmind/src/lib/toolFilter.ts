@@ -1,6 +1,8 @@
 import type { ToolDef } from "./tools";
 import { embedText } from "./vectorMemory";
 import { useMemoryStore } from "../store/memory";
+import { buildToolIndex, bm25Score, normalizeScores, isRankingAmbiguous } from "./toolBm25";
+import { effectiveAliases } from "./tools";
 
 /**
  * Relevance-based MCP/dynamic-tool gating (isair/jarvis-style "context-rot"
@@ -32,7 +34,7 @@ import { useMemoryStore } from "../store/memory";
  */
 
 /** An MCP (`__`) or dynamic (`group:"external"`) tool — everything else is a built-in. */
-function isExternalTool(t: ToolDef): boolean {
+export function isExternalTool(t: ToolDef): boolean {
   return t.name.includes("__") || t.group === "external";
 }
 
@@ -190,4 +192,159 @@ export async function filterToolsByRelevance(
 
   // Built-ins always pass; external tools only if they cleared the gate.
   return tools.filter((t) => !isExternalTool(t) || keptExternal.has(t.name));
+}
+
+// ─── Per-step retrieval (built-ins) ─────────────────────────────────────────
+//
+// Everything above this line is the ORIGINAL, unchanged external-tool hard
+// gate (still embedding-first — left untouched since it's already cheap in
+// the common case: it short-circuits entirely when no MCP/dynamic tools are
+// connected, and its documented MIN_FLOOR/MARGIN tuning is calibrated
+// specifically to cosine-similarity score ranges, not something to disturb
+// by swapping its scoring method).
+//
+// What follows is NEW: applying a *soft* rank+cap to the ~86 built-ins,
+// which previously always passed through this module untouched regardless
+// of relevance. Two safety nets bound the risk of a noisy per-round
+// objective signal starving the model of something essential mid-task:
+//   - a small protected CORE tier, never scored out;
+//   - a recency pin — whatever fired last round stays this round too.
+// Ranking itself is BM25-first (in-process, instant, every round) with
+// embedding as a conditional fallback (only when BM25 is ambiguous) —
+// unlike the external gate above, this DOES run every round (retrieval is
+// keyed to the current in-progress todo, which changes far more often per
+// session than "is an MCP server connected"), so it has to stay cheap by
+// default. See agentRuntime.ts for the memoization that additionally
+// collapses "every round" down to "every todo change" in practice.
+
+/** Tools kept regardless of score — fundamental I/O + planning + the
+ *  general command-execution escape hatch. Deliberately small: anything not
+ *  in this list is expected to genuinely vary in relevance by objective.
+ *
+ *  list_workflows/run_workflow are here for a different reason than the rest:
+ *  saved workflows are USER-DEFINED (a gym tracker, an expense logger,
+ *  anything) — their subject matter can't be baked into these two tools'
+ *  static descriptions, so BM25 has no keyword signal to rank them on for an
+ *  arbitrary incoming request. Confirmed live: a phone message ("log incline
+ *  dumbbell press 50lbs 3x6") that matched a real saved workflow by intent
+ *  never surfaced list_workflows/run_workflow in retrieval, and the model
+ *  fell back to search_past_sessions instead. Keeping both always-visible
+ *  costs nothing (list_workflows is a cheap read; run_workflow only acts on
+ *  a workflow the user already saved) and means every request gets a chance
+ *  to check "is there a saved automation for this" regardless of phrasing. */
+const CORE_TOOLS = new Set([
+  "read_file", "write_file", "patch_file",
+  "list_directory", "grep_files", "find_files",
+  "todo_write", "get_current_datetime", "run_command",
+  "list_workflows", "run_workflow",
+]);
+
+/** Soft cap on ranked (non-core, non-pinned) built-ins — sized for ~86 total
+ *  built-ins, not the thousands a fixed top-5-10 would assume. */
+const MAX_RANKED_BUILTINS = 25;
+
+/** True if `objective` names a tool directly — by its real name or one of
+ *  its effective aliases (hand-authored `useWhen`/`aliases` fields, plus the
+ *  free TOOL_ALIASES backfill via effectiveAliases()). Generalizes the
+ *  external gate's serviceTokens() service-name override to any tool. */
+function objectiveNamesTool(t: ToolDef, objectiveTokens: Set<string>): boolean {
+  const names = [t.name, ...effectiveAliases(t)];
+  return names.some((n) => {
+    const tokens = n.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+    return tokens.length > 0 && tokens.every((tok) => objectiveTokens.has(tok));
+  });
+}
+
+/**
+ * Soft-ranks the built-in subset of `tools` for the CURRENT objective,
+ * returning a reordered/trimmed built-in list — external tools are untouched
+ * (caller is expected to have already run them through `filterToolsByRelevance`
+ * and to re-merge that result back in; see `retrieveToolsForStep`).
+ *
+ * `recentToolNames`: tool(s) called in the immediately preceding round —
+ * pinned into this round's result regardless of score, so a mid-chain
+ * sequence (read_file → patch_file → run_command on the same file) can't
+ * have its next expected tool drop out just because the objective text
+ * didn't happen to mention it.
+ */
+export async function rankBuiltinTools(
+  builtins: ToolDef[],
+  objective: string,
+  recentToolNames: ReadonlySet<string> = new Set(),
+): Promise<ToolDef[]> {
+  if (builtins.length <= MAX_RANKED_BUILTINS || !objective.trim()) return builtins;
+
+  const core: ToolDef[] = [];
+  const pinned: ToolDef[] = [];
+  const rankable: ToolDef[] = [];
+  for (const t of builtins) {
+    if (CORE_TOOLS.has(t.name)) core.push(t);
+    else if (recentToolNames.has(t.name)) pinned.push(t);
+    else rankable.push(t);
+  }
+
+  const objectiveTokens = new Set(objective.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
+  const aliasHits: ToolDef[] = [];
+  const scorable: ToolDef[] = [];
+  for (const t of rankable) {
+    if (objectiveNamesTool(t, objectiveTokens)) aliasHits.push(t);
+    else scorable.push(t);
+  }
+
+  const remainingSlots = Math.max(0, MAX_RANKED_BUILTINS - aliasHits.length);
+  if (scorable.length === 0 || remainingSlots === 0) {
+    return [...core, ...pinned, ...aliasHits].slice(0, core.length + pinned.length + MAX_RANKED_BUILTINS);
+  }
+
+  const index = buildToolIndex(scorable);
+  const bm25Raw = bm25Score(index, objective);
+  let finalScores = normalizeScores(bm25Raw);
+
+  // Embedding is a conditional fallback, not a default cost — only pay for
+  // a live Ollama call when BM25 alone didn't clearly discriminate.
+  if (isRankingAmbiguous(bm25Raw)) {
+    try {
+      const model = useMemoryStore.getState().embedModel;
+      const queryEmb = await embedText(objective.slice(0, 500), model);
+      const embScores = new Map<string, number>();
+      for (const t of scorable) {
+        const e = await embedTool(t, model);
+        embScores.set(t.name, e ? cosine(queryEmb, e) : 0);
+      }
+      const blended = new Map<string, number>();
+      for (const t of scorable) {
+        const bm = finalScores.get(t.name) ?? 0;
+        const em = embScores.get(t.name) ?? 0;
+        blended.set(t.name, bm * 0.6 + em * 0.4);
+      }
+      finalScores = blended;
+    } catch {
+      // embedding unavailable — keep the BM25-only ranking, don't fail the round over it
+    }
+  }
+
+  const ranked = [...scorable]
+    .sort((a, b) => (finalScores.get(b.name) ?? 0) - (finalScores.get(a.name) ?? 0))
+    .slice(0, remainingSlots);
+
+  return [...core, ...pinned, ...aliasHits, ...ranked];
+}
+
+/**
+ * Full per-step retrieval: the existing external hard gate, then the new
+ * built-in soft rank+cap layered on top — the single entry point
+ * agentRuntime.ts's round loop calls each round.
+ */
+export async function retrieveToolsForStep(
+  tools: ToolDef[],
+  objective: string,
+  recentToolNames: ReadonlySet<string> = new Set(),
+): Promise<ToolDef[]> {
+  const afterExternalGate = await filterToolsByRelevance(tools, objective);
+  const builtins = afterExternalGate.filter((t) => !isExternalTool(t));
+  const externals = afterExternalGate.filter(isExternalTool);
+  const rankedBuiltins = await rankBuiltinTools(builtins, objective, recentToolNames);
+  // Preserve rankedBuiltins' own order (core/pinned/alias-hits/ranked, in
+  // that priority) followed by whatever externals cleared the outer gate.
+  return [...rankedBuiltins, ...externals];
 }

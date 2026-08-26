@@ -310,12 +310,29 @@ fn ensure_ollama_running() {
     // — this only runs while Ollama is confirmed down, so a retry after the
     // user installs Ollama needs to see that install immediately rather than
     // reusing whatever PATH was cached at LocalMind's own first startup.
+    // Confirmed live (curl'd Ollama's own CORS preflight response directly):
+    // WebView2's production origin for a packaged Tauri app is
+    // `http://tauri.localhost`, not `tauri://localhost` — Ollama's built-in
+    // default allowlist covers the `tauri://*` scheme (which is what macOS/
+    // Linux's WKWebView/WebKitGTK actually use, and what npm run tauri dev's
+    // plain `http://127.0.0.1:1420` origin already satisfies via its
+    // localhost-on-HTTP default), but `http://tauri.localhost` matches
+    // neither pattern and got a bare 403 with no CORS headers at all. Setting
+    // OLLAMA_ORIGINS only ever WIDENS Ollama's allowlist — its AllowedOrigins()
+    // appends the env var's origins onto its built-in defaults rather than
+    // replacing them — so this can't narrow access for anyone already working.
+    // Only fixes the instance LocalMind launches itself; an already-running,
+    // user-managed Ollama (the early return above) keeps whatever origins it
+    // was started with, which this process has no way to change.
+    const OLLAMA_ORIGINS_ADDITION: &str = "http://tauri.localhost";
+
     #[cfg(target_os = "windows")]
     let path_used = compute_effective_path();
     #[cfg(target_os = "windows")]
     let result = std::process::Command::new("ollama")
         .arg("serve")
         .env("PATH", &path_used)
+        .env("OLLAMA_ORIGINS", OLLAMA_ORIGINS_ADDITION)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn();
@@ -323,6 +340,7 @@ fn ensure_ollama_running() {
     #[cfg(not(target_os = "windows"))]
     let result = std::process::Command::new("ollama")
         .arg("serve")
+        .env("OLLAMA_ORIGINS", OLLAMA_ORIGINS_ADDITION)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn();

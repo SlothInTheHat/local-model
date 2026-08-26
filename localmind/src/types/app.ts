@@ -1,9 +1,9 @@
-export type AppView = "chat" | "code" | "docs" | "models" | "terminal" | "agents" | "research" | "study" | "settings" | "image" | "skills" | "benchmarks" | "compare" | "memory" | "logs" | "workflows" | "history";
+export type AppView = "chat" | "code" | "docs" | "models" | "terminal" | "agents" | "research" | "study" | "settings" | "image" | "skills" | "benchmarks" | "compare" | "memory" | "logs" | "workflows" | "history" | "resume";
 
 /** All top-level UI tabs/views, used for switch_view / send_task_to_tab validation and prompt rendering. */
 export const APP_VIEWS: AppView[] = [
   "chat", "code", "docs", "models", "terminal", "agents", "research",
-  "study", "settings", "image", "skills", "benchmarks", "compare", "memory", "logs", "workflows", "history",
+  "study", "settings", "image", "skills", "benchmarks", "compare", "memory", "logs", "workflows", "history", "resume",
 ];
 
 /**
@@ -28,6 +28,7 @@ export const VIEW_WIDTH: Record<AppView, "narrow" | "wide"> = {
   // its forms and two-column rows clip at the narrow width.
   settings: "wide",
   code: "wide",
+  resume: "wide",
   compare: "wide",
   benchmarks: "wide",
   terminal: "wide",
@@ -62,4 +63,6 @@ export const VIEW_DESCRIPTIONS: Record<AppView, string> = {
     "chat-created automations (saved via save_workflow) — dashboard to run on demand, view schedule/history, and delete",
   history:
     "cross-surface change history — every agent-made file change (chat, Code tab, scheduled/workflow runs) is auto-committed to a workspace-local shadow git repo (separate from the workspace's own .git, if any); browse diffs and restore individual files or the whole workspace to a prior point",
+  resume:
+    "LaTeX resume editor + tailoring agent — reads a job listing (pasted or fetched via web_fetch) and a dedicated 'Resume' background-knowledge collection (extra projects/experience not on the current resume, kept isolated from class/study collections), proposes edits as a reviewable side-by-side diff — never overwrites the file directly, only the user's Accept does",
 };

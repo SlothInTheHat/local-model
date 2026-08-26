@@ -24,6 +24,7 @@ materially changed, update this file as part of that change.**
 | **compare** | Side-by-side model comparison on the same prompt. |
 | **memory** | Global, cross-project memory — semantic search (via `nomic-embed-text` embeddings) over notes added here or by the agent (`save_global_memory`), shared by every project. Distinct from per-project memory (`.localmind/memory.md`, see Agent behaviors). |
 | **logs** | Agent session logs / history of tool calls. |
+| **resume** | LaTeX resume editor + tailoring agent — file tree/Monaco editor for the resume plus a dedicated chat that reads a job listing (pasted or fetched via `web_fetch`), a background "Resume" knowledge collection (kept isolated from class/study collections), and proposes edits as a reviewable side-by-side diff instead of writing directly. |
 
 ## Agent tools
 
@@ -44,6 +45,10 @@ system-prompt self-description and plan-mode/approval gating).
 - **Feature ideas** — lightbulb button has the agent research what similar tools (Claude Code, Cursor, other local-LLM agents) do well and write prioritized next-feature ideas to `FEATURE_IDEAS.md` (steerable via Settings).
 - **MCP client** — connect to external MCP servers (configured in Settings) for additional tools.
 - **Recent projects** — the workspace switcher (sidebar) remembers recently-opened project folders for one-click switching (desktop/Tauri only), and auto-reopens the last project on launch.
+- **Code Mode** (`run_tool_script`, off by default — enable per-tool in Settings) — the model can write a short JS script against a generated SDK of this round's retrieved tools instead of one tool call per round, batching a multi-step sequence into a single local-model turn. Runs in an isolated QuickJS (WASM) sandbox with no network/DOM access; every nested tool call still goes through the full approval/stuck-detector/read-before-write pipeline. Only offered to models `supportsCodeMode()` judges large/capable enough (`src/lib/modelCapabilities.ts`).
+- **Context-overflow recovery** — alongside the existing proactive (budget-ratio) history compaction, a real provider-reported "context window exceeded" error now triggers an immediate aggressive compaction + retry (up to 2x) instead of surfacing a dead-end error (`isContextOverflowError`/`compactHistoryAggressively`, `src/lib/contextSize.ts`).
+- **Reasoning-token hygiene** — thinking-model output (Ollama's `message.thinking`, or inline `<think>` tags) is captured for UI display (collapsed "Thinking" block) but never resent as part of `content` on a later turn — see `ChatMessage.thinking` / `sanitizeForWire` in `src/lib/ollama.ts`.
+- **Resume tailoring diff-gate** — the Resume tab's agent has no `write_file`/`patch_file`; it proposes a full replacement of the open `.tex` file via `propose_resume_edit`, rendered as a Monaco side-by-side diff, and only writes to disk when the user clicks Accept (Reject discards it, nothing touched). Its background material comes from a dedicated `search_resume_knowledge` tool hardcoded to a "Resume" knowledge collection, never mixed with the user's class/study collections.
 
 ## Companion: Phone Agent (Telegram bot, `phone-agent/`)
 

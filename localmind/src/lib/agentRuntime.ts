@@ -2,7 +2,7 @@ import type { ChatMessage } from "./ollama";
 import type { ToolDef, ToolCall, ToolResult } from "./tools";
 import { executeTool, normalizeSubPath, canonicalToolName, TOOL_DEFINITIONS, resolvePathParts } from "./tools";
 import { runAgentTurnForModel, streamChatForModel } from "./chatProvider";
-import { resolveNumCtx, compactHistoryIfOverBudget, capToolOutput } from "./contextSize";
+import { resolveNumCtx, compactHistoryIfOverBudget, compactHistoryAggressively, isContextOverflowError, capToolOutput } from "./contextSize";
 import { fileExists, listDirectory, readFileFromHandle } from "./fileSystem";
 import type { FileEntry } from "./fileSystem";
 import type { HardwareInfo } from "./hardware";
@@ -12,13 +12,15 @@ import { loadSkills, matchSkills, formatSkillsForContext } from "./skillEngine";
 import type { Skill } from "./skillEngine";
 import { formatToolLabel, summariseToolResult } from "./toolFormatting";
 import { StuckDetector, errorRecoveryHint, toolResultFailed } from "./stuckDetector";
-import { filterToolsByRelevance } from "./toolFilter";
+import { filterToolsByRelevance, retrieveToolsForStep } from "./toolFilter";
 import { buildCapabilityBlock } from "./capabilityRegistry";
 import type { AppView } from "../types/app";
 import { useTaskQueueStore } from "../store/taskQueue";
 import { usePendingSkillsStore } from "../store/pendingSkills";
 import { commitAfterToolCall } from "./shadowGit";
 import { resolveRole } from "./modelRoles";
+import { supportsCodeMode } from "./modelCapabilities";
+import { runToolScript } from "./toolScript";
 
 // ─── Tauri invoke shim (mirrors the pattern used in src/lib/tools.ts / AppSettings.tsx) ──
 
@@ -39,6 +41,9 @@ const MAX_COMPLETION_CHECKS = 2;
 
 /** How many times findMissingReferencedFiles can nudge before giving up and falling through to the normal completion check — a safety valve so a check bug can't hang a session forever. */
 const MAX_MISSING_REF_NUDGES = 2;
+
+/** How many times a real provider-reported context-overflow error can trigger an aggressive-compaction retry before giving up and surfacing a clear failure instead of looping forever against a window that's fundamentally too small. */
+const MAX_CONTEXT_OVERFLOW_RETRIES = 2;
 
 export interface TodoItem {
   id: string;
@@ -65,6 +70,30 @@ const READ_ONLY_ALIASES = [
   "read", "cat",                           // → read_file
   "transcribe", "transcribe_audio",        // → transcribe_video
 ];
+
+/**
+ * Hallucinated MCP-shaped tool names — observed live, twice, from a weak
+ * local model in quick-invoke's "circle a region, ask about it" flow: even
+ * after being told the exact real tool name to call ("Call take_screenshot"),
+ * the model instead invented "browser__browser_take_screenshot", a
+ * plausible-sounding name for a tool that was never offered this session
+ * (quick-invoke's headless run never includes MCP tools at all — see
+ * handleQuickInvokeWidget in App.tsx). canonicalToolName() (tools.ts)
+ * deliberately leaves any "__"-containing name untouched, on the assumption
+ * it's a real MCP tool reference — so this can't live in that name-agnostic
+ * lookup without risking hijacking a GENUINE same-named MCP tool in a
+ * session where one really is connected. Instead this is consulted only as a
+ * fallback in executeToolGuarded, after confirming the called name doesn't
+ * match any tool actually in `config.tools` this session — so a real,
+ * connected browser-automation server's own `browser__browser_take_screenshot`
+ * (if a user's MCP setup ever genuinely has one) is found first and this
+ * never overrides it.
+ */
+const HALLUCINATED_TOOL_FALLBACKS: Record<string, string> = {
+  browser__browser_take_screenshot: "take_screenshot",
+  browser__take_screenshot: "take_screenshot",
+  browser_take_screenshot: "take_screenshot",
+};
 
 export interface OpenFileInfo {
   path: string;
@@ -118,6 +147,18 @@ export interface AgentRuntimeConfig {
   conversational?: boolean;
 
   /**
+   * Selects an alternate, additive system-prompt branch for a specific
+   * feature surface instead of the generic coding-loop/conversational
+   * prompts. Currently only "resume" (the Resume Tailoring tab) — its agent
+   * has no write_file/patch_file and proposes edits via propose_resume_edit
+   * for the user to accept/reject as a diff, so neither existing prompt fits:
+   * the coding prompt talks about tools this surface doesn't have, and the
+   * conversational prompt actively discourages tool use. Unset for every
+   * other caller, so this is purely additive.
+   */
+  promptSurface?: "resume";
+
+  /**
    * This session's whole point is to mutate the workspace (scheduler /
    * task-queue runs) — there's no chat UI for anyone to read a text-only
    * answer. When set, the inaction-nudge (below) also fires if the session
@@ -149,6 +190,13 @@ export interface AgentRuntimeConfig {
 
   onTextDelta?: (chunk: string) => void;
   onTextReplace?: (cleanText: string) => void;
+  /**
+   * Reasoning/"thinking" output from a thinking-capable model. Never folded
+   * into `roundText`/`history` — this is a UI/display-only side channel, kept
+   * separate so a model's prior reasoning is never resent as part of `content`
+   * on a later turn (see ChatMessage.thinking in ollama.ts).
+   */
+  onThinkingDelta?: (chunk: string) => void;
   onToolCallStart?: (call: ToolCall, label: string) => void;
   onApprovalNeeded: (call: ToolCall) => Promise<boolean>;
   /**
@@ -176,6 +224,12 @@ export interface AgentRuntimeConfig {
    * it would corrupt the model's own context.
    */
   onDebugPrompt?: (info: { round: number; systemMessage: string }) => void;
+
+  /** Fired when a tool the model called wasn't in that round's retrieved
+   *  candidate set (see toolFilter.ts's retrieveToolsForStep) — the same
+   *  event already logged via console.info, additionally surfaced here so
+   *  it's visible in-app (debug mode's rail) without opening devtools. */
+  onRetrievalMiss?: (info: { round: number; toolName: string; objective: string }) => void;
 
   signal: AbortSignal;
 }
@@ -271,6 +325,35 @@ function buildConversationalSystemPrompt(config: AgentRuntimeConfig): string {
   return lines.join("\n");
 }
 
+/**
+ * System prompt for the Resume Tailoring tab. Deliberately does not reuse
+ * the coding-loop prompt below (todo_write cadence, patch_file/write_file/
+ * run_command guidance) since RESUME_TOOLS contains none of those tools —
+ * and does not reuse buildConversationalSystemPrompt either, since that
+ * prompt actively discourages tool use while this agent's entire job is to
+ * call tools (web_fetch, search_resume_knowledge, propose_resume_edit).
+ */
+function buildResumeTailoringSystemPrompt(config: AgentRuntimeConfig): string {
+  const sessionTools = config.toolsSupported ? config.tools : [];
+  const lines: string[] = [
+    "You are a resume-tailoring assistant inside LocalMind's Resume tab.",
+    "",
+    buildRuntimeLine(config.modelRef, config.hardware, config.workspaceName, config.workspacePath),
+    "",
+    "## How this works",
+    "- The user has a LaTeX resume open (shown below as 'Open:'). If the visible snippet looks truncated or doesn't show the section you need, call read_file on that same path for the full text.",
+    "- You have NO file-write tool. To propose a change, call propose_resume_edit with the user's job in mind and the FULL new file content (not just the changed lines) plus a one-line summary. The user reviews it as a side-by-side diff and explicitly accepts or rejects it — nothing is saved until they do.",
+    "- Never tell the user you 'updated', 'saved', or 'changed' the resume — say you've proposed an edit and it's waiting for their review.",
+    "- If given a job listing URL, call web_fetch once to retrieve it before proposing edits. If given pasted job text directly, use it as-is — do not re-fetch or search for it.",
+    "- Before inventing new bullet content, call search_resume_knowledge to check whether the user has relevant background material (a project, an internship, a skill) that isn't on the current resume but fits this job — prefer real background material over fabricating claims. This tool searches ONLY the user's dedicated 'Resume' background collection, never their class/study notes.",
+    "- Never fabricate experience, skills, employers, or metrics that aren't present in the open resume or in search_resume_knowledge results.",
+    "",
+    buildCapabilityBlock(sessionTools),
+  ];
+
+  return lines.join("\n");
+}
+
 // NOTE — a dedicated short "unattended background agent" prompt for
 // expectSideEffects sessions was tried here and REMOVED after a faithful
 // harness A/B (scratchpad/faithful_sched_harness.js, 2026-07-06): under the
@@ -281,6 +364,7 @@ function buildConversationalSystemPrompt(config: AgentRuntimeConfig): string {
 // knowledge-writer tools removed from the headless offering). Don't reintroduce
 // a lean unattended prompt without re-running that harness.
 function buildSystemPrompt(config: AgentRuntimeConfig): string {
+  if (config.promptSurface === "resume") return buildResumeTailoringSystemPrompt(config);
   if (config.conversational) return buildConversationalSystemPrompt(config);
 
   const modeTag = liveFlag(config.agentBuildMode) ? "BUILD" : "PLAN";
@@ -324,10 +408,12 @@ function buildSystemPrompt(config: AgentRuntimeConfig): string {
     "- If your change adds, removes, or materially changes a feature, tool, or tab, update FEATURES.md in the workspace root to match.",
     "- If a tool reports a path as not found, check the File tree in 'Current state' for the correct nested path (e.g. project files may live inside a subfolder like \"my-app/src/...\", not at the workspace root) before retrying — don't repeat a path that just failed.",
     "- Only ever call tools that appear under 'Tools available this session' below. If no listed tool fits, accomplish the goal with the tools you DO have — never invent a tool name (there is no 'create-skill', 'generate-dashboard', 'create-local-mind-skill', etc.); calling a non-existent tool just fails and wastes the turn.",
+    "- The reverse mistake is just as bad: before telling the user a capability isn't available (downloading a file, removing an image background, resolving a folder path, etc.), CAREFULLY re-read the actual tool list below — do not answer from a general impression of 'what an AI chatbot can typically do.' A multi-step request (search, then download, then transform, then save) usually needs a matching CHAIN of tools that likely IS available even if no single tool does everything — check for one before claiming the task is impossible.",
     "- To create / author / save a skill when the user asks (even from a long spec they paste), call save_skill with name, tags, and content (the full markdown instructions) — that is the ONLY way to make a skill. To produce a report/document/dashboard, write_file the content yourself; there is no separate 'generate' tool.",
     "- If a task needs a capability you don't have: if a shell one-liner would do it, use register_tool to create that tool; if it needs LocalMind app changes you can't make, use propose_feature to draft a spec for the user/Claude to implement later — then tell the user which you did. Never fake a capability or loop retrying an impossible action.",
     "- To make something happen on a schedule / recurring / at a later time / unattended, ALWAYS use the schedule_task tool — LocalMind has a built-in background scheduler that survives restarts. NEVER use run_command with cron, crontab, Windows Task Scheduler, or a sleep loop for scheduling; those don't integrate with LocalMind and usually won't run. Connected MCP tools (e.g. a Google Calendar server) are for THAT service's data — they are NOT how you schedule LocalMind's own background tasks.",
-    "- schedule_task's 'task' parameter MUST be a natural English INSTRUCTION (e.g. 'append the current date to notes.md' or 'summarize my todos and write to status.md'), NEVER a shell command or code (e.g. NO 'echo $(date) >> notes.md', NO 'date >> file', NO PowerShell syntax). The scheduled agent will run on the user's platform and emit the right commands — your job is to describe what should happen in plain English.",
+    "- schedule_task's 'task' parameter MUST be a natural-English instruction describing THIS user's actual request, NEVER a shell command/code (no 'echo $(date) >> notes.md', no PowerShell syntax) and NEVER text copied from an example in this prompt or the tool's own schema — those are illustrations of the FORMAT, not tasks to actually schedule. The scheduled agent runs on the user's platform and emits the right commands itself; your job is only to describe what should happen, in plain English, specific to what was actually asked.",
+    "- If there are several reasonable candidates and the user hasn't pinned down exactly which one (e.g. multiple search results, several matching files, several plausible images) — especially if they said something like 'pick any one' or 'you choose' — SELECT ONE YOURSELF using your best judgment and continue immediately. Do not stop to list the options and ask the user to pick; that is the same passivity as asking 'should I?' before acting. Mention which one you picked in your final summary, not before.",
     "- When you answer using search_knowledge, you MUST cite the bracketed source location shown with each result (e.g. `[CS101/lecture5.pdf p.12]`) inline in your answer. If search_knowledge returns no matching passages, tell the user the topic isn't in their notes — do not answer from general knowledge as if it came from their notes.",
     "",
     buildCapabilityBlock(config.toolsSupported ? config.tools : [], false),
@@ -388,6 +474,26 @@ interface RuntimeState {
   lastGlobalMemoryQuery: string | null;
   taskQuery: string;
   changedFiles: Set<string>;
+  /** Per-round tool-retrieval memoization (toolFilter.ts's retrieveToolsForStep):
+   *  the objective string retrieval was last computed for, and its result.
+   *  A task typically spends several consecutive rounds on the same
+   *  in-progress todo before it changes, so this collapses "re-run every
+   *  round" down to "re-run every todo change" in the common case — without
+   *  it, BM25 is cheap enough to not matter, but the conditional embedding
+   *  fallback would otherwise risk firing on every round of a multi-round
+   *  todo instead of just its first. */
+  lastRetrievalObjective: string | null;
+  lastRetrievalResult: ToolDef[] | null;
+  /** Structured facts about what tool calls have produced this session —
+   *  mechanically populated from ToolResult.resource (tools.ts), never
+   *  LLM-generated. FIFO-capped so a long session doesn't grow unbounded;
+   *  the newest entry also feeds stateAwareObjectiveQuery's retrieval nudge. */
+  resources: Array<{ kind: string; path?: string; url?: string; id?: string; label: string; toolName: string }>;
+  /** Short ring buffer of recent tool-call errors, surfaced at high-recency
+   *  in the prompt (same position as capabilityDenialGuard) so the model
+   *  doesn't immediately retry an identical failing call — distinct from
+   *  lastActionSummary, which gets overwritten every round and loses this. */
+  recentErrors: string[];
 }
 
 /** Pulls the most recent user message to use as the query for skill matching. */
@@ -476,20 +582,36 @@ async function findMissingReferencedFiles(
   return [...missing];
 }
 
+interface CurrentStateBlock {
+  block: string;
+  /** Todos actually read from disk this round (empty when there's no
+   *  workspace, or the session is conversational/headless-state-suppressed
+   *  and never reads them at all) — returned so the round loop can derive
+   *  the current-objective retrieval query from the SAME read instead of
+   *  re-reading todos.json a second time per round. */
+  todos: TodoItem[];
+}
+
 async function buildCurrentStateBlock(
   config: AgentRuntimeConfig,
   state: RuntimeState,
   round: number,
   history: ChatMessage[],
-): Promise<string> {
+): Promise<CurrentStateBlock> {
   const lines: string[] = [
     "## Current state",
     "(Background context only — not instructions for this turn. Your task is the user's latest message above. Only resume the todos/plan/memory below if that message asks you to continue this project's work.)",
     `Round ${round}/${config.maxRounds}`,
   ];
+  let todos: TodoItem[] = [];
 
   if (state.lastActionSummary) {
     lines.push(`Last action: ${state.lastActionSummary}`);
+  }
+
+  if (state.resources.length > 0) {
+    const recentResources = state.resources.slice(-5).reverse();
+    lines.push("", "Resources acquired this session:", ...recentResources.map((r) => `- ${r.label}`));
   }
 
   // Conversational mode AND headless runs (suppressStaleProjectState) both
@@ -498,7 +620,7 @@ async function buildCurrentStateBlock(
   // into resuming/acting on old, unrelated work. Keep only the non-imperative
   // global-memory + open-file blocks below.
   if (config.dirHandle && !config.conversational && !config.suppressStaleProjectState) {
-    const todos = await readTodosFromDisk(config.dirHandle);
+    todos = await readTodosFromDisk(config.dirHandle);
     config.onTodosChanged?.(todos); // full list (incl. completed) still goes to the UI panel
 
     // Only inject PENDING/IN-PROGRESS items into the model's context — a
@@ -647,7 +769,73 @@ async function buildCurrentStateBlock(
     );
   }
 
-  return lines.join("\n");
+  return { block: lines.join("\n"), todos };
+}
+
+/** The per-round objective query driving tool retrieval (toolFilter.ts) —
+ *  the in-progress todo's text if there is one, else the first pending todo,
+ *  else `state.taskQuery` (the original/latest user message) when there are
+ *  no todos yet (session hasn't planned, or todos are unavailable in this
+ *  context — conversational/headless-suppressed/no-workspace). Deliberately
+ *  NOT `state.taskQuery` itself, which stays pinned to the original message
+ *  for completion-review/skill-distillation framing (see its declaration) —
+ *  same separation-of-concerns precedent as `lastGlobalMemoryQuery` above. */
+function currentObjectiveQuery(todos: TodoItem[], state: RuntimeState): string {
+  const active = todos.find((t) => t.status === "in_progress") ?? todos.find((t) => t.status === "pending");
+  return active ? active.content : state.taskQuery;
+}
+
+/** currentObjectiveQuery's output enriched with the most recent resource
+ *  fact, so retrieval itself shifts once state changes — e.g. once a file
+ *  is downloaded, appending "(have: downloaded file at ...)" pulls
+ *  remove_background/convert_image up in BM25 ranking via ordinary token
+ *  overlap, without a new LLM call. Only the single most recent fact is
+ *  folded in — rankBuiltinTools scores the whole string as one bag of
+ *  tokens, and the todo-text signal is what's proven reliable; widen only
+ *  if evidence shows a real multi-fact-needed case. */
+function stateAwareObjectiveQuery(todos: TodoItem[], state: RuntimeState): string {
+  const base = currentObjectiveQuery(todos, state);
+  if (state.resources.length === 0) return base;
+  const last = state.resources[state.resources.length - 1];
+  return `${base} (have: ${last.label})`;
+}
+
+/**
+ * Tools observed (live, twice, with the exact tools ranked well inside the
+ * retrieved set both times) getting falsely denied by small models — the
+ * model answers from a pretrained prior ("AI assistants can't edit images")
+ * that overrides what's actually in its own context, the same failure shape
+ * already fixed once for search_knowledge (see the knowledge-base note at
+ * the end of buildCurrentStateBlock). That fix worked via two things a
+ * mid-list rule doesn't get: it's the LAST thing in the prompt (highest
+ * recency — small models weight that far more than description quality),
+ * and it names and forbids the exact bad completion instead of only
+ * describing the right tool. This generalizes that same pattern to a second
+ * observed cluster (image download/editing) rather than duplicating the
+ * knowledge-base-specific code.
+ *
+ * Evidence-driven, same spirit as ToolDef.aliases/useWhen's backfill: add a
+ * capability to WATCHED_CAPABILITIES only once a real false-denial is
+ * observed for it, not speculatively for every tool.
+ */
+const WATCHED_CAPABILITIES: Array<{ tools: string[]; label: string }> = [
+  { tools: ["download_file", "remove_background", "search_images", "convert_image"], label: "downloading, editing, or converting images/files" },
+];
+
+/** Returns a late-recency reminder naming whichever watched tools survived
+ *  THIS round's retrieval, or "" if none of them did (nothing to remind
+ *  about, or retrieval genuinely excluded the whole cluster this round). */
+function capabilityDenialGuard(toolsThisRound: ToolDef[]): string {
+  const availableNames = new Set(toolsThisRound.map((t) => t.name));
+  const lines: string[] = [];
+  for (const { tools, label } of WATCHED_CAPABILITIES) {
+    const present = tools.filter((t) => availableNames.has(t));
+    if (present.length > 0) {
+      lines.push(`For ${label}: you DO have ${present.join(", ")} — listed above under "Tools available this session". A multi-step request (find/download/edit/save) is a normal chain of several of these calls, not a missing capability. Do NOT tell the user you lack this ability.`);
+    }
+  }
+  if (lines.length === 0) return "";
+  return `\n\nIMPORTANT — capability reminder:\n${lines.join("\n")}`;
 }
 
 interface GuardedExecution {
@@ -655,6 +843,16 @@ interface GuardedExecution {
   toolContent: string;
   blocked: boolean;
   sideEffect: boolean;
+  /**
+   * Only set when call.name === "run_tool_script": the union of mutating
+   * paths and tool names from every NESTED call the script made. The round
+   * loop's bookkeeping (state.changedFiles, calledThisRound/retrieval-miss
+   * tracking) is keyed off the top-level call by default — pathsFromCall("run_tool_script")
+   * would return [] since its args are just {code}, so this is how that
+   * bookkeeping still sees what the script actually did internally.
+   */
+  scriptSideEffectPaths?: string[];
+  scriptCalledTools?: string[];
 }
 
 function pathsFromCall(call: ToolCall): string[] {
@@ -710,6 +908,7 @@ async function executeToolGuarded(
   config: AgentRuntimeConfig,
   detector: StuckDetector,
   sessionReadPaths: Set<string>,
+  toolsThisRound: ToolDef[],
 ): Promise<GuardedExecution> {
   // 0a. Canonicalize the tool name up front (hyphen→underscore, aliases) so a
   // weak model's "schedule-task" resolves to schedule_task BEFORE policy/approval
@@ -741,7 +940,22 @@ async function executeToolGuarded(
   }
 
   // 1. Metadata-driven policy resolution + Plan-mode denial
-  const def = config.tools.find((t) => t.name === call.name);
+  let def = config.tools.find((t) => t.name === call.name);
+
+  // 0b. Hallucinated-MCP-name fallback — only when the called name isn't a
+  // real tool actually offered this session (see HALLUCINATED_TOOL_FALLBACKS'
+  // doc comment for why this can't be a blind rename in canonicalToolName).
+  if (!def) {
+    const fallbackName = HALLUCINATED_TOOL_FALLBACKS[call.name];
+    if (fallbackName) {
+      const fallbackDef = config.tools.find((t) => t.name === fallbackName);
+      if (fallbackDef) {
+        call = { ...call, name: fallbackName };
+        def = fallbackDef;
+      }
+    }
+  }
+
   const policy = resolveToolPolicy(call, def);
 
   if (!policy.planModeAllowed && !liveFlag(config.agentBuildMode)) {
@@ -816,6 +1030,86 @@ async function executeToolGuarded(
     }
   }
 
+  // 4.5. Code Mode: run_tool_script executes a sandboxed script instead of
+  // going through executeTool directly (see toolScript.ts for the sandbox
+  // itself). Every nested call the script makes re-enters THIS function
+  // recursively, so approval/StuckDetector/read-before-write/capToolOutput/
+  // shadow-git all still apply per nested call, exactly as if each were its
+  // own normal round — the script is purely a batching mechanism, not a
+  // bypass of any gate above.
+  if (call.name === "run_tool_script") {
+    const code = typeof call.args["code"] === "string" ? (call.args["code"] as string) : "";
+    if (!code.trim()) {
+      return {
+        result: { toolCallId: call.id, name: call.name, output: "", error: "Empty script" },
+        toolContent: "run_tool_script was called with no code. Provide JavaScript that calls one or more of your available tools, e.g. read_file({ path: \"a.ts\" }).",
+        blocked: true,
+        sideEffect: false,
+      };
+    }
+
+    const nestedCalledTools = new Set<string>();
+    const dispatch = async (name: string, nestedArgs: Record<string, unknown>) => {
+      if (name === "run_tool_script") {
+        return { output: "", error: "run_tool_script cannot call itself from inside a script." };
+      }
+      const nestedCall: ToolCall = { id: crypto.randomUUID(), name, args: nestedArgs };
+      const label = formatToolLabel(nestedCall.name, nestedCall.args);
+      config.onToolCallStart?.(nestedCall, label);
+      const nested = await executeToolGuarded(nestedCall, config, detector, sessionReadPaths, toolsThisRound);
+      const nestedSummary = nested.blocked
+        ? `${label} → ${nested.result.error}`
+        : nested.result.error ? `${label} → error` : summariseToolResult(nestedCall.name, nestedCall.args, nested.result.output);
+      config.onToolCallResolved?.(nestedCall, label, nested.result, nestedSummary, nested.toolContent);
+      nestedCalledTools.add(name);
+      if (nested.scriptCalledTools) for (const n of nested.scriptCalledTools) nestedCalledTools.add(n);
+      return {
+        output: nested.toolContent,
+        error: nested.result.error,
+        sideEffect: nested.sideEffect,
+        paths: nested.sideEffect ? pathsFromCall(nestedCall) : (nested.scriptSideEffectPaths ?? []),
+      };
+    };
+
+    const scriptResult = await runToolScript(code, toolsThisRound, dispatch);
+
+    if (scriptResult.sandboxError) {
+      const toolContent = capToolOutput(
+        `Script failed: ${scriptResult.sandboxError}\nFall back to calling tools directly, one per round, if this keeps happening.`,
+      );
+      return {
+        result: { toolCallId: call.id, name: call.name, output: "", error: scriptResult.sandboxError },
+        toolContent,
+        blocked: false,
+        sideEffect: scriptResult.hadMutatingCall,
+        scriptSideEffectPaths: [...scriptResult.sideEffectPaths],
+        scriptCalledTools: [...nestedCalledTools],
+      };
+    }
+
+    const callLines = scriptResult.calls.map((c, i) => {
+      const label = formatToolLabel(c.name, c.args);
+      const short = c.error ? `Error: ${c.error}` : summariseToolResult(c.name, c.args, c.output);
+      return `${i + 1}. ${label} → ${short}`;
+    });
+    let toolContent = [
+      `Ran run_tool_script (${scriptResult.calls.length} tool call${scriptResult.calls.length === 1 ? "" : "s"}):`,
+      ...callLines,
+      scriptResult.consoleOutput ? `\nconsole output:\n${scriptResult.consoleOutput}` : "",
+      `\nreturn value: ${scriptResult.returnValue}`,
+    ].filter(Boolean).join("\n");
+    toolContent = capToolOutput(toolContent);
+
+    return {
+      result: { toolCallId: call.id, name: call.name, output: toolContent },
+      toolContent,
+      blocked: false,
+      sideEffect: scriptResult.hadMutatingCall,
+      scriptSideEffectPaths: [...scriptResult.sideEffectPaths],
+      scriptCalledTools: [...nestedCalledTools],
+    };
+  }
+
   // 5. Execute
   const result = await executeTool(call, config.dirHandle, config.workspacePath ?? undefined);
 
@@ -873,6 +1167,15 @@ export async function runAgentSession(
   priorHistory: ChatMessage[],
   config: AgentRuntimeConfig,
 ): Promise<AgentRuntimeResult> {
+  // "Code Mode" (run_tool_script) is opt-in via the normal per-tool toggle
+  // (store/agent.ts's DEFAULT_TOOLS_ENABLED, off by default — same posture as
+  // run_command), but even when a user has switched it on, only offer it to
+  // models supportsCodeMode judges capable of writing a small reliable
+  // script — see that function's doc comment for why. Filtered once here
+  // rather than at every config.tools read site below.
+  if (config.tools.some((t) => t.name === "run_tool_script") && !supportsCodeMode(config.modelRef)) {
+    config = { ...config, tools: config.tools.filter((t) => t.name !== "run_tool_script") };
+  }
   const numCtx = resolveNumCtx(config.hardware, config.numCtxOverride, config.modelRef);
   const detector = new StuckDetector();
   const sessionReadPaths = new Set<string>();
@@ -889,6 +1192,10 @@ export async function runAgentSession(
     cachedCollections: null,
     taskQuery: deriveTaskQuery(priorHistory),
     changedFiles: new Set<string>(),
+    lastRetrievalObjective: null,
+    lastRetrievalResult: null,
+    resources: [],
+    recentErrors: [],
   };
 
   let history: ChatMessage[] = [...priorHistory];
@@ -901,6 +1208,7 @@ export async function runAgentSession(
   let completionCheckCount = 0;
   let inactionNudgeCount = 0;
   let missingRefNudgeCount = 0;
+  let contextOverflowRetries = 0;
   let hadDeniedToolCalls = false;
   // expectSideEffects sessions (scheduler/task-queue) get a 2nd inaction nudge —
   // observed live: a single distraction (e.g. a stray management-tool call) or
@@ -911,14 +1219,15 @@ export async function runAgentSession(
   // the extra round.
   const maxInactionNudges = config.expectSideEffects ? 2 : 1;
 
-  // Relevance-filter the tool list so a large set (many connected MCP tools)
-  // doesn't overwhelm weak local models — keeps essential file/shell/plan tools
-  // plus the tools most relevant to this task. Fails open for small lists.
+  // Session-level tool list — NOT what most rounds actually use anymore (see
+  // retrieveToolsForStep below, called fresh per round in the main loop).
+  // This one-time, original-message-scoped filter now only backs two things:
+  // the toolless-model early-return path just below (no round loop to be
+  // "per-round" in), and the router's own tool set/prompt (kept exactly as
+  // before this change — see the router comment beneath this block).
   const toolsForModel = config.toolsSupported
     ? await filterToolsByRelevance(config.tools, state.taskQuery)
     : [];
-  // Build the system prompt from the SAME (filtered) tool list so its
-  // "Available tools" self-description matches what the model can actually call.
   const systemPrompt = buildSystemPrompt(
     config.toolsSupported ? { ...config, tools: toolsForModel } : config,
   );
@@ -966,6 +1275,14 @@ export async function runAgentSession(
       return { hadSideEffects, hitRoundLimit, wasAborted, roundsUsed: round, finalHistory: history, hadDeniedToolCalls };
     }
 
+    // Tool(s) called in the immediately preceding round — pinned into this
+    // round's retrieval regardless of score (see toolFilter.ts's recency
+    // pin), so a mid-chain sequence can't have its next expected tool
+    // dropped just because the objective text didn't mention it. Updated at
+    // the end of each non-router round below; router rounds don't touch it,
+    // since it only feeds the non-router retrieval path.
+    let recentToolNames = new Set<string>();
+
     while (round < config.maxRounds) {
       round++;
       const isRouterRound = routingPhaseActive;
@@ -975,12 +1292,33 @@ export async function runAgentSession(
       // writes into would leave empty gaps in the transcript.
       if (!isRouterRound) config.onRoundStart?.(round, config.maxRounds);
 
-      const stateBlock = await buildCurrentStateBlock(config, state, round, history);
+      const { block: stateBlock, todos } = await buildCurrentStateBlock(config, state, round, history);
       const routerRoundNote = isRouterRound
         ? "\n\nYou are in a TOOL-LOOKUP phase, not the main agent for this task: use ONLY the read-only tools available to you to gather what's needed to answer the user. You cannot write/modify/run anything right now (those tools aren't offered this round) — don't attempt to. Once you've found the relevant information, STOP calling tools; a different model takes over from there to write the actual answer."
         : "";
 
-      const activeSystemPrompt = isRouterRound ? routerSystemPrompt : systemPrompt;
+      // Per-round tool retrieval (non-router path only — the router keeps
+      // its own fixed read-only tool set/prompt from before the loop,
+      // untouched by this feature). Keyed on the CURRENT objective (the
+      // in-progress todo, not the pinned original message — see
+      // currentObjectiveQuery's doc comment), re-run only when that
+      // objective actually changed since last round (memoized below), which
+      // in practice collapses "every round" down to "every todo change."
+      let toolsThisRoundNonRouter = toolsForModel;
+      let nonRouterSystemPrompt = systemPrompt;
+      if (!isRouterRound) {
+        const objective = stateAwareObjectiveQuery(todos, state);
+        if (objective === state.lastRetrievalObjective && state.lastRetrievalResult) {
+          toolsThisRoundNonRouter = state.lastRetrievalResult;
+        } else {
+          toolsThisRoundNonRouter = await retrieveToolsForStep(config.tools, objective, recentToolNames);
+          state.lastRetrievalObjective = objective;
+          state.lastRetrievalResult = toolsThisRoundNonRouter;
+        }
+        nonRouterSystemPrompt = buildSystemPrompt({ ...config, tools: toolsThisRoundNonRouter });
+      }
+
+      const activeSystemPrompt = isRouterRound ? routerSystemPrompt : nonRouterSystemPrompt;
 
       // WP4.1: fold old history into a compact work-log stub before the
       // projected token load overflows numCtx (see compactHistoryIfOverBudget
@@ -994,7 +1332,18 @@ export async function runAgentSession(
         );
       }
 
-      const roundSystemMessage = `${activeSystemPrompt}\n\n${stateBlock}${routerRoundNote}`;
+      // Pushed after the state block (highest-recency position, same
+      // reasoning as the knowledge-base note inside buildCurrentStateBlock)
+      // — router rounds skip it, same reasoning as routerRoundNote: it's a
+      // primary-model concern, not something the read-only lookup phase needs.
+      const capabilityGuard = isRouterRound ? "" : capabilityDenialGuard(toolsThisRoundNonRouter);
+      // Same high-recency position/reasoning as capabilityGuard above — a
+      // small model needs a failure named at the very end of the prompt to
+      // reliably avoid repeating it, not buried mid-prompt in the state block.
+      const errorGuard = isRouterRound || state.recentErrors.length === 0
+        ? ""
+        : `\n\nRecent errors this session (do not repeat the same failing call — try a different approach):\n${state.recentErrors.slice(-3).map((e) => `- ${e}`).join("\n")}`;
+      const roundSystemMessage = `${activeSystemPrompt}\n\n${stateBlock}${routerRoundNote}${capabilityGuard}${errorGuard}`;
       const messagesForRound: ChatMessage[] = [
         { role: "system", content: roundSystemMessage },
         ...history,
@@ -1003,14 +1352,18 @@ export async function runAgentSession(
 
       lastRoundHadToolCalls = false;
       let roundText = "";
+      let overflowRetryHandled = false;
+      const calledThisRound = new Set<string>();
 
       const modelForThisRound = isRouterRound ? routerModel! : config.modelRef;
-      const toolsForThisRound = isRouterRound ? routerTools : toolsForModel;
+      const toolsForThisRound = isRouterRound ? routerTools : toolsThisRoundNonRouter;
 
       for await (const event of runAgentTurnForModel(modelForThisRound, messagesForRound, toolsForThisRound, config.signal, { numCtx })) {
         if (config.signal.aborted) throw new DOMException("Aborted", "AbortError");
 
-        if (event.type === "text_delta" && event.content) {
+        if (event.type === "thinking_delta" && event.content) {
+          if (!isRouterRound) config.onThinkingDelta?.(event.content);
+        } else if (event.type === "text_delta" && event.content) {
           if (event.content.startsWith("\x00CLEAN:")) {
             const clean = event.content.slice("\x00CLEAN:".length);
             if (!isRouterRound) config.onTextReplace?.(clean);
@@ -1029,19 +1382,29 @@ export async function runAgentSession(
           for (const call of event.toolCalls) {
             if (config.signal.aborted) throw new DOMException("Aborted", "AbortError");
 
+            calledThisRound.add(call.name);
             const label = formatToolLabel(call.name, call.args);
             config.onToolCallStart?.(call, label);
             config.onActivity?.(label);
 
-            const { result, toolContent, blocked, sideEffect } = await executeToolGuarded(call, config, detector, sessionReadPaths);
+            const { result, toolContent, blocked, sideEffect, scriptSideEffectPaths, scriptCalledTools } =
+              await executeToolGuarded(call, config, detector, sessionReadPaths, toolsForThisRound);
 
             config.onActivity?.(null);
+
+            // A run_tool_script call's own tool-retrieval/recency bookkeeping
+            // should reflect what it actually called internally, not just the
+            // wrapper name — otherwise every nested tool looks like a
+            // retrieval miss next round (it WAS in this round's retrieved
+            // set; it just wasn't the top-level call).
+            if (scriptCalledTools) for (const n of scriptCalledTools) calledThisRound.add(n);
 
             if (sideEffect) {
               hadSideEffects = true;
               state.treeDirty = true;
               if (call.name === "install_deps") state.memoryDirty = true;
-              for (const p of pathsFromCall(call)) state.changedFiles.add(p);
+              const paths = call.name === "run_tool_script" ? (scriptSideEffectPaths ?? []) : pathsFromCall(call);
+              for (const p of paths) state.changedFiles.add(p);
             }
             if (blocked && (result.error === "Denied by user" || result.error?.startsWith("Denied — "))) {
               hadDeniedToolCalls = true;
@@ -1059,6 +1422,15 @@ export async function runAgentSession(
 
             state.lastActionSummary = summary;
 
+            if (!blocked && result.resource) {
+              state.resources.push({ ...result.resource, toolName: call.name });
+              if (state.resources.length > 20) state.resources.shift();
+            }
+            if (!blocked && result.error) {
+              state.recentErrors.push(`${call.name}: ${result.error}`);
+              if (state.recentErrors.length > 5) state.recentErrors.shift();
+            }
+
             config.onToolCallResolved?.(call, label, result, summary, toolContent);
 
             history = [
@@ -1074,10 +1446,42 @@ export async function runAgentSession(
           // session instead of showing a confusing cloud-API error mid-answer.
           if (isRouterRound) {
             routingPhaseActive = false;
+          } else if (isContextOverflowError(event.error) && contextOverflowRetries < MAX_CONTEXT_OVERFLOW_RETRIES) {
+            // Reactive safety net alongside the proactive budget-ratio
+            // compaction above: the provider itself just rejected this
+            // request as too long, so the ~4-chars/token estimate that
+            // compaction relies on was wrong this round. Fold much harder
+            // and retry the SAME round rather than surfacing the raw
+            // provider error or burning a round out of maxRounds on a
+            // request that never actually ran.
+            contextOverflowRetries++;
+            const aggressive = compactHistoryAggressively(activeSystemPrompt, stateBlock, history);
+            if (aggressive.compacted) {
+              history = aggressive.history;
+              console.info(
+                `[context] overflow retry ${contextOverflowRetries}/${MAX_CONTEXT_OVERFLOW_RETRIES}: compacted ${aggressive.foldedCount} msgs → ~${aggressive.tokensAfter} tokens (was ~${aggressive.tokensBefore})`,
+              );
+              overflowRetryHandled = true;
+              break;
+            }
+            // Nothing left to fold — compaction can't help further, fall
+            // through to the same clear message as the retries-exhausted case.
+            config.onTextDelta?.(
+              `\n\n*[This model's context window (numCtx=${numCtx}) is too small for this conversation even after aggressive compaction — try a model with a larger context window, or start a new chat.]*`,
+            );
+          } else if (isContextOverflowError(event.error)) {
+            config.onTextDelta?.(
+              `\n\n*[This model's context window (numCtx=${numCtx}) is too small for this conversation even after aggressive compaction — try a model with a larger context window, or start a new chat.]*`,
+            );
           } else {
             config.onTextDelta?.(`\n\n*[Agent error: ${event.error}]*`);
           }
         }
+      }
+
+      if (overflowRetryHandled) {
+        round--; // this attempt never actually ran a model turn — don't count it against maxRounds
+        continue;
       }
 
       if (isRouterRound) {
@@ -1093,6 +1497,29 @@ export async function runAgentSession(
         }
         continue; // never run the primary-model-only nudge/completion-review checks below on a router round
       }
+
+      // Retrieval-miss instrumentation: a tool called this round that wasn't
+      // in this round's retrieved candidate set means either a safety net
+      // (core tier/recency pin/alias hard-include) rescued it, or — if it
+      // reached the model's own tool schema at all, which it must have to be
+      // callable — something let it through outside retrieveToolsForStep's
+      // ranked slice. Logged so real misses can drive the evidence-based
+      // useWhen/aliases backfill (see tools.ts's ToolDef doc comments)
+      // instead of hand-authoring metadata for all ~86 tools upfront.
+      if (calledThisRound.size > 0) {
+        const retrievedNames = new Set(toolsForThisRound.map((t) => t.name));
+        for (const name of calledThisRound) {
+          if (!retrievedNames.has(name)) {
+            const objective = state.lastRetrievalObjective ?? "";
+            console.info(`[tool-retrieval] miss: "${name}" called but not in this round's retrieved set (objective: ${JSON.stringify(objective)})`);
+            config.onRetrievalMiss?.({ round, toolName: name, objective });
+          }
+        }
+      }
+      // Pin this round's calls into the NEXT round's retrieval regardless of
+      // that round's objective/score — see the recentToolNames declaration
+      // above the loop.
+      recentToolNames = calledThisRound;
 
       if (!lastRoundHadToolCalls) {
         const trimmed = roundText.trim();

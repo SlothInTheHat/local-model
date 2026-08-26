@@ -1,10 +1,12 @@
 import type { ChatMessage } from "./ollama";
-import { getOllamaBaseUrl, createStallWatchdog, stallError, STREAM_STALL_TIMEOUT_MS } from "./ollama";
+import { getOllamaBaseUrl, createStallWatchdog, stallError, STREAM_STALL_TIMEOUT_MS, sanitizeForWire } from "./ollama";
+import { isThinkingModel } from "./modelCapabilities";
+import { createThinkSplitter } from "./thinkingStream";
 import type { ToolDef, ToolCall } from "./tools";
 
 export interface AgentEvent {
-  type: "text_delta" | "tool_calls" | "done" | "error";
-  content?: string;       // for text_delta
+  type: "text_delta" | "thinking_delta" | "tool_calls" | "done" | "error";
+  content?: string;       // for text_delta / thinking_delta
   toolCalls?: ToolCall[]; // for tool_calls
   error?: string;         // for error
   /** true when tool calls were parsed from text blocks, not from the native API */
@@ -211,6 +213,8 @@ export async function* runAgentTurn(
   options?: AgentTurnOptions
 ): AsyncGenerator<AgentEvent> {
   const ollamaTools = tools.map(toOllamaTool);
+  const think = isThinkingModel(model);
+  const splitter = createThinkSplitter();
 
   // Inactivity watchdog — a wedged Ollama (port open, model loaded, inference
   // never returns) would otherwise hang this generator forever, leaving an
@@ -226,9 +230,10 @@ export async function* runAgentTurn(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model,
-        messages,
+        messages: sanitizeForWire(messages),
         tools: ollamaTools,
         stream: true,
+        ...(think ? { think: true } : {}),
         ...(options?.numCtx ? { options: { num_ctx: options.numCtx } } : {}),
       }),
       signal: watchdog.signal,
@@ -270,10 +275,25 @@ export async function* runAgentTurn(
 
       const msg = json["message"] as Record<string, unknown> | undefined;
       if (msg) {
+        // Native reasoning field (Ollama's `think: true` response shape).
+        const nativeThinking = msg["thinking"] as string | undefined;
+        if (nativeThinking) {
+          yield { type: "thinking_delta", content: nativeThinking };
+        }
+
+        // Belt-and-suspenders: also split any inline <think> tags out of
+        // `content` for models that emit reasoning that way regardless of the
+        // `think` request param — only the "text" half ever reaches
+        // accumulatedText (and therefore the tool-call parser and the next
+        // turn's resent history).
         const textContent = msg["content"] as string | undefined;
         if (textContent) {
-          accumulatedText += textContent;
-          yield { type: "text_delta", content: textContent };
+          const { text, thinking } = splitter.push(textContent);
+          if (thinking) yield { type: "thinking_delta", content: thinking };
+          if (text) {
+            accumulatedText += text;
+            yield { type: "text_delta", content: text };
+          }
         }
 
         const toolCalls = msg["tool_calls"] as OllamaToolCall[] | undefined;
@@ -283,6 +303,12 @@ export async function* runAgentTurn(
       }
 
       if (json["done"]) {
+        const { text: flushedText, thinking: flushedThinking } = splitter.flush();
+        if (flushedThinking) yield { type: "thinking_delta", content: flushedThinking };
+        if (flushedText) {
+          accumulatedText += flushedText;
+          yield { type: "text_delta", content: flushedText };
+        }
         if (accumulatedToolCalls.length > 0) {
           // ── Native tool calls from the API ──────────────────────────────
           const mapped: ToolCall[] = accumulatedToolCalls.map((tc) => ({
@@ -321,6 +347,14 @@ export async function* runAgentTurn(
   }
 
   // End of stream without explicit done message
+  {
+    const { text: flushedText, thinking: flushedThinking } = splitter.flush();
+    if (flushedThinking) yield { type: "thinking_delta", content: flushedThinking };
+    if (flushedText) {
+      accumulatedText += flushedText;
+      yield { type: "text_delta", content: flushedText };
+    }
+  }
   if (accumulatedToolCalls.length > 0) {
     const mapped: ToolCall[] = accumulatedToolCalls.map((tc) => ({
       id: crypto.randomUUID(),

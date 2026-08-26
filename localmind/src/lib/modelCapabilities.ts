@@ -12,6 +12,8 @@ import { getOllamaBaseUrl } from "./ollama";
 interface ProbedCaps {
   tools?: boolean;
   vision?: boolean;
+  /** From `capabilities.includes("thinking")` on Ollama versions that report it. */
+  thinking?: boolean;
   /**
    * Raw parameter count from /api/show's `model_info["general.parameter_count"]`
    * (e.g. 14_768_307_200 for qwen3:14b, 7_615_616_512 for qwen2.5:7b — verified
@@ -84,6 +86,7 @@ export async function probeModelCapabilities(name: string): Promise<void> {
     if (capabilities) {
       updated.tools = capabilities.includes("tools");
       updated.vision = capabilities.includes("vision");
+      updated.thinking = capabilities.includes("thinking");
     }
     if (paramCount != null) updated.paramCount = paramCount;
     capsCache.set(name, updated);
@@ -186,4 +189,51 @@ export function isVisionModel(modelName: string): boolean {
  */
 export function knownParamCount(modelName: string): number | null {
   return capsCache.get(modelName)?.paramCount ?? null;
+}
+
+/** Models at or above this size are the ones "Code Mode" (run_tool_script) is
+ *  offered to — see supportsCodeMode below. */
+const CODE_MODE_MIN_PARAMS = 7_000_000_000; // 7B
+
+/**
+ * Returns true if the model should be offered "Code Mode" (the
+ * `run_tool_script` tool, agentRuntime.ts). Batching several tool calls into
+ * one model-authored script is exactly the kind of multi-step planning small
+ * local models are already unreliable at for a SINGLE tool call (see
+ * agentLoop.ts's 4-pass text fallback parser, needed because small models
+ * often can't even emit one well-formed call) — offering it to them would
+ * likely make things worse, not faster. Requires both a known-large parameter
+ * count and native tool-calling support as a baseline instruction-following
+ * signal. Non-Ollama (`::`) models and anything not yet probed are treated as
+ * NOT qualifying (unlike supportsNativeTools' provider-model default) — Code
+ * Mode's sandboxed-script trust tier is high enough that "unknown" should
+ * default to withheld, not granted.
+ */
+export function supportsCodeMode(modelName: string): boolean {
+  const paramCount = knownParamCount(modelName);
+  if (paramCount == null || paramCount < CODE_MODE_MIN_PARAMS) return false;
+  return supportsNativeTools(modelName);
+}
+
+/**
+ * Returns true if the model emits separate reasoning/"thinking" output
+ * (Ollama's `think` request param + `message.thinking` response field).
+ * Prefers a probed ground-truth capability; falls back to a name-based
+ * heuristic for the well-known local reasoning-model families so `think: true`
+ * still gets set (and the resulting thinking content still gets routed away
+ * from `content`) before this model has ever been probed.
+ */
+export function isThinkingModel(modelName: string): boolean {
+  const cached = capsCache.get(modelName);
+  if (cached && cached.thinking !== undefined) return cached.thinking;
+
+  const lower = modelName.toLowerCase();
+  return (
+    lower.includes("deepseek-r1") || lower.includes("deepseek r1") ||
+    lower.includes("qwen3") ||
+    lower.includes("qwq") ||
+    lower.includes("magistral") ||
+    lower.includes("phi4-reasoning") || lower.includes("phi-4-reasoning") ||
+    lower.includes("gpt-oss")
+  );
 }

@@ -21,6 +21,15 @@ npm run tauri build
 
 > Rust 1.96.0 is installed. Use `npm run tauri dev` or `npm run tauri build` for the full desktop app.
 
+## Testing
+
+```bash
+node tests/confinement.test.mjs   # JS-side path-classification assertions for create_folder etc.
+cd src-tauri && cargo test --lib  # Rust-side workspace-confinement unit tests (path containment, `&&` command translation)
+```
+
+Most `fs_*`/`run_command` confinement behavior can only be exercised inside the running app (the native `__TAURI__` bridge isn't reachable from plain Node) — `tests/confinement.test.mjs` documents the manual refusal cases to verify inside `npm run tauri dev`.
+
 ## Architecture
 
 ### Views (`src/types/app.ts`)
@@ -32,7 +41,7 @@ The agent's self-description (tabs + tools + MCP status) is generated at runtime
 ### Data flow
 `App.tsx` is the single orchestrator. It owns `selectedModel`, `agentMode`, `attachedImages`, and `systemPromptOpen` as local state, and wires them into every child. All Ollama API calls originate here via two paths:
 1. **Normal chat** → `streamChat()` async generator (yields string tokens)
-2. **Agent loop** → `runAgentTurn()` async generator (yields `AgentEvent`; pauses on `tool_calls` for user approval)
+2. **Agent loop** → `runAgentSession()` (`src/lib/agentRuntime.ts`) — the actual multi-round orchestrator (see below); it internally drives per-round streaming via `agentLoop.ts`'s lower-level `runAgentTurn()` primitive, which callers don't invoke directly.
 
 ### Stores (Zustand)
 | Store | Persisted | Purpose |
@@ -43,17 +52,40 @@ The agent's self-description (tabs + tools + MCP status) is generated at runtime
 | `useAgentStore` | ❌ ephemeral | `FileSystemDirectoryHandle` (non-serializable), `toolsEnabled`, `pendingToolCalls` |
 
 ### Ollama API (`src/lib/ollama.ts`)
-All calls target `http://localhost:11434`. Three async generators:
+All calls target `http://localhost:11434`. Key async generators:
 - `streamChat(model, messages, signal?)` → `string` chunks via `/api/chat`
 - `pullModel(name, signal?)` → `PullUpdate` progress via `/api/pull`
-- `runAgentTurn(model, messages, tools, signal?)` → `AgentEvent` via `/api/chat` with Ollama `tools` field (in `src/lib/agentLoop.ts`)
+- `runAgentTurn(model, messages, tools, signal?)` (`src/lib/agentLoop.ts`) → `AgentEvent` via `/api/chat` with Ollama's `tools` field — one round of streaming + tool-call detection, called internally by `runAgentSession`, not by UI code directly.
 
-### Agent / tool use (`src/lib/tools.ts`, `src/lib/agentLoop.ts`)
-`runAgentTurn` streams from Ollama with a `tools` array. When the model emits `tool_calls` in the response, it yields a `{type:"tool_calls"}` event and returns — it never auto-executes. `App.tsx` surfaces `ToolCallCard` components for user approval, then calls `executeTool()` for each approved call and continues the loop via `handleContinueAgent()`.
+### Agent runtime (`src/lib/agentRuntime.ts` — `runAgentSession`)
+The real entry point for tool-using sessions (Chat agent mode, Code tab, headless/scheduled runs). A round loop (bounded by `maxRounds`/`DEFAULT_MAX_ROUNDS`) that, each round:
+1. Rebuilds a `RuntimeState`-derived "Current state" block (todos read fresh from `.localmind/todos.json`, file tree, project/global memory, and — since the structured-resource-tracking work — a "Resources acquired this session" list and a late-recency "Recent errors" block, both populated mechanically from `ToolResult.resource`/`.error`, never LLM-generated).
+2. Retrieves a per-round candidate tool set (see below) keyed on the current objective — the in-progress/pending todo's text plus the most recent acquired resource, not the original request text pinned for the whole session.
+3. Streams one round via `runAgentTurn`, executes approved tool calls, updates `RuntimeState`, and loops.
+`capabilityDenialGuard` appends a high-recency, explicitly-named list of available-but-possibly-refused tools at the very end of the round's system prompt — small local models have been observed hallucinating "I can't do that" for tools that were actually retrieved and available; end-of-prompt recency measurably fixes this more reliably than mid-prompt wording.
 
-Tools use the browser **File System Access API** — `dirHandle` in `useAgentStore` holds the user-granted `FileSystemDirectoryHandle`. Path traversal with `..` is rejected at execution time.
+### Tool retrieval (`src/lib/toolFilter.ts`, `src/lib/toolBm25.ts`)
+~90 built-in tools (`TOOL_DEFINITIONS` in `src/lib/tools.ts`) are too many to hand a small local model every round. Built-ins get a **soft rank+cap**: in-process BM25 (`toolBm25.ts`, no SQLite/network) scores each round's objective string against tool descriptions/aliases, capped at the top ~25, with a protected core tier (`read_file`, `todo_write`, etc., always included) and a recency pin (last round's called tools stay eligible). Embeddings (via Ollama) are a conditional fallback only when BM25 is ambiguous — deliberately not a per-round default, to avoid competing with the primary model for the same local hardware. External/MCP tools keep a separate, unchanged **hard gate** (`filterToolsByRelevance`) requiring them to out-score the best built-in or match a named service. Retrieval is memoized per-round (`RuntimeState.lastRetrievalObjective/Result`) so it only re-runs when the objective actually changes, not every round.
 
-Tool support is model-dependent. `supportsNativeTools()` in `src/lib/modelCapabilities.ts` gates which models get the `tools` field (llama3.1/3.2, mistral-nemo, qwen2.5, command-r).
+### Agent / tool use (`src/lib/tools.ts`)
+Tools use the browser **File System Access API** — `dirHandle` in `useAgentStore` holds the user-granted `FileSystemDirectoryHandle` — plus native `fs_*`/`run_command` Tauri commands confined server-side (Rust) to registered workspace roots. Path traversal with `..` is rejected at execution time on both sides. `ToolResult` carries an optional structured `resource` field (`{kind, path?, url?, id?, label}`) for tools that produce a durable, chainable artifact (downloads, writes, image conversions, rendered plots/tables/canvases) — populated directly from data each handler already computes, feeding the agent-runtime resource tracking above.
+
+Tool gating (Plan-mode allowance, approval requirements) is metadata-driven via `planModeAllowed`/`requiresApproval` on each `ToolDef`, resolved by `resolveToolPolicy` in `agentRuntime.ts`. Tool support in non-agent chat mode is model-dependent — `supportsNativeTools()` in `src/lib/modelCapabilities.ts` gates which models get the `tools` field (llama3.1/3.2, mistral-nemo, qwen2.5, command-r); agent mode itself works with any tool-calling model.
+
+### Model roles (`src/lib/modelRoles.ts`)
+Optional, pinned, off-by-default secondary models can participate for specific jobs — `router` (tool-selection help for weak primaries), `vision`, `embed`, `digest`, `knowledge` — each resolved via `resolveRole(name)` and falling back to no-op (never auto-substituted) when unconfigured.
+
+### MCP integrations (`src/lib/mcp.ts`, `mcpPresets.ts`, `mcpAutoConnect.ts`)
+External tool servers (Gmail, Drive, Calendar, Canvas, browser control, etc.) are deliberately curated to a handful of vetted presets rather than open server discovery, configured in Settings.
+
+### Shadow git history (`src/lib/shadowGit.ts`)
+Every mutating tool call is auto-committed to a separate shadow git repo (`commitAfterToolCall`) so file changes from agent runs are diffable/restorable from the History tab, independent of the user's own git repo (if any).
+
+### Backend (`src-tauri/src/`)
+Rust commands behind the Tauri IPC boundary: `os_tools.rs` (window/process control, disk usage, screenshots+OCR, clipboard), `pdf.rs` (merge/text-extract), `transcribe.rs`/`piper.rs` (offline video transcription, TTS — bundled via PyInstaller in packaged builds), `mcp.rs` (MCP server spawning), `git_shadow.rs`, `db.rs` (SQLite), `credential_store.rs`, `ui_automation.rs`. Workspace confinement (`lib.rs`) is enforced here, not just in the frontend: `fs_*` commands and `run_command`'s cwd are refused outside roots registered via `register_workspace_root`; `run_command`'s shell itself is *not* sandboxed beyond that (documented limitation — gated by the UI approval dialog instead).
+
+### Companion: phone-agent
+`phone-agent/` (Python, separate `requirements.txt`) is a standalone Telegram bot — not part of the npm/Tauri build. See `phone-agent/README.md` for its own setup.
 
 ### Styling
 Tailwind v4 via `@tailwindcss/vite`. The design system uses **CSS custom properties** defined in `src/index.css` — always use semantic tokens (`bg-background`, `bg-card`, `text-foreground`, `text-muted-foreground`, `border-border`, `bg-primary`, `text-primary-foreground`) rather than hardcoded colors or `zinc-*` classes. The `cn()` helper from `src/components/ui/utils.ts` merges Tailwind classes.

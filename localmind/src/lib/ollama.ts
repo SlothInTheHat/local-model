@@ -1,4 +1,6 @@
 import { DEFAULT_OLLAMA_BASE_URL, useSettingsStore } from "../store/settings";
+import { isThinkingModel } from "./modelCapabilities";
+import { createThinkSplitter } from "./thinkingStream";
 
 export interface OllamaModel {
   name: string;
@@ -13,6 +15,32 @@ export interface ChatMessage {
   images?: string[];
   // Used when role === "assistant" and the model issued tool calls
   tool_calls?: Array<{ function: { name: string; arguments: Record<string, unknown> } }>;
+  /**
+   * UI/display-only reasoning output captured from a thinking model (Ollama's
+   * `message.thinking`, or an inline `<think>` block stripped out of
+   * `content`). Never sent to a model — see `sanitizeForWire`. Storing it here
+   * rather than discarding it lets the UI show/collapse it without it ever
+   * re-entering a subsequent request's `content`.
+   */
+  thinking?: string;
+}
+
+/**
+ * Strips every UI-only field (currently just `thinking`) before a message
+ * list goes out over the wire. This is the one place that guarantees a
+ * thinking model's prior reasoning never gets resent as part of `content` on
+ * a later turn — every outbound call (plain chat and agent-loop) must route
+ * through this rather than `JSON.stringify(messages)` directly.
+ */
+export function sanitizeForWire(
+  messages: ChatMessage[]
+): Array<Pick<ChatMessage, "role" | "content" | "images" | "tool_calls">> {
+  return messages.map(({ role, content, images, tool_calls }) => ({
+    role,
+    content,
+    ...(images ? { images } : {}),
+    ...(tool_calls ? { tool_calls } : {}),
+  }));
 }
 
 /** Current configured Ollama base URL (no trailing slash), reading live from settings. */
@@ -108,6 +136,39 @@ export async function* pullModel(
   }
 }
 
+/**
+ * Distinguishes "Ollama isn't running" from "Ollama is running but its CORS
+ * policy rejects requests from this webview's origin" — a browser fetch()
+ * failure looks identical for both (CORS failures are deliberately opaque to
+ * JS: no status code, no headers, just a generic network error). Retries the
+ * SAME endpoint through Rust's `http_fetch` command, which has no CORS
+ * concept at all — if Rust reaches it, the server is genuinely up and the
+ * frontend's own request is specifically being CORS-rejected. Confirmed real
+ * case: WebView2's production origin on Windows (`http://tauri.localhost`)
+ * isn't covered by Ollama's default CORS allowlist, which only recognizes
+ * the `tauri://*` scheme macOS/Linux use — see lib.rs's OLLAMA_ORIGINS fix,
+ * which only covers an Ollama instance LocalMind launches itself; an
+ * already-running, user-managed Ollama (or llama.cpp, which LocalMind never
+ * launches) keeps whatever CORS config it was started with.
+ *
+ * Tauri-only (returns false outside it, since http_fetch is a Tauri
+ * command) — callers should only invoke this after a normal listModels()-
+ * style fetch has already failed.
+ */
+export async function isOllamaCorsBlocked(): Promise<boolean> {
+  const tauri = (window as unknown as Record<string, unknown>).__TAURI__ as
+    | { core?: { invoke?: (cmd: string, args?: Record<string, unknown>) => Promise<string> } }
+    | undefined;
+  const invoke = tauri?.core?.invoke;
+  if (typeof invoke !== "function") return false;
+  try {
+    await invoke("http_fetch", { url: `${getOllamaBaseUrl()}/api/tags`, method: "GET" });
+    return true; // Rust reached it — the server is up, so the earlier failure must be CORS
+  } catch {
+    return false; // Rust couldn't reach it either — genuinely down/not installed
+  }
+}
+
 export async function deleteModel(name: string): Promise<void> {
   const res = await fetch(`${getOllamaBaseUrl()}/api/delete`, {
     method: "DELETE",
@@ -188,14 +249,22 @@ export function stallError(where: string): Error {
 export async function* streamChat(
   model: string,
   messages: ChatMessage[],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onThinking?: (chunk: string) => void
 ): AsyncGenerator<string> {
   const watchdog = createStallWatchdog(signal, STREAM_STALL_TIMEOUT_MS);
+  const think = isThinkingModel(model);
+  const splitter = createThinkSplitter();
   try {
     const res = await fetch(`${getOllamaBaseUrl()}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model, messages, stream: true }),
+      body: JSON.stringify({
+        model,
+        messages: sanitizeForWire(messages),
+        stream: true,
+        ...(think ? { think: true } : {}),
+      }),
       signal: watchdog.signal,
     });
     watchdog.bump();
@@ -218,8 +287,18 @@ export async function* streamChat(
       for (const line of lines) {
         try {
           const json = JSON.parse(line);
-          if (json.message?.content) yield json.message.content;
-          if (json.done) return;
+          if (json.message?.thinking) onThinking?.(json.message.thinking);
+          if (json.message?.content) {
+            const { text, thinking } = splitter.push(json.message.content);
+            if (thinking) onThinking?.(thinking);
+            if (text) yield text;
+          }
+          if (json.done) {
+            const { text, thinking } = splitter.flush();
+            if (thinking) onThinking?.(thinking);
+            if (text) yield text;
+            return;
+          }
         } catch {
           // skip malformed lines
         }

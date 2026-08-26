@@ -10,6 +10,7 @@ import type { AgentEvent, AgentTurnOptions } from "./agentLoop";
 import type { ToolDef, ToolCall } from "./tools";
 import { useProvidersStore } from "../store/providers";
 import { acquireGeneration } from "./generationGate";
+import { createThinkSplitter } from "./thinkingStream";
 
 export type { AgentTurnOptions };
 
@@ -113,7 +114,8 @@ export async function* streamChatOpenAI(
   apiKey: string,
   model: string,
   messages: ChatMessage[],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onThinking?: (chunk: string) => void
 ): AsyncGenerator<string> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
@@ -141,6 +143,7 @@ export async function* streamChatOpenAI(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
+  const splitter = createThinkSplitter();
 
   while (true) {
     const { done, value } = await reader.read();
@@ -157,10 +160,21 @@ export async function* streamChatOpenAI(
         const json = JSON.parse(raw) as Record<string, unknown>;
         const delta = (json["choices"] as Array<Record<string, unknown>>)?.[0]
           ?.["delta"] as Record<string, unknown> | undefined;
+        const nativeReasoning = (delta?.["reasoning_content"] ?? delta?.["reasoning"]) as string | undefined;
+        if (nativeReasoning) onThinking?.(nativeReasoning);
         const content = delta?.["content"] as string | undefined;
-        if (content) yield content;
+        if (content) {
+          const { text, thinking } = splitter.push(content);
+          if (thinking) onThinking?.(thinking);
+          if (text) yield text;
+        }
       } catch { /* skip */ }
     }
+  }
+  {
+    const { text, thinking } = splitter.flush();
+    if (thinking) onThinking?.(thinking);
+    if (text) yield text;
   }
 }
 
@@ -240,6 +254,7 @@ export async function* runAgentTurnOpenAI(
   const decoder = new TextDecoder();
   let buf = "";
   const toolAccum: Record<number, { id: string; name: string; args: string }> = {};
+  const splitter = createThinkSplitter();
 
   const flushToolCalls = (): ToolCall[] =>
     Object.values(toolAccum).map((c) => ({
@@ -247,6 +262,12 @@ export async function* runAgentTurnOpenAI(
       name: c.name,
       args: (() => { try { return JSON.parse(c.args) as Record<string, unknown>; } catch { return {}; } })(),
     }));
+
+  const flushSplitter = function* (): Generator<AgentEvent> {
+    const { text, thinking } = splitter.flush();
+    if (thinking) yield { type: "thinking_delta", content: thinking };
+    if (text) yield { type: "text_delta", content: text };
+  };
 
   while (true) {
     const { done, value } = await reader.read();
@@ -259,6 +280,7 @@ export async function* runAgentTurnOpenAI(
       const trimmed = line.trim();
       if (!trimmed) continue;
       if (trimmed === "data: [DONE]") {
+        yield* flushSplitter();
         const calls = flushToolCalls();
         if (calls.length > 0) yield { type: "tool_calls", toolCalls: calls };
         else yield { type: "done" };
@@ -272,8 +294,19 @@ export async function* runAgentTurnOpenAI(
       const delta = choice?.["delta"] as Record<string, unknown> | undefined;
       if (!delta) continue;
 
+      // Native reasoning field — DeepSeek's own API (and several
+      // OpenAI-compatible reasoning-model routes, e.g. via OpenRouter) send
+      // reasoning separately as `reasoning_content`/`reasoning` rather than
+      // inline in `content`.
+      const nativeReasoning = (delta["reasoning_content"] ?? delta["reasoning"]) as string | undefined;
+      if (nativeReasoning) yield { type: "thinking_delta", content: nativeReasoning };
+
       const content = delta["content"] as string | undefined;
-      if (content) yield { type: "text_delta", content };
+      if (content) {
+        const { text, thinking } = splitter.push(content);
+        if (thinking) yield { type: "thinking_delta", content: thinking };
+        if (text) yield { type: "text_delta", content: text };
+      }
 
       const tds = delta["tool_calls"] as OAIToolDelta[] | undefined;
       if (tds) {
@@ -287,17 +320,20 @@ export async function* runAgentTurnOpenAI(
 
       const finish = choice?.["finish_reason"] as string | undefined;
       if (finish === "tool_calls") {
+        yield* flushSplitter();
         const calls = flushToolCalls();
         if (calls.length > 0) yield { type: "tool_calls", toolCalls: calls };
         return;
       }
       if (finish === "stop") {
+        yield* flushSplitter();
         yield { type: "done" };
         return;
       }
     }
   }
   // Stream ended without explicit [DONE]
+  yield* flushSplitter();
   const calls = flushToolCalls();
   if (calls.length > 0) yield { type: "tool_calls", toolCalls: calls };
   else yield { type: "done" };
@@ -312,7 +348,8 @@ function resolveProvider(providerId: string) {
 export async function* streamChatForModel(
   modelRef: string,
   messages: ChatMessage[],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onThinking?: (chunk: string) => void
 ): AsyncGenerator<string> {
   // Held for the generator's entire lifetime: incremented on first .next()
   // (generator bodies don't execute until iteration starts), released in
@@ -323,12 +360,12 @@ export async function* streamChatForModel(
   try {
     const { providerId, modelName } = parseModelRef(modelRef);
     if (providerId === "ollama") {
-      yield* streamChatOllama(modelName, messages, signal);
+      yield* streamChatOllama(modelName, messages, signal, onThinking);
       return;
     }
     const cfg = resolveProvider(providerId);
     if (!cfg) throw new Error(`Provider "${providerId}" not configured`);
-    yield* streamChatOpenAI(cfg.baseUrl, cfg.apiKey, modelName, messages, signal);
+    yield* streamChatOpenAI(cfg.baseUrl, cfg.apiKey, modelName, messages, signal, onThinking);
   } finally {
     release();
   }

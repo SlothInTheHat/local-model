@@ -144,10 +144,6 @@ export interface CompactionOutcome {
 }
 
 /**
- * Checks whether `[systemPrompt + stateBlock + history]` is projected to
- * exceed COMPACTION_BUDGET_RATIO of numCtx, and if so, folds the oldest
- * history entries into a single synthetic work-log message.
- *
  * Cut-boundary rule: the retained tail must start at an assistant or user/
  * system message, NEVER at a `role: "tool"` message — a tool result with no
  * preceding assistant tool_calls message is rejected by Ollama/OpenAI-style
@@ -160,29 +156,28 @@ export interface CompactionOutcome {
  * Idempotent-friendly: if the fold prefix already starts with a prior
  * work-log message (COMPACTED_WORK_LOG_PREFIX), its bullets are merged into
  * the new one instead of nesting "[Compacted work log...]" inside itself.
+ *
+ * Shared by both the proactive budget-ratio compactor and the reactive
+ * overflow compactor below — they differ only in how much tail they keep and
+ * how big the resulting work-log is allowed to get, not in the fold mechanics.
  */
-export function compactHistoryIfOverBudget(
-  systemPrompt: string,
-  stateBlock: string,
+function foldHistory(
   history: ChatMessage[],
-  numCtx: number,
-): CompactionOutcome {
-  const overhead = estimateTokens(systemPrompt) + estimateTokens(stateBlock);
-  const tokensBefore = overhead + estimateMessagesTokens(history);
-  const budget = numCtx * COMPACTION_BUDGET_RATIO;
-
-  if (tokensBefore <= budget || history.length <= RETAINED_TAIL_MESSAGES) {
-    return { history, compacted: false, foldedCount: 0, tokensBefore, tokensAfter: tokensBefore };
+  tailSize: number,
+  tokenCap: number,
+): { history: ChatMessage[]; compacted: boolean; foldedCount: number } {
+  if (history.length <= tailSize) {
+    return { history, compacted: false, foldedCount: 0 };
   }
 
-  let cutIndex = history.length - RETAINED_TAIL_MESSAGES;
+  let cutIndex = history.length - tailSize;
   while (cutIndex < history.length && history[cutIndex].role === "tool") cutIndex++;
 
   if (cutIndex <= 0 || cutIndex >= history.length) {
     // Nothing safe to fold (either everything would be retained, or every
     // remaining message is an orphaned tool result) — leave history as-is
     // rather than risk an invalid sequence.
-    return { history, compacted: false, foldedCount: 0, tokensBefore, tokensAfter: tokensBefore };
+    return { history, compacted: false, foldedCount: 0 };
   }
 
   const toFold = history.slice(0, cutIndex);
@@ -214,10 +209,10 @@ export function compactHistoryIfOverBudget(
   }
 
   let bulletsText = [existingBullets, ...newBullets].filter(Boolean).join("\n");
-  if (estimateTokens(bulletsText) > WORK_LOG_TOKEN_CAP) {
+  if (estimateTokens(bulletsText) > tokenCap) {
     const lines = bulletsText.split("\n");
     let dropped = false;
-    while (lines.length > 1 && estimateTokens(lines.join("\n")) > WORK_LOG_TOKEN_CAP) {
+    while (lines.length > 1 && estimateTokens(lines.join("\n")) > tokenCap) {
       lines.shift();
       dropped = true;
     }
@@ -229,8 +224,91 @@ export function compactHistoryIfOverBudget(
     content: `${COMPACTED_WORK_LOG_PREFIX}\n${bulletsText}`,
   };
 
-  const newHistory = [workLogMessage, ...tail];
-  const tokensAfter = overhead + estimateMessagesTokens(newHistory);
+  return { history: [workLogMessage, ...tail], compacted: true, foldedCount: toFold.length };
+}
 
-  return { history: newHistory, compacted: true, foldedCount: toFold.length, tokensBefore, tokensAfter };
+/**
+ * Checks whether `[systemPrompt + stateBlock + history]` is projected to
+ * exceed COMPACTION_BUDGET_RATIO of numCtx, and if so, folds the oldest
+ * history entries into a single synthetic work-log message. Proactive: based
+ * on the ~4-chars/token estimate, checked every round before anything has
+ * actually gone wrong. See `compactHistoryAggressively` for the reactive
+ * counterpart, used after a real provider-reported context overflow.
+ */
+export function compactHistoryIfOverBudget(
+  systemPrompt: string,
+  stateBlock: string,
+  history: ChatMessage[],
+  numCtx: number,
+): CompactionOutcome {
+  const overhead = estimateTokens(systemPrompt) + estimateTokens(stateBlock);
+  const tokensBefore = overhead + estimateMessagesTokens(history);
+  const budget = numCtx * COMPACTION_BUDGET_RATIO;
+
+  if (tokensBefore <= budget) {
+    return { history, compacted: false, foldedCount: 0, tokensBefore, tokensAfter: tokensBefore };
+  }
+
+  const folded = foldHistory(history, RETAINED_TAIL_MESSAGES, WORK_LOG_TOKEN_CAP);
+  if (!folded.compacted) {
+    return { history, compacted: false, foldedCount: 0, tokensBefore, tokensAfter: tokensBefore };
+  }
+  const tokensAfter = overhead + estimateMessagesTokens(folded.history);
+  return { history: folded.history, compacted: true, foldedCount: folded.foldedCount, tokensBefore, tokensAfter };
+}
+
+/** Much smaller tail/cap than the proactive compactor's — reserved for the reactive path below, where the provider has already rejected the request rather than a heuristic estimate merely predicting it would. */
+const AGGRESSIVE_RETAINED_TAIL_MESSAGES = 2;
+const AGGRESSIVE_WORK_LOG_TOKEN_CAP = 800;
+
+/**
+ * Reactive counterpart to `compactHistoryIfOverBudget`: called only after the
+ * provider has actually rejected a request for exceeding its context window
+ * (see `isContextOverflowError`), so it deliberately skips any budget
+ * estimate check — the ~4-chars/token heuristic already proved wrong once
+ * this round, trusting it again would just repeat the failure. Folds much
+ * more aggressively (smaller tail, smaller work-log cap) to maximize the
+ * chance the retried request actually fits.
+ */
+export function compactHistoryAggressively(
+  systemPrompt: string,
+  stateBlock: string,
+  history: ChatMessage[],
+): CompactionOutcome {
+  const overhead = estimateTokens(systemPrompt) + estimateTokens(stateBlock);
+  const tokensBefore = overhead + estimateMessagesTokens(history);
+
+  const folded = foldHistory(history, AGGRESSIVE_RETAINED_TAIL_MESSAGES, AGGRESSIVE_WORK_LOG_TOKEN_CAP);
+  if (!folded.compacted) {
+    return { history, compacted: false, foldedCount: 0, tokensBefore, tokensAfter: tokensBefore };
+  }
+  const tokensAfter = overhead + estimateMessagesTokens(folded.history);
+  return { history: folded.history, compacted: true, foldedCount: folded.foldedCount, tokensBefore, tokensAfter };
+}
+
+/**
+ * Heuristic classifier for "this error means the request overflowed the
+ * model's context window" vs. any other failure (network blip, bad request,
+ * server error). Matches known Ollama/llama.cpp phrasings and the
+ * OpenAI-compatible convention providers like DeepSeek/OpenRouter use —
+ * same pattern-matching-over-provider-strings approach as
+ * stuckDetector.ts's errorRecoveryHint, extended here rather than
+ * duplicated.
+ */
+const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
+  /context length/i,
+  /context window/i,
+  /\bn_ctx\b/i,
+  /exceeds?[\s\S]{0,30}context/i,
+  /context[\s\S]{0,30}exceeded/i,
+  /prompt is longer than/i,
+  /too many tokens/i,
+  /input length[\s\S]{0,30}exceeds/i,
+  /maximum context length/i,
+  /context_length_exceeded/i,
+];
+
+export function isContextOverflowError(message: string | undefined | null): boolean {
+  if (!message) return false;
+  return CONTEXT_OVERFLOW_PATTERNS.some((re) => re.test(message));
 }
