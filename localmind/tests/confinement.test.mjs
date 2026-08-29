@@ -113,6 +113,12 @@ Manual refusal cases — verify inside the running desktop app:
       - run_command "false && echo hi"  -> "hi" is NOT printed (short-circuit).
       - run_command "cd . && echo ok"   -> "ok" IS printed.
       - run_command 'echo "a && b"'     -> prints  a && b  (quotes preserved).
+
+  [ ] move_file's new action:"copy" param (consolidated from copy_file):
+      - move_file({from, to, action:"copy"}) with 'to' OUTSIDE the workspace
+        -> refused, same as a plain move; original file untouched.
+      - move_file({from, to, action:"copy"}) inside the workspace -> both
+        the original AND the new copy exist afterward.
 `);
 
 if (failed > 0) {

@@ -669,7 +669,7 @@ export function CodeEditor({ selectedModel, isActive = true }: CodeEditorProps) 
       "install_deps", "todo_write",
       "git_status", "git_commit",
       "update_project_memory",
-      "create_folder", "register_tool",
+      "create_folder", "register_tool", "run_tool_script",
       "switch_model", "switch_view", "send_task_to_tab",
     ]);
     const CODE_TOOLS = await assembleSessionTools({ dirHandle, essentialOnly: ESSENTIAL_CODING_TOOLS });

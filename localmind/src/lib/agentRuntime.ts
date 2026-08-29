@@ -415,6 +415,9 @@ function buildSystemPrompt(config: AgentRuntimeConfig): string {
     "- schedule_task's 'task' parameter MUST be a natural-English instruction describing THIS user's actual request, NEVER a shell command/code (no 'echo $(date) >> notes.md', no PowerShell syntax) and NEVER text copied from an example in this prompt or the tool's own schema — those are illustrations of the FORMAT, not tasks to actually schedule. The scheduled agent runs on the user's platform and emits the right commands itself; your job is only to describe what should happen, in plain English, specific to what was actually asked.",
     "- If there are several reasonable candidates and the user hasn't pinned down exactly which one (e.g. multiple search results, several matching files, several plausible images) — especially if they said something like 'pick any one' or 'you choose' — SELECT ONE YOURSELF using your best judgment and continue immediately. Do not stop to list the options and ask the user to pick; that is the same passivity as asking 'should I?' before acting. Mention which one you picked in your final summary, not before.",
     "- When you answer using search_knowledge, you MUST cite the bracketed source location shown with each result (e.g. `[CS101/lecture5.pdf p.12]`) inline in your answer. If search_knowledge returns no matching passages, tell the user the topic isn't in their notes — do not answer from general knowledge as if it came from their notes.",
+    ...(config.tools.some((t) => t.name === "run_tool_script")
+      ? ["- If run_tool_script is available this round and your next few actions are a known, linear sequence (e.g. read several files then write results, or list+filter+act), prefer writing one script over one tool call per round — it collapses several round-trips into a single inference pass."]
+      : []),
     "",
     buildCapabilityBlock(config.toolsSupported ? config.tools : [], false),
   );

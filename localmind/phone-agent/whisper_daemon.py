@@ -45,22 +45,37 @@ def _get_model(model_name: str):
     if model is not None:
         return model
 
-    from faster_whisper import WhisperModel
+    from whisper_device import load_whisper_model
 
     _log(f"whisper_daemon: loading model '{model_name}' ...")
-    # Same device/compute_type as transcribe_cli.py's transcribe() — this
-    # machine's GPU reports 0 CUDA devices to CTranslate2, so CPU/int8 is the
-    # only supported combination here.
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    model, device = load_whisper_model(model_name)
     _MODELS[model_name] = model
-    _log(f"whisper_daemon: model '{model_name}' ready")
+    _log(f"whisper_daemon: model '{model_name}' ready (device={device})")
     return model
 
 
 def _transcribe(path: str, model_name: str) -> str:
-    """Mirrors transcribe_cli.py's transcribe(): same settings, same join."""
+    """Dictation-tuned settings — this is short, single-utterance mic audio,
+    not the long-form video/audio transcribe_cli.py handles, so it can
+    afford to trade a little accuracy for latency:
+      - beam_size=1 (greedy) instead of the default 5 — meaningfully faster
+        for short clips, and beam search's main benefit (recovering from an
+        early wrong token over a long sequence) matters far less over a
+        single spoken sentence.
+      - vad_filter=True skips silence, which a mic recording reliably has at
+        the start/end (button-press lag).
+      - condition_on_previous_text=False: each dictation request is one
+        independent utterance, so there is no prior-segment context worth
+        conditioning on, only a (small) chance of it dragging in unrelated
+        phrasing from whatever the model free-associates.
+    """
     model = _get_model(model_name)
-    segments, _info = model.transcribe(path)
+    segments, _info = model.transcribe(
+        path,
+        beam_size=1,
+        vad_filter=True,
+        condition_on_previous_text=False,
+    )
     return " ".join(seg.text.strip() for seg in segments)
 
 

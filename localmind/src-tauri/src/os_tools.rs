@@ -184,6 +184,27 @@ pub fn clear_pending_region() {
     }
 }
 
+/// Read a stashed region capture (if fresh) WITHOUT consuming it — unlike
+/// `take_screenshot`'s `.take()`, this leaves PENDING_REGION exactly as it
+/// was. Added so a caller can peek at the OCR text a screenshot already
+/// produced (e.g. to inject it straight into a prompt) while still leaving
+/// the real `take_screenshot` tool call free to consume the same stash
+/// afterward if the model decides it needs the actual image (vision-model
+/// description), not just the OCR text. Returns `None` on no stash or a
+/// stale one — mirrors take_screenshot's own freshness check, but never
+/// clears a stale entry itself (that stays take_screenshot's job, the only
+/// path that actually consumes the stash).
+#[tauri::command]
+pub fn peek_pending_region() -> Option<ScreenshotResult> {
+    let slot = PENDING_REGION.lock().ok()?;
+    let (result, captured_at) = slot.as_ref()?;
+    if now_epoch_ms().saturating_sub(*captured_at) < PENDING_REGION_MAX_AGE_MS {
+        Some(result.clone())
+    } else {
+        None
+    }
+}
+
 /// Enumerate visible top-level windows (title + stable id).
 #[tauri::command]
 pub fn list_windows() -> Result<Vec<WindowInfo>, String> {

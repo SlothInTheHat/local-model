@@ -127,10 +127,17 @@ export async function* streamChatOpenAI(
   const res = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers,
+    // max_tokens: without an explicit value, the provider applies its own
+    // silent default (varies by model, sometimes as low as ~1000) — observed
+    // live as a quick-invoke answer cut off mid-word with no error at all,
+    // just a response that stopped. A generous ceiling here doesn't
+    // encourage longer answers (the model isn't rewarded for using more of
+    // it), it just gives one room to finish the sentence it's already on.
     body: JSON.stringify({
       model,
       messages: messages.map(toOpenAIMessage),
       stream: true,
+      max_tokens: 4096,
     }),
     signal,
   });
@@ -233,7 +240,9 @@ export async function* runAgentTurnOpenAI(
     res = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ model, messages: oaiMessages, tools: oaiTools, stream: true }),
+      // See streamChatOpenAI's identical max_tokens comment above — same
+      // silent-truncation risk applies to agent-mode tool-calling rounds.
+      body: JSON.stringify({ model, messages: oaiMessages, tools: oaiTools, stream: true, max_tokens: 4096 }),
       signal,
     });
   } catch (err) {

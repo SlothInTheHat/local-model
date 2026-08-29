@@ -532,8 +532,8 @@ use transcribe::{transcribe_video, transcribe_audio_base64};
 mod pdf;
 use pdf::{pdf_merge, pdf_to_text};
 
-mod piper;
-use piper::{piper_status, piper_setup, piper_download_voice, piper_speak};
+mod kokoro;
+use kokoro::{kokoro_status, kokoro_setup, kokoro_download_model, kokoro_speak};
 
 mod db;
 use db::{
@@ -546,12 +546,12 @@ use db::{
 };
 
 mod tray;
-use tray::{set_close_to_tray, show_result_widget};
+use tray::{set_close_to_tray, get_cursor_position, highlight_screen_rect};
 
 mod os_tools;
 use os_tools::{
     open_application, list_windows, focus_window, take_screenshot, read_image_base64,
-    capture_region, clear_pending_region, close_window, minimize_window,
+    capture_region, clear_pending_region, peek_pending_region, close_window, minimize_window,
     list_processes, kill_process, get_disk_usage, empty_recycle_bin, adjust_volume,
     speak_text, print_file,
 };
@@ -1801,10 +1801,10 @@ pub fn run() {
             image_convert,
             pdf_merge,
             pdf_to_text,
-            piper_status,
-            piper_setup,
-            piper_download_voice,
-            piper_speak,
+            kokoro_status,
+            kokoro_setup,
+            kokoro_download_model,
+            kokoro_speak,
             open_upload_dialog,
             read_upload_bytes,
             memory_upsert,
@@ -1831,7 +1831,8 @@ pub fn run() {
             http_fetch,
             http_fetch_with_headers,
             set_close_to_tray,
-            show_result_widget,
+            get_cursor_position,
+            highlight_screen_rect,
             open_application,
             list_windows,
             focus_window,
@@ -1841,6 +1842,7 @@ pub fn run() {
             read_image_base64,
             capture_region,
             clear_pending_region,
+            peek_pending_region,
             list_processes,
             kill_process,
             restart_ollama,

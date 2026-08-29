@@ -21,6 +21,11 @@ pub struct UiaElementInfo {
     pub automation_id: String,
     pub is_enabled: bool,
     pub supported_actions: Vec<String>,
+    /// (x, y, width, height) in physical screen pixels — same coordinate
+    /// space as monitor geometry and `capture_region` — or `None` when the
+    /// element reports an empty/offscreen rect. `None` rather than zeros so
+    /// callers can distinguish "no usable rect" from "rect at the origin".
+    pub bounding_rect: Option<(f64, f64, f64, f64)>,
 }
 
 /// List elements in the given window's accessibility tree, optionally
@@ -107,17 +112,19 @@ pub fn uia_set_element_text(
 mod windows_impl {
     use super::UiaElementInfo;
     use windows::core::BSTR;
-    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_APARTMENTTHREADED,
     };
+    use windows::Win32::System::Variant::{VARIANT, VT_I4};
     use windows::Win32::UI::Accessibility::{
-        CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
-        IUIAutomationLegacyIAccessiblePattern, IUIAutomationSelectionItemPattern,
-        IUIAutomationTextPattern, IUIAutomationTogglePattern, IUIAutomationValuePattern,
-        TreeScope_Descendants, UIA_InvokePatternId, UIA_LegacyIAccessiblePatternId,
-        UIA_SelectionItemPatternId, UIA_TextPatternId, UIA_TogglePatternId, UIA_ValuePatternId,
+        CUIAutomation, IUIAutomation, IUIAutomationCondition, IUIAutomationElement,
+        IUIAutomationInvokePattern, IUIAutomationLegacyIAccessiblePattern,
+        IUIAutomationSelectionItemPattern, IUIAutomationTextPattern, IUIAutomationTogglePattern,
+        IUIAutomationValuePattern, TreeScope_Descendants, UIA_ControlTypePropertyId,
+        UIA_InvokePatternId, UIA_LegacyIAccessiblePatternId, UIA_SelectionItemPatternId,
+        UIA_TextPatternId, UIA_TogglePatternId, UIA_ValuePatternId,
     };
 
     /// The 39 well-known Win32 UI Automation control type IDs (documented,
@@ -241,6 +248,20 @@ mod windows_impl {
         unsafe { el.CurrentIsEnabled() }.map(|b| b.as_bool()).unwrap_or(false)
     }
 
+    /// Physical-pixel bounding rect, or `None` for an offscreen/collapsed
+    /// element (zero or negative width/height) — those aren't useful
+    /// highlight targets and would otherwise draw a degenerate ring at the
+    /// origin.
+    fn element_bounding_rect(el: &IUIAutomationElement) -> Option<(f64, f64, f64, f64)> {
+        let rect: RECT = unsafe { el.CurrentBoundingRectangle() }.ok()?;
+        let width = (rect.right - rect.left) as f64;
+        let height = (rect.bottom - rect.top) as f64;
+        if width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        Some((rect.left as f64, rect.top as f64, width, height))
+    }
+
     fn has_pattern<T: windows::core::Interface>(el: &IUIAutomationElement, pattern_id: windows::Win32::UI::Accessibility::UIA_PATTERN_ID) -> bool {
         unsafe { el.GetCurrentPatternAs::<T>(pattern_id) }.is_ok()
     }
@@ -269,17 +290,47 @@ mod windows_impl {
         actions
     }
 
-    /// Enumerates every descendant of `root` into a flat list, capped well
-    /// below anything that would make a single response unwieldy — dense
-    /// apps (browsers, IDEs) can have thousands of accessibility nodes.
+    /// Enumerates matching descendants of `root` into a flat list, capped
+    /// well below anything that would make a single response unwieldy —
+    /// dense apps (browsers, IDEs) can have thousands of accessibility
+    /// nodes. When `control_type_id` is given, the filter is pushed down
+    /// into the COM call itself via a PropertyCondition rather than
+    /// fetched-then-discarded client-side: a `TrueCondition` FindAll on a
+    /// dense tree can burn the entire MAX_ELEMENTS cap on irrelevant nodes
+    /// before ever reaching a matching one buried deeper in traversal
+    /// order, silently making a real target undiscoverable. Filtering at
+    /// the COM level means the cap applies to the FILTERED set, not the
+    /// raw one.
     const MAX_ELEMENTS: usize = 400;
+
+    /// Builds a VARIANT wrapping a single i32 (VT_I4) — the shape
+    /// CreatePropertyCondition expects for UIA_ControlTypePropertyId's
+    /// value. windows-rs has no convenience constructor for this raw COM
+    /// union; this is the standard, if verbose, way to populate one.
+    fn i32_variant(value: i32) -> VARIANT {
+        let mut variant = VARIANT::default();
+        unsafe {
+            (*variant.Anonymous.Anonymous).vt = VT_I4;
+            (*variant.Anonymous.Anonymous).Anonymous.lVal = value;
+        }
+        variant
+    }
 
     fn find_all_descendants(
         automation: &IUIAutomation,
         root: &IUIAutomationElement,
+        control_type_id: Option<i32>,
     ) -> Result<Vec<IUIAutomationElement>, String> {
-        let condition = unsafe { automation.CreateTrueCondition() }
-            .map_err(|e| format!("CreateTrueCondition failed: {e}"))?;
+        let condition: IUIAutomationCondition = match control_type_id {
+            Some(id) => unsafe {
+                automation
+                    .CreatePropertyCondition(UIA_ControlTypePropertyId, &i32_variant(id))
+                    .map_err(|e| format!("CreatePropertyCondition failed: {e}"))?
+            },
+            None => unsafe {
+                automation.CreateTrueCondition().map_err(|e| format!("CreateTrueCondition failed: {e}"))?
+            },
+        };
         let array = unsafe { root.FindAll(TreeScope_Descendants, &condition) }
             .map_err(|e| format!("FindAll failed: {e}"))?;
         let count = unsafe { array.Length() }.map_err(|e| format!("{e}"))?;
@@ -305,16 +356,11 @@ mod windows_impl {
             ));
         }
 
-        let elements = find_all_descendants(&automation, &root)?;
+        let elements = find_all_descendants(&automation, &root, filter_id)?;
         let infos = elements
             .iter()
             .filter_map(|el| {
                 let ct = element_control_type(el);
-                if let Some(f) = filter_id {
-                    if ct != f {
-                        return None;
-                    }
-                }
                 let name = element_name(el);
                 let automation_id = element_automation_id(el);
                 // Skip anonymous, non-actionable nodes (typically decorative
@@ -329,6 +375,7 @@ mod windows_impl {
                     automation_id,
                     is_enabled: element_enabled(el),
                     supported_actions: supported_actions(el),
+                    bounding_rect: element_bounding_rect(el),
                 })
             })
             .collect();
@@ -357,7 +404,7 @@ mod windows_impl {
             None => None,
         };
 
-        let elements = find_all_descendants(automation, root)?;
+        let elements = find_all_descendants(automation, root, filter_id)?;
         let query = name.trim().to_lowercase();
         if query.is_empty() {
             return Err("Element name must not be empty".to_string());
@@ -366,11 +413,6 @@ mod windows_impl {
         let mut exact: Option<IUIAutomationElement> = None;
         let mut partial: Option<IUIAutomationElement> = None;
         for el in elements {
-            if let Some(f) = filter_id {
-                if element_control_type(&el) != f {
-                    continue;
-                }
-            }
             let el_name = element_name(&el).to_lowercase();
             if el_name.is_empty() {
                 continue;

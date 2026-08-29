@@ -1,12 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "overlay",
-  "description": "Capability for the quick-invoke overlay window",
+  "description": "Capability for the quick-invoke overlay window (WP7.4: also renders the running/result/walkthrough states formerly shown by the separate, now-deleted `result` window)",
   "windows": ["overlay"],
   "permissions": [
     "core:default",
     "core:window:allow-hide",
     "core:window:allow-show",
-    "core:window:allow-set-focus"
+    "core:window:allow-set-focus",
+    "core:window:allow-set-ignore-cursor-events"
   ]
 }

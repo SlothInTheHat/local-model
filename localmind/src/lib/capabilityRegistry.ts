@@ -18,32 +18,26 @@ function renderTabList(): string {
 }
 
 /**
- * Groups sessionTools by their ToolDef.group metadata and renders one line
- * per group, e.g. "- files: read_file, write_file, ...". Tools with no group
- * (or an MCP-style "serverId__toolName" name) are bucketed into a trailing
- * "integrations (MCP)" line.
+ * Lists which built-in tool CATEGORIES (not individual tool names) are
+ * available this session, e.g. "files, shell, git, web". Names are
+ * deliberately omitted — every tool in `sessionTools` already has its exact
+ * name/description/parameters sent to the model via the `tools:` schema
+ * (agentLoop.ts's toOllamaTool), so repeating names here in prose was pure
+ * duplication (each retrieved tool's name appeared twice in the same
+ * prompt). MCP-style "serverId__toolName" tools are excluded from this
+ * category summary entirely — renderMcpStatus (verbose path) or the
+ * connected-integrations one-liner (lean path) already cover them with live
+ * connection status, which a static category label can't express anyway.
  */
 function renderToolGroups(sessionTools: ToolDef[]): string {
-  const byGroup = new Map<string, string[]>();
-  const other: string[] = [];
-
+  const groupsPresent = new Set<string>();
   for (const t of sessionTools) {
-    if (t.name.includes("__") || !t.group || !GROUP_ORDER.includes(t.group as (typeof GROUP_ORDER)[number])) {
-      other.push(t.name);
-      continue;
-    }
-    const list = byGroup.get(t.group) ?? [];
-    list.push(t.name);
-    byGroup.set(t.group, list);
+    if (t.name.includes("__") || !t.group) continue;
+    if (GROUP_ORDER.includes(t.group as (typeof GROUP_ORDER)[number])) groupsPresent.add(t.group);
   }
-
-  const lines: string[] = [];
-  for (const group of GROUP_ORDER) {
-    const names = byGroup.get(group);
-    if (names && names.length > 0) lines.push(`- ${group}: ${names.join(", ")}`);
-  }
-  if (other.length > 0) lines.push(`- integrations (MCP): ${other.join(", ")}`);
-  return lines.join("\n");
+  const labels = GROUP_ORDER.filter((g) => groupsPresent.has(g));
+  if (labels.length === 0) return "No built-in tool categories are active this session.";
+  return `Tool categories available this session: ${labels.join(", ")} (each tool's exact name and parameters are already provided in your tool schema, not repeated here).`;
 }
 
 /**
@@ -89,7 +83,7 @@ function renderExtraRoots(): string {
   return [
     "Folders enabled for file access beyond the open workspace (Settings > Privacy & Security):",
     ...lines,
-    "Pass these paths directly to file tools (read_file, write_file, list_directory, find_files, grep_files, delete_file, move_file, copy_file, rename_file, create_folder).",
+    "Pass these paths directly to file tools (read_file, write_file, list_directory, find_files, grep_files, delete_file, move_file, create_folder).",
   ].join("\n");
 }
 
@@ -115,7 +109,7 @@ export function buildCapabilityBlock(sessionTools: ToolDef[], verbose = true): s
     }
     const connected = useMcpStore.getState().servers.filter((s) => s.enabled && s.status === "connected");
     if (connected.length > 0) {
-      lean.push("", `Connected integrations: ${connected.map((s) => s.label).join(", ")} (their tools appear above under "integrations (MCP)").`);
+      lean.push("", `Connected integrations: ${connected.map((s) => s.label).join(", ")} — their tools are included in your tool schema this session.`);
     }
     return lean.join("\n");
   }

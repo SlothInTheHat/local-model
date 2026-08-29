@@ -51,8 +51,6 @@ const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   patch_file: true,
   delete_file: true,
   move_file: true,
-  copy_file: true,
-  rename_file: true,
   list_directory: true,
   grep_files: true,
   find_files: true,
@@ -64,12 +62,13 @@ const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   remove_background: true,
   pdf_merge: true,
   pdf_to_text: true,
-  close_window: true,
-  minimize_window: true,
+  window_control: true,
   uia_list_elements: true,
   uia_click_element: true,
   uia_read_element_text: true,
   uia_set_element_text: true,
+  highlight_element: true,
+  propose_walkthrough_steps: true,
   list_processes: true,
   kill_process: true,
   get_disk_usage: true,
@@ -82,10 +81,16 @@ const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   web_search: true,
   search_images: true,
   run_command: false,
-  // Also gated separately by settings.codeModeEnabled + supportsCodeMode() —
-  // see assembleSessionTools/agentRuntime.ts. Off here too so it never
-  // appears in the plain tools-enabled list by default.
-  run_tool_script: false,
+  // "Code Mode" — batches a multi-step tool sequence into one script instead
+  // of one call per round. Also independently gated by supportsCodeMode()
+  // (agentRuntime.ts/modelCapabilities.ts), which withholds it from models
+  // judged unlikely to write a reliable script regardless of this toggle —
+  // that capability bar is the real safety gate and stays exactly as strict
+  // as it already was. Defaulting this to true only affects brand-new
+  // installs: useAgentStore's persist `merge` lets a persisted value always
+  // win over this default, so existing users' explicit choice (including an
+  // existing "off") is never silently overridden.
+  run_tool_script: true,
   get_system_info: true,
   get_current_datetime: true,
   git_status: false,
@@ -122,7 +127,6 @@ const DEFAULT_TOOLS_ENABLED: Record<ToolName, boolean> = {
   set_clipboard: true,
   open_application: true,
   list_windows: true,
-  focus_window: true,
   take_screenshot: true,
   save_workflow: true,
   list_workflows: true,

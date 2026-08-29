@@ -20,6 +20,7 @@ import { useModelSelectionStore } from "../store/modelSelection";
 import { useAppViewStore } from "../store/appView";
 import { useTaskQueueStore } from "../store/taskQueue";
 import { useAgentStore } from "../store/agent";
+import { useVoiceStore } from "../store/voice";
 import { useModelStore } from "../store/models";
 import { useWorkflowStore, compileInstruction } from "../store/workflows";
 import type { Workflow } from "../store/workflows";
@@ -31,6 +32,7 @@ import { streamChatForModel } from "./chatProvider";
 import { listShadowHistory, diffShadowRange } from "./shadowGit";
 import { runBenchmarkSuite } from "./benchmarks";
 import { notifyOs } from "./osNotify";
+import { primaryMonitor } from "@tauri-apps/api/window";
 
 // ─── Tauri invoke shim ───────────────────────────────────────────────────────
 
@@ -42,6 +44,33 @@ async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
   };
   if (typeof core?.invoke !== "function") throw new Error("Tauri core.invoke unavailable");
   return core.invoke(cmd, args);
+}
+
+/** Parses a vision model's free-text response into a normalized (0-1)
+ *  bounding box for highlight_element's vision fallback. Small/weak models
+ *  reliably wrap JSON in prose or a markdown code fence despite being told
+ *  "no other text," so this extracts the first `{...}` blob rather than
+ *  trusting the whole response to be bare JSON. Returns null on anything
+ *  that doesn't parse into four in-range numbers, or on an explicit
+ *  `{"found":false}` — both are treated as "the vision model didn't find
+ *  it," not a hard error. */
+function extractNormalizedBoundingBox(text: string): { x: number; y: number; width: number; height: number } | null {
+  const match = text.match(/\{[^{}]*\}/);
+  if (!match) return null;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(match[0]) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (parsed["found"] === false) return null;
+  const x = Number(parsed["x"]);
+  const y = Number(parsed["y"]);
+  const width = Number(parsed["width"]);
+  const height = Number(parsed["height"]);
+  if (![x, y, width, height].every((n) => Number.isFinite(n) && n >= 0 && n <= 1)) return null;
+  if (width <= 0 || height <= 0) return null;
+  return { x, y, width, height };
 }
 
 function base64ToBlob(base64: string, mime: string): Blob {
@@ -87,8 +116,6 @@ export type ToolName =
   | "patch_file"
   | "delete_file"
   | "move_file"
-  | "copy_file"
-  | "rename_file"
   | "list_directory"
   | "grep_files"
   | "find_files"
@@ -100,12 +127,13 @@ export type ToolName =
   | "remove_background"
   | "pdf_merge"
   | "pdf_to_text"
-  | "close_window"
-  | "minimize_window"
+  | "window_control"
   | "uia_list_elements"
   | "uia_click_element"
   | "uia_read_element_text"
   | "uia_set_element_text"
+  | "highlight_element"
+  | "propose_walkthrough_steps"
   | "list_processes"
   | "kill_process"
   | "get_disk_usage"
@@ -152,7 +180,6 @@ export type ToolName =
   | "set_clipboard"
   | "open_application"
   | "list_windows"
-  | "focus_window"
   | "take_screenshot"
   | "save_workflow"
   | "list_workflows"
@@ -648,47 +675,15 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
   {
     name: "move_file",
     description:
-      "Move (or rename, if 'to' is in the same folder) a file or directory. Works within the open workspace, or between any folders the user has enabled in Settings > Privacy & Security (e.g. moving a file from Downloads into the workspace, or organizing files within Downloads).",
+      "Move, copy, or rename a file or directory. action='move' (default) relocates it — pass 'to' in the same folder with a new name to rename in place. action='copy' duplicates it (recursively for directories), leaving the original untouched. Works within the open workspace, or between any folders the user has enabled in Settings > Privacy & Security (e.g. moving a file from Downloads into the workspace, or organizing files within Downloads).",
     parameters: {
       type: "object",
       properties: {
         from: { type: "string", description: "Path to the existing file/directory. Relative paths resolve against the open workspace; absolute paths must be inside the workspace or an enabled folder." },
         to: { type: "string", description: "Destination path, same rules as 'from'. Parent directories are created as needed." },
+        action: { type: "string", enum: ["move", "copy"], description: "Defaults to 'move'. Use 'copy' to duplicate instead of relocating, leaving the original in place." },
       },
       required: ["from", "to"],
-    },
-    group: "files",
-    risk: "mutate",
-    planModeAllowed: false,
-    requiresApproval: true,
-  },
-  {
-    name: "copy_file",
-    description:
-      "Copy a file or directory (recursively) to a new location, leaving the original in place. Same path rules as move_file.",
-    parameters: {
-      type: "object",
-      properties: {
-        from: { type: "string", description: "Path to the existing file/directory." },
-        to: { type: "string", description: "Destination path. Parent directories are created as needed." },
-      },
-      required: ["from", "to"],
-    },
-    group: "files",
-    risk: "mutate",
-    planModeAllowed: false,
-    requiresApproval: true,
-  },
-  {
-    name: "rename_file",
-    description: "Rename a file or directory in place (keeps it in the same folder). For moving to a different folder, use move_file instead.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Path to the existing file/directory." },
-        new_name: { type: "string", description: "The new file/directory name (not a full path — just the name)." },
-      },
-      required: ["path", "new_name"],
     },
     group: "files",
     risk: "mutate",
@@ -833,7 +828,7 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
   },
   {
     name: "list_windows",
-    description: "List visible top-level windows on the desktop, each with a title and a stable id. Use the id with focus_window.",
+    description: "List visible top-level windows on the desktop, each with a title and a stable id. Use the id with window_control.",
     parameters: {
       type: "object",
       properties: {},
@@ -845,44 +840,15 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
     requiresApproval: false,
   },
   {
-    name: "focus_window",
-    description: "Bring a window to the foreground (restoring it if minimized) by the id returned from list_windows.",
+    name: "window_control",
+    description: "Act on a window by the id returned from list_windows. action='focus' brings it to the foreground (restoring it if minimized). action='close' sends a normal close request (same as clicking its X button — well-behaved apps get a chance to prompt for unsaved changes). action='minimize' minimizes it.",
     parameters: {
       type: "object",
       properties: {
+        action: { type: "string", enum: ["focus", "close", "minimize"] },
         id: { type: "string", description: "The window id from list_windows." },
       },
-      required: ["id"],
-    },
-    group: "state",
-    risk: "execute",
-    planModeAllowed: false,
-    requiresApproval: true,
-  },
-  {
-    name: "close_window",
-    description: "Close a window (a normal close request, same as clicking its X button — well-behaved apps get a chance to prompt for unsaved changes) by the id returned from list_windows.",
-    parameters: {
-      type: "object",
-      properties: {
-        id: { type: "string", description: "The window id from list_windows." },
-      },
-      required: ["id"],
-    },
-    group: "state",
-    risk: "execute",
-    planModeAllowed: false,
-    requiresApproval: true,
-  },
-  {
-    name: "minimize_window",
-    description: "Minimize a window by the id returned from list_windows.",
-    parameters: {
-      type: "object",
-      properties: {
-        id: { type: "string", description: "The window id from list_windows." },
-      },
-      required: ["id"],
+      required: ["action", "id"],
     },
     group: "state",
     risk: "execute",
@@ -956,6 +922,51 @@ export const TOOL_DEFINITIONS: ToolDef[] = [
     risk: "execute",
     planModeAllowed: false,
     requiresApproval: true,
+  },
+  {
+    name: "highlight_element",
+    description: "Draw a brief animated ring around a UI element on screen, by its accessible name inside a window (from list_windows) — a visual \"look here\" pointer, e.g. after finding something with uia_list_elements and wanting to show the user exactly where it is rather than only describing it in text. Purely visual: it does not click, focus, or otherwise interact with the element, and clears itself automatically after a few seconds. Call uia_list_elements first if you're not sure of the exact name. Works even for apps with no accessibility tree (older Win32 apps, custom-drawn UI like Paint/creative tools/games) — it automatically falls back to locating the element visually via a screenshot when the accessibility lookup finds nothing, so call it directly rather than assuming it will fail or asking the user for permission first.",
+    parameters: {
+      type: "object",
+      properties: {
+        window_id: { type: "string", description: "The window id from list_windows." },
+        name: { type: "string", description: "The element's accessible name (exact match preferred, substring match as fallback)." },
+        control_type: { type: "string", description: "Optional filter to disambiguate elements sharing a name, e.g. 'button'." },
+      },
+      required: ["window_id", "name"],
+    },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
+  },
+  {
+    name: "propose_walkthrough_steps",
+    description: "Only for a genuine step-by-step \"walk me through X\" request. Once you've looked at the screen (take_screenshot/uia_list_elements) and identified the concrete UI elements involved, call this with an ordered list of 4-15 steps to guide the user through the task. Each step names the EXACT accessible element name (matching what uia_list_elements reports) to interact with next, plus a short spoken-style instruction. This does not perform any action itself — it hands the plan to the UI, which highlights each step's element in turn as the user works through it. For anything that isn't a step-by-step teaching request, just answer normally instead of calling this.",
+    parameters: {
+      type: "object",
+      properties: {
+        window_id: { type: "string", description: "The window id (from list_windows) the steps apply to." },
+        steps: {
+          type: "array",
+          description: "4 to 15 ordered steps.",
+          items: {
+            type: "object",
+            properties: {
+              target: { type: "string", description: "The exact accessible element name to highlight for this step." },
+              control_type: { type: "string", description: "Optional filter to disambiguate elements sharing a name, e.g. 'button'." },
+              instruction: { type: "string", description: "Short, spoken-style instruction for this step, e.g. \"Click File, then New Project.\"" },
+            },
+            required: ["target", "instruction"],
+          },
+        },
+      },
+      required: ["window_id", "steps"],
+    },
+    group: "state",
+    risk: "read",
+    planModeAllowed: true,
+    requiresApproval: false,
   },
   {
     name: "list_processes",
@@ -2044,7 +2055,8 @@ export function resolveFileRoot(
 
 /**
  * Resolves a model-supplied path to a plain absolute OS path string, for the
- * native Rust-backed tools (move_file/copy_file/rename_file) that operate on
+ * native Rust-backed tools (move_file, incl. its legacy copy_file/rename_file
+ * fallback cases) that operate on
  * path strings directly rather than a FileSystemDirectoryHandle. Confinement
  * is still enforced server-side by Rust's ensure_confined — this only builds
  * a plausible absolute path and grants no access by itself.
@@ -2844,10 +2856,22 @@ export async function executeTool(
         if (!toArg) throw new Error("Missing 'to' argument");
         const from = resolveNativeAbsolutePath(fromArg, workspacePath);
         const to = resolveNativeAbsolutePath(toArg, workspacePath);
+        if (argStr(call.args["action"]) === "copy") {
+          await tauriInvoke("fs_copy", { from, to });
+          return { toolCallId: call.id, name: call.name, output: `Copied ${from} -> ${to}`, resource: { kind: "file", path: to, label: `copied file to ${to}` } };
+        }
         await tauriInvoke("fs_move", { from, to });
         return { toolCallId: call.id, name: call.name, output: `Moved ${from} -> ${to}`, resource: { kind: "file", path: to, label: `moved file to ${to}` } };
       }
 
+      // copy_file/rename_file are no longer advertised in TOOL_DEFINITIONS
+      // (folded into move_file's action param — see its doc comment) but kept
+      // here, unchanged, as unadvertised legacy handlers: never aliased via
+      // TOOL_ALIASES (that renames the call only, not its args, so aliasing
+      // copy_file -> move_file would silently turn a copy into a move), so a
+      // stray call to either falls through canonicalToolName unchanged, then
+      // resolveToolPolicy's default-deny (identical to these tools' own
+      // policy below) — zero behavior change if anything still calls them.
       case "copy_file": {
         const fromArg = argStr(call.args["from"]) || argStr(call.args["source"]) || argStr(call.args["path"]);
         const toArg = argStr(call.args["to"]) || argStr(call.args["destination"]);
@@ -4006,6 +4030,24 @@ export async function executeTool(
         };
       }
 
+      case "window_control": {
+        const id = argStr(call.args["id"]);
+        if (!id) throw new Error("Missing id argument");
+        const action = argStr(call.args["action"]);
+        if (action !== "focus" && action !== "close" && action !== "minimize") {
+          throw new Error("Missing or invalid action argument — must be 'focus', 'close', or 'minimize'");
+        }
+        const rustCommand = action === "close" ? "close_window" : action === "minimize" ? "minimize_window" : "focus_window";
+        const output = await tauriInvoke<string>(rustCommand, { id });
+        return { toolCallId: call.id, name: call.name, output };
+      }
+
+      // focus_window/close_window/minimize_window are no longer advertised in
+      // TOOL_DEFINITIONS (folded into window_control's action param) but kept
+      // here, unchanged, as unadvertised legacy handlers — same reasoning as
+      // move_file/copy_file/rename_file above: a stray call to one of these
+      // falls through canonicalToolName unchanged, then resolveToolPolicy's
+      // default-deny (identical to these tools' own policy below).
       case "focus_window": {
         const id = argStr(call.args["id"]);
         if (!id) throw new Error("Missing id argument");
@@ -4077,6 +4119,111 @@ export async function executeTool(
         return { toolCallId: call.id, name: call.name, output };
       }
 
+      case "highlight_element": {
+        const windowId = argStr(call.args["window_id"]);
+        const name = argStr(call.args["name"]);
+        if (!windowId || !name) throw new Error("Missing window_id/name argument");
+        const controlType = argStr(call.args["control_type"]) || undefined;
+        const elements = await tauriInvoke<
+          Array<{ name: string; automation_id: string; control_type: string; bounding_rect: [number, number, number, number] | null }>
+        >("uia_list_elements", { windowId, controlType });
+        const lowerName = name.trim().toLowerCase();
+        // AutomationId first — far more stable than the visible Name, which
+        // is localized and can shift with the OS/app display language.
+        // uia_list_elements already surfaces automation_id to the model, so
+        // it may pass one directly as `name` when it's the more reliable
+        // handle. Falls through to exact-then-substring Name match, same as
+        // before.
+        const match =
+          elements.find((e) => e.automation_id && e.automation_id.trim().toLowerCase() === lowerName) ??
+          elements.find((e) => e.name.trim().toLowerCase() === lowerName) ??
+          elements.find((e) => e.name.trim().toLowerCase().includes(lowerName));
+
+        if (match?.bounding_rect) {
+          const [x, y, width, height] = match.bounding_rect;
+          await tauriInvoke("highlight_screen_rect", { x, y, width, height });
+          return { toolCallId: call.id, name: call.name, output: `Highlighted "${match.name}" on screen.` };
+        }
+
+        // The accessibility tree came up empty (or found the element but
+        // with no usable rect) — common for canvas/GPU-rendered UI (browser
+        // page content, Electron/Chromium apps, custom-drawn creative/DAW
+        // tools, games), where UIA exposes nothing or just one opaque
+        // surface. Fall back to asking the vision model to locate it
+        // directly in a fresh screenshot, converting its normalized
+        // bounding box back to real screen pixels via the primary
+        // monitor's own physical size. This inherits take_screenshot's own
+        // primary-monitor-only limitation — a target on a secondary
+        // monitor won't be found this way either.
+        const visionModel = resolveRole("vision");
+        if (!visionModel) {
+          throw new Error(
+            match
+              ? `Found "${match.name}" via the accessibility tree but it has no visible bounding rect, and no vision model is configured to fall back to.`
+              : `No element named "${name}" found via the accessibility tree in window ${windowId}, and no vision model is configured to fall back to.`,
+          );
+        }
+        try {
+          const shot = await tauriInvoke<{ path: string }>("take_screenshot");
+          const imageB64 = await tauriInvoke<string>("read_image_base64", { path: shot.path, maxDim: 1568 });
+          const prompt = `Find the UI element described as "${name}" in this screenshot. Respond with ONLY a JSON object giving its bounding box as fractions of the image (0 to 1, top-left origin): {"x":0.0,"y":0.0,"width":0.0,"height":0.0}. If you cannot find it, respond with exactly {"found":false}. No other text.`;
+          let visionText = "";
+          for await (const chunk of streamChatForModel(visionModel, [
+            { role: "user", content: prompt, images: [imageB64] },
+          ])) {
+            visionText += chunk;
+            // 300 chars was too tight: a reasoning-mode vision model (e.g.
+            // an OpenRouter ":reasoning" variant) emits its chain-of-thought
+            // BEFORE the JSON despite being told "no other text," so a
+            // small cap could cut the stream off before the actual bounding
+            // box ever appears — silently making this fallback always fail
+            // for that class of model. Matches take_screenshot's own
+            // generous cap for the same reason.
+            if (visionText.length > 4000) break;
+          }
+          const box = extractNormalizedBoundingBox(visionText);
+          if (!box) {
+            throw new Error(`Vision model (${visionModel}) couldn't locate "${name}" in the current screenshot either.`);
+          }
+          const monitor = await primaryMonitor();
+          if (!monitor) throw new Error("Could not resolve the primary monitor's size to convert the vision model's coordinates.");
+          const x = Math.round(box.x * monitor.size.width);
+          const y = Math.round(box.y * monitor.size.height);
+          const width = Math.round(box.width * monitor.size.width);
+          const height = Math.round(box.height * monitor.size.height);
+          await tauriInvoke("highlight_screen_rect", { x, y, width, height });
+          return {
+            toolCallId: call.id,
+            name: call.name,
+            output: `Highlighted "${name}" on screen (located visually, not via the accessibility tree — this app doesn't expose it there — so the position is an estimate rather than pixel-exact).`,
+          };
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          throw new Error(
+            match
+              ? `Found "${match.name}" via the accessibility tree but it has no bounding rect, and the vision fallback failed: ${reason}`
+              : `No element named "${name}" found via the accessibility tree, and the vision fallback failed: ${reason}`,
+          );
+        }
+      }
+
+      case "propose_walkthrough_steps": {
+        // No Rust call, no side effect — this tool's entire purpose is to
+        // force the model's step plan through Ollama's native tool-call JSON
+        // schema validation (the same machinery every other tool already
+        // goes through) rather than parsing fenced JSON out of prose. The
+        // validated args are read directly off the resolved ToolCall by
+        // headlessRunner.ts's onToolCallResolved callback (see
+        // HeadlessTaskRunResult.walkthroughSteps) — this handler just needs
+        // to return SOME output so the round loop treats the call as done.
+        const steps = Array.isArray(call.args["steps"]) ? (call.args["steps"] as unknown[]).length : 0;
+        return {
+          toolCallId: call.id,
+          name: call.name,
+          output: `Proposed a ${steps}-step walkthrough.`,
+        };
+      }
+
       case "list_processes": {
         const processes = await tauriInvoke<Array<{ pid: number; name: string }>>("list_processes");
         const output = processes.length === 0
@@ -4122,7 +4269,7 @@ export async function executeTool(
         const truncated = rawText.length > SPEAK_TEXT_MAX_CHARS;
         const text = truncated ? rawText.slice(0, SPEAK_TEXT_MAX_CHARS) : rawText;
         try {
-          await speakText(text);
+          await speakText(text, useVoiceStore.getState().selectedVoiceName);
           return {
             toolCallId: call.id,
             name: call.name,

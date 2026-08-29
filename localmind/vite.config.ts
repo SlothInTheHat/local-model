@@ -20,14 +20,14 @@ export default defineConfig(async () => ({
   // 1. prevent Vite from obscuring rust errors
   build: {
     rollupOptions: {
-      // Multi-page build (WP5.3, extended for the result widget): the overlay
-      // and result windows each load their own HTML entry so their bundles
-      // never pull in main.tsx/App.tsx (and, by extension, the
-      // stores/scheduler/taskRunner side effects those import).
+      // Multi-page build (WP5.3): the overlay window loads its own HTML entry
+      // so its bundle never pulls in main.tsx/App.tsx (and, by extension, the
+      // stores/scheduler/taskRunner side effects those import). The result
+      // window (result.html) was merged into the overlay window's own
+      // QuickInvoke.tsx and no longer exists as a separate entry.
       input: {
         main: resolve(__dirname, "index.html"),
         overlay: resolve(__dirname, "overlay.html"),
-        result: resolve(__dirname, "result.html"),
       },
       output: {
         manualChunks: {

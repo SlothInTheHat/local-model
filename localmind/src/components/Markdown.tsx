@@ -14,8 +14,9 @@ import "katex/dist/katex.min.css";
 import { rehypeCitations } from "../lib/citationsRehype";
 
 // HARD CONSTRAINT: this component is shared by the main app AND the isolated
-// result widget webview (see the import-graph comments at the top of
-// src/result/ResultWidget.tsx and src/result/main.tsx). It must import ONLY
+// quick-invoke overlay webview, which renders the answer card once the
+// separate `result` window was merged into it (see the import-graph comment
+// at the top of src/overlay/QuickInvoke.tsx). It must import ONLY
 // react/react-markdown/remark/rehype/katex/mermaid — never ../store/, never a
 // side-effectful ../lib/ module, and never cn() from ../components/ui/utils.
 // Pulling in a store here would boot a second scheduler/taskRunner inside

@@ -103,13 +103,44 @@ export interface HeadlessTaskOpts {
    * — its answer is the transcript itself, returned to the parent).
    */
   expectSideEffects?: boolean;
+  /**
+   * When true, the model only ever sees the tools named in toolAllowlist —
+   * not every read-only built-in tool plus the allowlist for
+   * approval-requiring ones (today's default; see the `tools:` filter
+   * below). Default false preserves that broader default for scheduler/
+   * task-queue/subagent callers, which rely on the full read-only surface
+   * being available without having to enumerate it. quick-invoke sets this
+   * true: QUICK_INVOKE_ALLOWLIST in App.tsx is meant to be the COMPLETE tool
+   * surface for that mode (a deliberately small, curated set), not just the
+   * approval-requiring subset of a much larger implicit one — without this,
+   * quick-invoke was being offered every read-only tool in the app (~50+)
+   * as a round candidate, most of them irrelevant to what it's for.
+   */
+  restrictToolsToAllowlist?: boolean;
   signal?: AbortSignal;
+}
+
+/** One step of a model-proposed guided walkthrough — see the
+ *  `propose_walkthrough_steps` tool (src/lib/tools.ts) this is captured from. */
+export interface WalkthroughStepPlan {
+  target: string;
+  controlType?: string;
+  instruction: string;
 }
 
 export interface HeadlessTaskRunResult {
   record: SessionResult;
   transcript: string;
   steps: string[];
+  /** Populated only when the model called `propose_walkthrough_steps` this
+   *  run (quick-invoke's walkthrough feature) — optional and unused by every
+   *  other caller (scheduler/task-queue/subagent/workflow runs). */
+  walkthroughSteps?: { windowId: string; steps: WalkthroughStepPlan[] };
+  /** Total wall-clock time for this run in ms (finishedAt - startedAt) —
+   *  WP7.6 debug timing, so a caller (quick-invoke) can show "how long did
+   *  that take" without recomputing it from the SessionResult's own
+   *  timestamps itself. */
+  durationMs: number;
 }
 
 /**
@@ -167,6 +198,7 @@ export async function runHeadlessTask(opts: HeadlessTaskOpts): Promise<HeadlessT
 
   let transcript = "";
   const steps: string[] = [];
+  let walkthroughSteps: HeadlessTaskRunResult["walkthroughSteps"];
 
   const config: AgentRuntimeConfig = {
     modelRef: opts.modelRef,
@@ -187,8 +219,8 @@ export async function runHeadlessTask(opts: HeadlessTaskOpts): Promise<HeadlessT
     // Advertising e.g. run_command when it will always be auto-denied just
     // wastes a round on a dead-on-arrival call — and previously let a session
     // "complete" having accomplished nothing (see hadDeniedToolCalls below).
-    tools: [...getHeadlessDefaultTools(), ...(opts.extraTools ?? [])].filter(
-      (t) => !t.requiresApproval || allowlist.includes(t.name),
+    tools: [...getHeadlessDefaultTools(), ...(opts.extraTools ?? [])].filter((t) =>
+      opts.restrictToolsToAllowlist ? allowlist.includes(t.name) : !t.requiresApproval || allowlist.includes(t.name),
     ),
     agentBuildMode: opts.agentBuildMode ?? true,
     autoApproveAll: false,
@@ -221,8 +253,39 @@ export async function runHeadlessTask(opts: HeadlessTaskOpts): Promise<HeadlessT
       transcript = cleanText;
     },
     onApprovalNeeded: (call: ToolCall) => Promise.resolve(allowlist.includes(call.name)),
-    onToolCallResolved: (_call, label, _result, summary) => {
-      steps.push(`${label} → ${summary}`);
+    onToolCallResolved: (call, label, _result, summary) => {
+      // [+X.Xs] prefix — WP7.6 debug timing. Each tool-call resolution is a
+      // full model round completing (decide-to-call-this-tool included), so
+      // the deltas between consecutive steps below approximate per-round
+      // latency without needing any deeper hook into agentRuntime.ts's round
+      // loop. Elapsed since `startedAt` (Date.now(), already captured above)
+      // rather than a running total in the closure — simpler, no separate
+      // "last mark" variable to keep in sync.
+      const elapsedS = ((Date.now() - startedAt) / 1000).toFixed(1);
+      steps.push(`[+${elapsedS}s] ${label} → ${summary}`);
+      // Capture the model's already-validated step plan directly off the
+      // call args (Ollama's own tool-call JSON-schema validation already
+      // shaped this) rather than re-parsing anything out of prose — see
+      // propose_walkthrough_steps' doc comment in tools.ts for why this tool
+      // exists at all.
+      if (call.name === "propose_walkthrough_steps") {
+        const windowId = typeof call.args["window_id"] === "string" ? (call.args["window_id"] as string) : "";
+        const rawSteps = Array.isArray(call.args["steps"]) ? (call.args["steps"] as unknown[]) : [];
+        const parsed: WalkthroughStepPlan[] = rawSteps
+          .map((s): WalkthroughStepPlan | null => {
+            if (typeof s !== "object" || s === null) return null;
+            const rec = s as Record<string, unknown>;
+            const target = typeof rec["target"] === "string" ? rec["target"] : "";
+            const instruction = typeof rec["instruction"] === "string" ? rec["instruction"] : "";
+            if (!target || !instruction) return null;
+            const controlType = typeof rec["control_type"] === "string" ? rec["control_type"] : undefined;
+            return { target, instruction, controlType };
+          })
+          .filter((s): s is WalkthroughStepPlan => s !== null);
+        if (windowId && parsed.length > 0) {
+          walkthroughSteps = { windowId, steps: parsed.slice(0, 15) };
+        }
+      }
     },
 
     signal,
@@ -239,6 +302,11 @@ export async function runHeadlessTask(opts: HeadlessTaskOpts): Promise<HeadlessT
     roundsUsed = result.roundsUsed;
     hadSideEffects = result.hadSideEffects;
     outcome = result.wasAborted ? "aborted" : result.hitRoundLimit ? "hit_round_limit" : "completed";
+    // Marks the end of generation even when zero tool calls happened at all
+    // (a plain text-only answer never fires onToolCallResolved) — without
+    // this, a run with no tool calls would show an empty [+Xs] trail despite
+    // still taking real time to generate.
+    steps.push(`[+${((Date.now() - startedAt) / 1000).toFixed(1)}s] done — ${roundsUsed} round${roundsUsed === 1 ? "" : "s"}`);
 
     // Zero side effects on a run whose whole point IS mutation (scheduler /
     // task-queue) means the task didn't actually happen, however calmly the
@@ -247,10 +315,25 @@ export async function runHeadlessTask(opts: HeadlessTaskOpts): Promise<HeadlessT
     // calling write_file. There's no chat UI here for anyone to read that
     // text, so a text-only "answer" IS a failure for this class of run. A
     // denied tool call (e.g. reaching for run_command, never auto-approved
-    // unattended) is the same failure shape regardless of opts.expectSideEffects.
+    // unattended) is the same failure shape for that class of run.
     // Subagents are NOT covered (expectSideEffects unset) — a subagent's job
     // can legitimately be read-only, with its transcript as the real answer.
-    if (outcome === "completed" && !hadSideEffects && (result.hadDeniedToolCalls || opts.expectSideEffects)) {
+    //
+    // opts.expectSideEffects === false (quick-invoke's explicit "this is a
+    // question, not a build task" signal — see App.tsx's own comment on it)
+    // is EXCLUDED from the hadDeniedToolCalls check too, not just the
+    // zero-side-effects one: a plain question answered without touching a
+    // file is already a correct outcome for this class of run, and a denied
+    // call earlier in the transcript doesn't retroactively invalidate a real
+    // answer the model went on to give afterward. Observed live: a weak local
+    // model hallucinated a nonexistent `browser__browser_tabs` tool (denied,
+    // correctly — see HALLUCINATED_TOOL_FALLBACKS in agentRuntime.ts for the
+    // sibling hallucination this file already recovers from silently), then
+    // immediately self-corrected and solved the actual on-screen problem —
+    // but this branch discarded that whole working answer and reported the
+    // task as failed over a wasted call the model had already moved past.
+    const deniedCallIsFatal = result.hadDeniedToolCalls && opts.expectSideEffects !== false;
+    if (outcome === "completed" && !hadSideEffects && (deniedCallIsFatal || opts.expectSideEffects)) {
       outcome = "error";
       const reason = result.hadDeniedToolCalls
         ? "A required tool call was denied (not on the unattended allowlist — e.g. run_command)"
@@ -300,5 +383,5 @@ export async function runHeadlessTask(opts: HeadlessTaskOpts): Promise<HeadlessT
   // Must never throw into the run — indexSession already swallows its own errors.
   void indexSession({ id, origin, task: opts.task, transcript, outcome, createdAt: finishedAt });
 
-  return { record, transcript, steps };
+  return { record, transcript, steps, walkthroughSteps, durationMs: finishedAt - startedAt };
 }

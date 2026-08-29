@@ -35,20 +35,6 @@
         "visible": false,
         "focus": false,
         "shadow": false
-      },
-      {
-        "label": "result",
-        "url": "result.html",
-        "width": 420,
-        "height": 320,
-        "resizable": false,
-        "decorations": false,
-        "transparent": true,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "visible": false,
-        "focus": false,
-        "shadow": false
       }
     ],
     "security": {

@@ -1,5 +1,4 @@
-import { useVoiceStore } from "../store/voice";
-import { decodePiperVoiceSelection, speakWithPiper } from "./piper";
+import { decodeKokoroVoiceSelection, speakWithKokoro } from "./kokoro";
 
 /** Shared cap advertised by the speak_text tool description — keeps a single call bounded. */
 export const SPEAK_TEXT_MAX_CHARS = 1000;
@@ -49,11 +48,15 @@ export function pickBestSpeechVoice(voices: SpeechSynthesisVoice[]): SpeechSynth
 }
 
 /** Honors the user's Settings > Voice pick (by name) if it still exists in the
- *  current voice list, otherwise falls back to the automatic "best" choice. */
-export function resolveSelectedVoice(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | null {
-  const selectedName = useVoiceStore.getState().selectedVoiceName;
-  if (selectedName) {
-    const match = voices.find((v) => v.name === selectedName);
+ *  current voice list, otherwise falls back to the automatic "best" choice.
+ *  Takes the selection explicitly rather than reading useVoiceStore itself —
+ *  this module has no store dependency by design, so it stays importable
+ *  from isolated windows (QuickInvoke.tsx) that must never pull in ../store
+ *  (see that file's header comment for why). Callers with normal store
+ *  access pass `useVoiceStore.getState().selectedVoiceName`. */
+export function resolveSelectedVoice(voices: SpeechSynthesisVoice[], selectedVoiceName: string | null): SpeechSynthesisVoice | null {
+  if (selectedVoiceName) {
+    const match = voices.find((v) => v.name === selectedVoiceName);
     if (match) return match;
   }
   return pickBestSpeechVoice(voices);
@@ -85,10 +88,10 @@ export function speakUtterance(text: string, voice: SpeechSynthesisVoice | null)
  * read-aloud UI) rather than one long utterance, both for a more natural
  * cadence and because some engines truncate very long single utterances.
  */
-export async function speakText(text: string): Promise<void> {
-  const piperVoice = decodePiperVoiceSelection(useVoiceStore.getState().selectedVoiceName);
-  if (piperVoice) {
-    await speakWithPiper(text, piperVoice);
+export async function speakText(text: string, selectedVoiceName: string | null): Promise<void> {
+  const kokoroVoice = decodeKokoroVoiceSelection(selectedVoiceName);
+  if (kokoroVoice) {
+    await speakWithKokoro(text, kokoroVoice);
     return;
   }
 
@@ -96,8 +99,15 @@ export async function speakText(text: string): Promise<void> {
     throw new Error("Web Speech API unavailable in this environment");
   }
   window.speechSynthesis.cancel();
+  // WebView2/Chromium's speech engine can garble or truncate whatever
+  // utterance is queued IMMEDIATELY after cancel() — the previous
+  // utterance's teardown hasn't settled yet. Observed live as "the first
+  // sentence of every spoken answer comes out as noise, every sentence after
+  // it is fine" — a short delay before the first speak() call is the
+  // standard workaround for this well-documented browser behavior.
+  await new Promise((resolve) => setTimeout(resolve, 150));
   const voices = await loadSpeechVoices();
-  const voice = resolveSelectedVoice(voices);
+  const voice = resolveSelectedVoice(voices, selectedVoiceName);
   for (const sentence of splitIntoSentences(text)) {
     await speakUtterance(sentence, voice);
   }

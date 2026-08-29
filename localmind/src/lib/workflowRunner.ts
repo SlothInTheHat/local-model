@@ -12,6 +12,22 @@ import { useModelStore } from "../store/models";
 import { useSettingsStore } from "../store/settings";
 
 /**
+ * Forward-insurance for the move_file/window_control tool consolidations: if
+ * a saved Workflow.toolAllowlist ever starts referencing a pre-consolidation
+ * tool name (today it's always [] — save_workflow never populates it — so
+ * this is guarding against a future write, not fixing a live bug), expand it
+ * to the name that actually exists now so an old saved workflow doesn't
+ * silently lose an allowlist entry it was relying on.
+ */
+const LEGACY_TOOL_NAME_MAP: Record<string, string> = {
+  copy_file: "move_file",
+  rename_file: "move_file",
+  focus_window: "window_control",
+  close_window: "window_control",
+  minimize_window: "window_control",
+};
+
+/**
  * Composes and runs a Workflow (src/store/workflows.ts) via the same headless
  * runtime the scheduler and task queue already use. This is the single place
  * that turns a saved Workflow into an actual agent run — the save_workflow /
@@ -97,8 +113,9 @@ export async function runWorkflow(workflow: Workflow, opts: RunWorkflowOpts): Pr
     ? `${workflow.instruction}\n\nWrite the result as a single complete, self-contained HTML page to ${workflow.outputFile} (use write_file) — inline all CSS in a <style> tag and all JS in a <script> tag, no external resources. Include real interactive controls (filter/sort/search) that work with plain client-side JS, not just a static table. If ${workflow.outputFile} already exists, you may read it first (read_file) to reuse its data/structure for continuity, but always write back a complete valid HTML document, not a partial edit.${unavailableNote}`
     : `${workflow.instruction}\n\nBefore adding anything new, read ${workflow.outputFile} if it exists (use read_file) and skim its existing entries so you do not add a duplicate of something already recorded. Then use write_file or patch_file to save your findings back to exactly that path, in a consistent structured format (e.g. one Markdown list item or table row per entry), appending only genuinely new items to what's already there.${unavailableNote}`;
 
+  const expandedWorkflowAllowlist = workflow.toolAllowlist.map((name) => LEGACY_TOOL_NAME_MAP[name] ?? name);
   const effectiveAllowlist = Array.from(
-    new Set([...SAFE_SCHED_ALLOWLIST, ...workflow.toolAllowlist, ...extraTools.map((t) => t.name)]),
+    new Set([...SAFE_SCHED_ALLOWLIST, ...expandedWorkflowAllowlist, ...extraTools.map((t) => t.name)]),
   );
 
   const modelRef = useModelSelectionStore.getState().selectedModel;

@@ -42,12 +42,20 @@ def extract_audio(video_path: Path) -> Path:
 
 
 def transcribe(audio_path: Path, model_name: str) -> str:
-    """Transcribe audio to text using faster-whisper (CPU, int8)."""
-    from faster_whisper import WhisperModel
+    """Transcribe audio to text using faster-whisper — GPU if this machine
+    can actually run on one, otherwise CPU (see whisper_device.py). Unlike
+    whisper_daemon.py's dictation path, this keeps beam_size at faster-whisper's
+    own default (5): video/audio files are long-form content where accuracy
+    matters more than shaving latency off a single short clip, so only
+    vad_filter is added here — skipping silence/non-speech is close to a free
+    win for quality (fewer hallucinated segments) as well as speed, regardless
+    of content length.
+    """
+    from whisper_device import load_whisper_model
 
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    model, _device = load_whisper_model(model_name)
     try:
-        segments, _info = model.transcribe(str(audio_path))
+        segments, _info = model.transcribe(str(audio_path), vad_filter=True)
         return " ".join(seg.text.strip() for seg in segments)
     finally:
         del model

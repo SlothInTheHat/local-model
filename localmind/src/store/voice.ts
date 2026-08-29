@@ -11,6 +11,16 @@ import { persist } from "zustand/middleware";
 interface VoiceState {
   selectedVoiceName: string | null;
   setSelectedVoiceName: (name: string | null) => void;
+  /** Speak quick-invoke's widget-mode (background) answers aloud automatically
+   *  once they're ready — the point of that mode is not having to look at a
+   *  screen, so a silent text-only answer defeats it. Defaults to true.
+   *  Chat-mode quick-invoke (opens the full window) is unaffected — that
+   *  surface already shows the answer visibly, so auto-speaking there would
+   *  be redundant rather than the primary way of receiving the answer. Read
+   *  directly from localStorage (not this hook) by QuickInvoke.tsx, which
+   *  must never import ../store — see that file's header comment. */
+  quickInvokeAutoSpeak: boolean;
+  setQuickInvokeAutoSpeak: (enabled: boolean) => void;
 }
 
 export const useVoiceStore = create<VoiceState>()(
@@ -18,6 +28,8 @@ export const useVoiceStore = create<VoiceState>()(
     (set) => ({
       selectedVoiceName: null,
       setSelectedVoiceName: (name) => set({ selectedVoiceName: name }),
+      quickInvokeAutoSpeak: true,
+      setQuickInvokeAutoSpeak: (enabled) => set({ quickInvokeAutoSpeak: enabled }),
     }),
     { name: "localmind-voice" }
   )

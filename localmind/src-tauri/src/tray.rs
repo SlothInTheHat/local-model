@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition, Position};
+use tauri::{AppHandle, Emitter, Manager, Position};
 use tauri_plugin_autostart::ManagerExt;
 
 // WP7.1 rework: the quick-invoke overlay used to hand off drawing to a
@@ -110,76 +110,118 @@ pub fn toggle_overlay(app: &AppHandle) {
 
         let _ = win.show();
         let _ = win.set_focus();
+
+        // Tells QuickInvoke.tsx "this is a genuinely fresh invocation" —
+        // distinct from onFocusChanged(true), which now also fires for
+        // reasons that are NOT a fresh hotkey press (e.g. the merged
+        // overlay/result window regaining focus while a run is in flight or
+        // a result/walkthrough is already showing, both of which must
+        // survive blur — see QuickInvoke.tsx's phase state machine). Only
+        // the SHOW branch above should ever reset ink/position/dictation for
+        // a new session; the HIDE branch and a plain refocus must not.
+        let _ = app.emit("quick-invoke-open", ());
     }
 }
 
-/// Inset, in logical pixels, between the result widget and the right/bottom
-/// edges of the monitor's work area. Scaled by the monitor's scale_factor
-/// before use since window positions/sizes are all in physical pixels.
-const RESULT_WIDGET_INSET_LOGICAL_PX: f64 = 24.0;
-
-/// Logical size of the compact loading pill shown while a quick-invoke run is
-/// in flight — small and content-free on purpose (see ResultWidget.tsx).
-const RESULT_WIDGET_COMPACT_SIZE: LogicalSize<f64> = LogicalSize::new(168.0, 60.0);
-
-/// Logical size of the full result card (prompt header, body, close button,
-/// plus the WP7.3 follow-up input row pinned to the bottom of the card — the
-/// extra 60px is that row's height so it doesn't eat into the scrollable
-/// answer body).
-const RESULT_WIDGET_FULL_SIZE: LogicalSize<f64> = LogicalSize::new(420.0, 380.0);
-
-/// Show the quick-invoke result widget (WP5.4), resizing it to the compact
-/// loading pill or the full result card and re-anchoring it to the
-/// bottom-right corner of whichever monitor it would currently appear on,
-/// without ever stealing focus — the entire point of the widget is that the
-/// user stays in whatever app they were using.
-///
-/// Exposed as a Tauri command (`invoke("show_result_widget", { compact })`)
-/// so App.tsx can call it right before emitting the matching `quick-result`
-/// event — `compact: true` for the "running" pill, `compact: false` for the
-/// "done"/"error" card. Tauri's `#[tauri::command]` extractor only implements
-/// `CommandArg` for an owned `AppHandle`, not `&AppHandle` (see
-/// `tauri::app::CommandArg` impl for `AppHandle<R>`), so the command itself
-/// takes `AppHandle` by value; all the positioning logic below only ever
-/// borrows it.
-///
-/// The window is positioned by its top-left corner, so growing/shrinking it
-/// without re-anchoring would push it off its bottom-right dock — hence
-/// set_size is called FIRST, then outer_size() is re-read (never trust the
-/// pre-resize size for the position math), then set_position.
-///
-/// Positioning failure (no monitor resolvable) is not fatal: per-spec, we fall
-/// back to just showing the window wherever it last was rather than erroring
-/// out and leaving it hidden.
+/// Returns the OS cursor position in physical pixels — the same
+/// virtual-desktop coordinate space monitor.position()/size() already use.
+/// JS only ever sees pointer coordinates relative to its own window, never
+/// the global OS cursor position, so this is the frontend's only way to know
+/// where the cursor actually is. Used by the quick-invoke overlay to spawn
+/// its prompt bar near the cursor (QuickInvoke.tsx's onFocusChanged) instead
+/// of always centered — the window itself stays fullscreen (still needed for
+/// freehand circling elsewhere on screen); only the bar's position within it
+/// moves. `None` on any failure (no overlay window, cursor query failed) —
+/// the caller falls back to the existing centered position, so this is
+/// never fatal to opening the overlay.
 #[tauri::command]
-pub fn show_result_widget(app: AppHandle, compact: bool) {
-    let Some(win) = app.get_webview_window("result") else { return };
+pub fn get_cursor_position(app: AppHandle) -> Option<(f64, f64)> {
+    let win = app.get_webview_window("overlay")?;
+    let pos = win.cursor_position().ok()?;
+    Some((pos.x, pos.y))
+}
 
-    let target_size = if compact { RESULT_WIDGET_COMPACT_SIZE } else { RESULT_WIDGET_FULL_SIZE };
-    let _ = win.set_size(target_size);
+/// Payload for the `highlight-element` event — already converted into the
+/// overlay window's own CSS-pixel viewport space (physical rect minus the
+/// target monitor's physical position, divided by its scale factor), so
+/// QuickInvoke.tsx's render loop can draw it with the exact same math it
+/// already uses for stroke coordinates, no further conversion needed.
+#[derive(Clone, serde::Serialize)]
+struct HighlightElementPayload {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    /// Whether the overlay was already visible before this call. `false`
+    /// means this call is the only reason the window is showing, so the
+    /// frontend owns auto-hiding it once the ring's lifetime ends; `true`
+    /// means the user already had it open and only the ring layers on top —
+    /// visibility stays whatever the user's own session was already doing.
+    was_visible: bool,
+}
 
-    let monitor = win
-        .current_monitor()
-        .ok()
-        .flatten()
+/// Draw a highlighting ring around a UI element's bounding rect — `x`/`y`/
+/// `width`/`height` are physical screen pixels in the same virtual-desktop
+/// space `uia_list_elements`'s `bounding_rect` and `monitor.position()`/
+/// `size()` already use. Resolves which monitor the rect's center falls on,
+/// positions/shows the overlay there ONLY if it wasn't already visible
+/// (mirroring `toggle_overlay`'s full-bounds sizing — never `work_area()`,
+/// same reasoning as there), then emits `highlight-element` with the rect
+/// converted into that monitor's CSS-pixel space.
+///
+/// Deliberately never calls `set_focus()` — this is a passive visual
+/// pointer, not a window the user is meant to be yanked into.
+#[tauri::command]
+pub fn highlight_screen_rect(
+    app: AppHandle,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let win = app
+        .get_webview_window("overlay")
+        .ok_or_else(|| "overlay window not found".to_string())?;
+
+    let was_visible = win.is_visible().unwrap_or(false);
+
+    let center_x = x + width / 2.0;
+    let center_y = y + height / 2.0;
+
+    let monitors = win.available_monitors().map_err(|e| e.to_string())?;
+    let target_monitor = monitors
+        .into_iter()
+        .find(|m| {
+            let pos = m.position();
+            let size = m.size();
+            center_x >= pos.x as f64
+                && center_x < pos.x as f64 + size.width as f64
+                && center_y >= pos.y as f64
+                && center_y < pos.y as f64 + size.height as f64
+        })
         .or_else(|| win.primary_monitor().ok().flatten());
 
-    if let (Some(monitor), Ok(size)) = (monitor, win.outer_size()) {
-        // work_area() already excludes the taskbar and is expressed in the
-        // same physical-pixel coordinate space as monitor.position() (i.e. it
-        // accounts for multi-monitor origins that aren't (0, 0)).
-        let work_area = monitor.work_area();
-        let inset = (RESULT_WIDGET_INSET_LOGICAL_PX * monitor.scale_factor()).round() as i32;
+    let Some(monitor) = target_monitor else {
+        return Err("could not resolve a monitor for the target rect".to_string());
+    };
 
-        let x = work_area.position.x + work_area.size.width as i32 - size.width as i32 - inset;
-        let y = work_area.position.y + work_area.size.height as i32 - size.height as i32 - inset;
-
-        let _ = win.set_position(Position::Physical(PhysicalPosition { x, y }));
+    if !was_visible {
+        let _ = win.set_size(monitor.size().to_owned());
+        let _ = win.set_position(Position::Physical(*monitor.position()));
+        let _ = win.show();
     }
 
-    // Never call set_focus() here — stealing focus is exactly what this
-    // widget exists to avoid.
-    let _ = win.show();
+    let scale = monitor.scale_factor();
+    let mpos = monitor.position();
+    let payload = HighlightElementPayload {
+        x: (x - mpos.x as f64) / scale,
+        y: (y - mpos.y as f64) / scale,
+        width: width / scale,
+        height: height / scale,
+        was_visible,
+    };
+
+    app.emit("highlight-element", payload).map_err(|e| e.to_string())
 }
 
 /// Build the tray icon + right-click menu and wire up close-to-tray window
