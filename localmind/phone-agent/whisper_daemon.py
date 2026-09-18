@@ -57,13 +57,15 @@ def _get_model(model_name: str):
 def _transcribe(path: str, model_name: str) -> str:
     """Dictation-tuned settings — this is short, single-utterance mic audio,
     not the long-form video/audio transcribe_cli.py handles, so it can
-    afford to trade a little accuracy for latency:
-      - beam_size=1 (greedy) instead of the default 5 — meaningfully faster
-        for short clips, and beam search's main benefit (recovering from an
-        early wrong token over a long sequence) matters far less over a
-        single spoken sentence.
+    afford to trade a little accuracy for latency — but NOT beam_size:
+    reverted after a live report that dictation had started mishearing
+    things. beam_size=1 (greedy) traded noticeably worse accuracy for a
+    speedup that barely mattered anyway on a clip this short (this session's
+    actual quick-invoke latency problem turned out to be the agent loop's
+    round count, not whisper's decoding — see App.tsx's WP7.23 fast path).
+    Kept:
       - vad_filter=True skips silence, which a mic recording reliably has at
-        the start/end (button-press lag).
+        the start/end (button-press lag) — a pure win, not a quality trade.
       - condition_on_previous_text=False: each dictation request is one
         independent utterance, so there is no prior-segment context worth
         conditioning on, only a (small) chance of it dragging in unrelated
@@ -72,7 +74,6 @@ def _transcribe(path: str, model_name: str) -> str:
     model = _get_model(model_name)
     segments, _info = model.transcribe(
         path,
-        beam_size=1,
         vad_filter=True,
         condition_on_previous_text=False,
     )

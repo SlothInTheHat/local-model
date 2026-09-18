@@ -32,7 +32,6 @@ import { streamChatForModel } from "./chatProvider";
 import { listShadowHistory, diffShadowRange } from "./shadowGit";
 import { runBenchmarkSuite } from "./benchmarks";
 import { notifyOs } from "./osNotify";
-import { primaryMonitor } from "@tauri-apps/api/window";
 
 // ─── Tauri invoke shim ───────────────────────────────────────────────────────
 
@@ -4151,10 +4150,14 @@ export async function executeTool(
         // tools, games), where UIA exposes nothing or just one opaque
         // surface. Fall back to asking the vision model to locate it
         // directly in a fresh screenshot, converting its normalized
-        // bounding box back to real screen pixels via the primary
-        // monitor's own physical size. This inherits take_screenshot's own
-        // primary-monitor-only limitation — a target on a secondary
-        // monitor won't be found this way either.
+        // bounding box back to real screen pixels via the rect of whichever
+        // monitor was ACTUALLY captured (take_screenshot's own
+        // monitor_x/y/width/height — WP7.28: no longer always the primary
+        // monitor, since take_screenshot now captures wherever the cursor
+        // is). Must use that, not primaryMonitor() — a vision call on a
+        // secondary-monitor capture converted against the primary
+        // monitor's size/position would misplace the ring by the
+        // difference between the two.
         const visionModel = resolveRole("vision");
         if (!visionModel) {
           throw new Error(
@@ -4164,7 +4167,13 @@ export async function executeTool(
           );
         }
         try {
-          const shot = await tauriInvoke<{ path: string }>("take_screenshot");
+          const shot = await tauriInvoke<{
+            path: string;
+            monitor_x: number;
+            monitor_y: number;
+            monitor_width: number;
+            monitor_height: number;
+          }>("take_screenshot");
           const imageB64 = await tauriInvoke<string>("read_image_base64", { path: shot.path, maxDim: 1568 });
           const prompt = `Find the UI element described as "${name}" in this screenshot. Respond with ONLY a JSON object giving its bounding box as fractions of the image (0 to 1, top-left origin): {"x":0.0,"y":0.0,"width":0.0,"height":0.0}. If you cannot find it, respond with exactly {"found":false}. No other text.`;
           let visionText = "";
@@ -4185,12 +4194,10 @@ export async function executeTool(
           if (!box) {
             throw new Error(`Vision model (${visionModel}) couldn't locate "${name}" in the current screenshot either.`);
           }
-          const monitor = await primaryMonitor();
-          if (!monitor) throw new Error("Could not resolve the primary monitor's size to convert the vision model's coordinates.");
-          const x = Math.round(box.x * monitor.size.width);
-          const y = Math.round(box.y * monitor.size.height);
-          const width = Math.round(box.width * monitor.size.width);
-          const height = Math.round(box.height * monitor.size.height);
+          const x = shot.monitor_x + Math.round(box.x * shot.monitor_width);
+          const y = shot.monitor_y + Math.round(box.y * shot.monitor_height);
+          const width = Math.round(box.width * shot.monitor_width);
+          const height = Math.round(box.height * shot.monitor_height);
           await tauriInvoke("highlight_screen_rect", { x, y, width, height });
           return {
             toolCallId: call.id,

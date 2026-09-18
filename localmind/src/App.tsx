@@ -211,8 +211,19 @@ const QUICK_INVOKE_REGION_PREAMBLE =
 // cover that pattern explicitly. This tool call should be the DEFAULT
 // reflex for any question about locating or using something in a visible
 // app, not a special case reserved for the word "where".
+// WP7.21: asked "is this table filled out correctly" (a web form's already-
+// entered values), the model treated the table as "a specific place/control"
+// this hint applies to and went looking for it via uia_list_elements — which
+// can't see a filled-in web table's actual VALUES any better than it could
+// see an image — then, once uia_list_elements came up short, hallucinated a
+// browser-automation tool name that was never actually offered, got denied,
+// and gave up rather than ever trying take_screenshot. Added the
+// disambiguation below explicitly: LOCATING a control (where/point at it)
+// is this hint's job; reading or verifying content already on screen
+// (values, correctness, what something says/shows) is take_screenshot's
+// job, same as any other "what does this say" question.
 const QUICK_INVOKE_POINTING_HINT =
-  "Whenever the answer involves a specific place or control in a visible app — the user asks WHERE something is, asks you to show/point to a UI element, or asks HOW to do something that means clicking/finding a specific button or setting (e.g. \"where do I find settings\", \"can I find the paint bucket tool\", \"how do I change the background color\") — call list_windows + uia_list_elements to find the relevant element, then CALL highlight_element yourself to point at it. This should be your default reflex for this class of question, not something reserved only for literal \"where\" phrasing. Do not describe pointing as something you could do and ask permission first, and do not give up just because the app has no accessibility tree (highlight_element falls back to locating it visually on its own). Do this in addition to, not instead of, a short text answer — and if the task takes more than one step, use propose_walkthrough_steps instead (see below) so each step gets its own highlight.";
+  "Whenever the answer involves a specific place or control in a visible app — the user asks WHERE something is, asks you to show/point to a UI element, or asks HOW to do something that means clicking/finding a specific button or setting (e.g. \"where do I find settings\", \"can I find the paint bucket tool\", \"how do I change the background color\") — call list_windows + uia_list_elements to find the relevant element, then CALL highlight_element yourself to point at it. This should be your default reflex for this class of question, not something reserved only for literal \"where\" phrasing. Do not describe pointing as something you could do and ask permission first, and do not give up just because the app has no accessibility tree (highlight_element falls back to locating it visually on its own). Do this in addition to, not instead of, a short text answer — and if the task takes more than one step, use propose_walkthrough_steps instead (see below) so each step gets its own highlight. This is for LOCATING a control, not for reading or verifying content that's already displayed (a filled-in form or table, a checklist, a diagram, \"is this correct\", \"what does this say\") — for that, call take_screenshot instead so you can actually see it; the accessibility tree usually cannot tell you a table's or form's actual filled-in values, and there is no browser-automation tool available here even if one sounds plausible — never call a tool whose exact name you have not seen offered to you this session.";
 
 const QUICK_INVOKE_SCREEN_HINT =
   `(If this refers to something currently visible on the user's screen — including text, code, or a question in a browser tab or any other window — call take_screenshot FIRST, directly; it shows exactly what's on screen right now. There is no tool to list browser tabs. ${QUICK_INVOKE_POINTING_HINT} If this is a general question with nothing to look at, just answer directly.)\n\n`;
@@ -276,6 +287,22 @@ const QUICK_INVOKE_WALKTHROUGH_HINT =
 // talking to you, not like a system reporting what it did.
 const QUICK_INVOKE_BREVITY_HINT =
   "Keep your answer short and to the point — a sentence or a few bullet points, not an essay. Lead with the answer itself. Respond like a knowledgeable friend talking to the user, never like a system reporting what it did — never say things like \"I see you have X open,\" \"the OCR caught,\" \"I highlighted X to point you to it,\" or otherwise mention OCR, screenshots, tool names, or accessibility trees at all; the user sees the highlight ring appear on their own screen and doesn't need it described or announced. Do not narrate your own process (what you looked at, which tool failed, why) — the user only wants the answer. Do not describe a tool call as something you COULD do and ask permission first — if calling a tool (e.g. highlight_element) is the right move, just call it. Do not add incidental details nobody asked about (pixel dimensions, cursor coordinates, unrelated settings/state you happened to notice on screen). Do not claim the user's message got cut off, and do not close with a generic \"what would you like help with?\" / \"let me know if...\" question — if the user asked something specific, just answer it and stop.\n\n";
+
+// ─── WP7.22: bound worst-case latency by biasing toward decisiveness ───────
+//
+// Complements the hard maxRounds:5 cap on this run (see handleQuickInvokeWidget)
+// rather than replacing it — that cap only bounds the WORST case; this hint is
+// meant to reduce how often the model actually needs every one of those rounds
+// in the first place. Observed live: asked about a workspace file, the model
+// spent 8 rounds and 3+ minutes searching by name, listing windows, reaching
+// for a hallucinated browser tool (denied), reading unrelated files, trying
+// the hallucinated tool again under a different name (also denied), before
+// finally attempting — and failing to read — the actual target file. Every
+// one of those tools individually made sense as a next guess; nothing told
+// the model that quick-invoke's whole premise is speed, so exhausting every
+// plausible avenue felt like the right instinct rather than the wrong one.
+const QUICK_INVOKE_DECISIVENESS_HINT =
+  "This is a QUICK popup meant to answer in seconds, not a research task — you have very few tool-call rounds available, so be decisive: try the single most promising step first, and if a search/lookup comes up empty or a tool call is denied, do NOT keep trying variations or alternate tools chasing the same lead — answer immediately with whatever you already know or found, or say plainly that you couldn't find it. Never call a tool whose exact name you have not seen offered to you this session, even a plausible-sounding one — if it's not on the tool bar in this session's own list, it does not exist here, and any attempt just wastes a round on a guaranteed denial. Finishing fast with a partial or 'couldn't find it' answer is always better here than continuing to dig.\n\n";
 
 // ─── WP7.5: skip the take_screenshot round-trip when possible ──────────────
 //
@@ -833,8 +860,10 @@ export default function App() {
         const { prompt, mode, hasRegion } = event.payload;
         if (mode === "chat") {
           void handleQuickInvokeChat(prompt, hasRegion ?? false);
-        } else {
+        } else if (quickInvokeNeedsAgenticPath(prompt)) {
           void handleQuickInvokeWidget(prompt, hasRegion ?? false);
+        } else {
+          void handleQuickInvokeFast(prompt, hasRegion ?? false);
         }
       }
     );
@@ -1151,6 +1180,135 @@ export default function App() {
     };
   }, []);
 
+  // ─── WP7.23: fast path — skip the agent loop entirely for plain screen/
+  // general questions ────────────────────────────────────────────────────
+  //
+  // Modeled directly on why HeyClicky feels instant and quick-invoke didn't:
+  // it captures screen+voice once and makes ONE model call, never a
+  // multi-round tool-calling loop. Every round in handleQuickInvokeWidget's
+  // full agent loop (list_windows, uia_list_elements, take_screenshot,
+  // find_files, ...) is a full network round-trip to the model — observed
+  // live taking over three minutes across 8 rounds for a question that
+  // needed exactly one look at the screen. Most quick-invoke prompts
+  // ("is this correct", "what does this say", "solve this", "what's on my
+  // screen", or a plain general-knowledge question) never needed the tool
+  // loop's ability to search files, click through multi-step UI, or locate
+  // a specific control by name — they needed a look and an answer, or just
+  // an answer. This path handles exactly that case in one model call;
+  // quickInvokeNeedsAgenticPath below routes anything that genuinely needs
+  // the loop's real capabilities back to handleQuickInvokeWidget unchanged.
+  //
+  // Deliberately reuses take_screenshot's own OCR/region-crop plumbing
+  // (peek_pending_region, take_screenshot, read_image_base64) and the vision
+  // role (resolveRole("vision")) rather than inventing new ones — the only
+  // thing genuinely new here is skipping the agent runtime/tool-calling loop
+  // around them.
+  function quickInvokeNeedsAgenticPath(prompt: string): boolean {
+    const p = prompt.toLowerCase();
+    // File/workspace access — this path has no file tools at all.
+    if (/\.(txt|md|csv|json|ya?ml|py|ts|tsx|js|jsx|rs|go|java|c|cpp|h|docx?|pdf|xlsx?)\b/.test(p)) return true;
+    if (/\b(my|the) (file|files|project|workspace|repo|repository|codebase|folder)\b/.test(p)) return true;
+    // Multi-step walkthrough phrasing — needs propose_walkthrough_steps +
+    // per-step highlighting, real tool calls this path can't make.
+    if (/\b(walk me through|guide me through|step[- ]by[- ]step)\b/.test(p)) return true;
+    // Locating/pointing at a specific control needs
+    // uia_list_elements + highlight_element. "how do/can I ..." is included
+    // deliberately broad — it's the exact trigger phrasing
+    // QUICK_INVOKE_POINTING_HINT/WALKTHROUGH_HINT already rely on (tuned
+    // this session after live failures), so keeping it here too means this
+    // fast path can never regress either of those fixes by intercepting a
+    // prompt they were specifically broadened to catch.
+    //
+    // WP7.24 (fixed after a live failure): "show me where my Chrome/Discord/
+    // Slack icons are, highlight each one" fell through both of these —
+    // "where my X are" has the verb at the END, not the "where is/are X"
+    // shape the first pattern expected, and nothing checked for "highlight"
+    // as its own explicit signal. Routed to the fast path (no highlighting
+    // capability at all), the model got a screenshot plus a request it
+    // fundamentally couldn't fulfill and hallucinated "your message got cut
+    // off" instead. Broadened "where" to match either word order, and added
+    // "highlight"/"point at" as direct triggers regardless of phrasing —
+    // asking to highlight something is never answerable by a one-shot text
+    // reply, full stop.
+    if (/\bwhere\b[\s\S]{0,80}\b(is|are)\b/.test(p)) return true;
+    if (/\b(is|are)\b[\s\S]{0,20}\bwhere\b/.test(p)) return true;
+    if (/\bwhere (can|do) i find\b/.test(p)) return true;
+    if (/\bhighlight\b/.test(p)) return true;
+    if (/\b(point|show) (me )?(to|where)\b/.test(p)) return true;
+    if (/\bhow (do|can) i\b/.test(p)) return true;
+    return false;
+  }
+
+  async function handleQuickInvokeFast(prompt: string, hasRegion: boolean): Promise<void> {
+    emitQuickResult({ status: "running", prompt });
+    const startedAt = Date.now();
+    try {
+      // Same stash take_screenshot itself reads — peek (not take_screenshot's
+      // own consuming .take()) so a real take_screenshot call below still
+      // gets the region crop this leaves in place. Works identically whether
+      // hasRegion came from a drawn circle or the always-on auto-screenshot
+      // OCR (see buildScreenContextPreamble above) — this function doesn't
+      // need to know which.
+      let ocrText = "";
+      try {
+        const peeked = await invoke<{ ocr_text: string } | null>("peek_pending_region");
+        if (peeked?.ocr_text?.trim()) ocrText = peeked.ocr_text.trim().slice(0, QUICK_INVOKE_OCR_MAX_CHARS);
+      } catch (err) {
+        console.error("[quick-invoke-fast] peek_pending_region failed:", err);
+      }
+
+      const visionModel = resolveRole("vision");
+      let answerText = "";
+      const maxAnswerChars = 4000;
+
+      if (visionModel) {
+        // The ONE model call this whole path exists to make: screenshot (or
+        // the already-cropped drawn region — take_screenshot returns
+        // whichever is pending, see its own tools.ts comment) plus the
+        // question, straight to the vision model. No list_windows, no
+        // uia_list_elements, no round loop.
+        const shot = await invoke<{ path: string }>("take_screenshot");
+        const imageB64 = await invoke<string>("read_image_base64", { path: shot.path, maxDim: 2048 });
+        const ocrBlock = ocrText
+          ? `\n\nText already extracted from this screen via OCR (may help, may be incomplete/garbled — trust the image over this if they disagree):\n"""\n${ocrText}\n"""`
+          : "";
+        const visionPrompt = `${QUICK_INVOKE_BREVITY_HINT}Answer the user's question about what's visible in the attached screenshot.${ocrBlock}\n\nThe user's question: ${prompt}`;
+        for await (const chunk of streamChatForModel(visionModel, [
+          { role: "user", content: visionPrompt, images: [imageB64] },
+        ])) {
+          answerText += chunk;
+          if (answerText.length > maxAnswerChars) break;
+        }
+      } else {
+        // No vision role configured — never send an image to the primary
+        // model (it may not support one at all, see isImageUnsupportedError
+        // in agentRuntime.ts for exactly that failure). Degrade to
+        // OCR-text-only when there is any, otherwise just answer the
+        // question on its own terms — still exactly one model call either way.
+        const modelRef = useModelSelectionStore.getState().selectedModel;
+        const ocrBlock = ocrText
+          ? `${QUICK_INVOKE_OCR_INJECTION_WARNING}\n\nText detected on the user's screen via OCR just now (may or may not be relevant):\n"""\n${ocrText}\n"""\n\n`
+          : "";
+        const plainPrompt = `${ocrBlock}${QUICK_INVOKE_BREVITY_HINT}The user's question: ${prompt}`;
+        for await (const chunk of streamChatForModel(modelRef, [{ role: "user", content: plainPrompt }])) {
+          answerText += chunk;
+          if (answerText.length > maxAnswerChars) break;
+        }
+      }
+
+      const durationMs = Date.now() - startedAt;
+      console.log(`[quick-invoke-fast] ${(durationMs / 1000).toFixed(1)}s total, one model call`);
+      emitQuickResult({ status: "done", prompt, text: answerText.trim() || "(no answer)", durationMs });
+    } catch (err) {
+      // Never leave the user with nothing — fall back to the slower but
+      // more capable full agent loop on any failure here (vision call
+      // errored, screenshot failed, etc.), same contract every other
+      // graceful-degradation path in this codebase already follows.
+      console.error("[quick-invoke-fast] failed, falling back to the full agent loop:", err);
+      await handleQuickInvokeWidget(prompt, hasRegion);
+    }
+  }
+
   async function handleQuickInvokeWidget(prompt: string, hasRegion: boolean): Promise<void> {
     // Read live store state rather than this component's (possibly stale,
     // mount-time) closured values — mirrors the exact pattern taskRunner.ts /
@@ -1189,7 +1347,7 @@ export default function App() {
     // reply "it seems you haven't asked me anything," i.e. it lost track of
     // which part of the text WAS the question once enough scaffolding
     // preceded it.
-    const task = `${screenPreamble}${QUICK_INVOKE_WALKTHROUGH_HINT}${QUICK_INVOKE_BREVITY_HINT}The user's question: ${prompt}`;
+    const task = `${screenPreamble}${QUICK_INVOKE_WALKTHROUGH_HINT}${QUICK_INVOKE_BREVITY_HINT}${QUICK_INVOKE_DECISIVENESS_HINT}The user's question: ${prompt}`;
 
     try {
       const { record, transcript, walkthroughSteps, durationMs } = await runHeadlessTask({
@@ -1213,6 +1371,27 @@ export default function App() {
         // (web_search, calculator, image tools, ~50+ of them) was also
         // being offered as a round candidate every single quick-invoke call.
         restrictToolsToAllowlist: true,
+        // WP7.22: quick-invoke inherited DEFAULT_MAX_ROUNDS (50) — a budget
+        // sized for autonomous background runs (task queue, scheduler) where
+        // taking minutes is fine, not for a popup whose entire premise is
+        // feeling instant. Observed live: a question about a workspace file
+        // spiraled through find_files → list_windows → a hallucinated
+        // browser tool → more file reads → another hallucinated/denied
+        // browser tool → a final failed file read, 8 rounds and over three
+        // minutes before answering at all. A small, hard cap bounds the
+        // worst case to something that still feels like "quick" even when
+        // the model goes down a wrong path.
+        // WP7.26: bumped 5 → 6 after a live case (an ArcGIS Pro pointing
+        // question) legitimately needed list_windows + uia_list_elements +
+        // highlight_element + take_screenshot — 4 genuinely useful calls —
+        // and hit the 5-round cap one round short of ever writing an
+        // answer, before headlessRunner.ts's forced-final-answer fallback
+        // existed to rescue exactly that case. That fallback (see its own
+        // comment) is now the real safety net for anything that still
+        // overruns this budget, so this number just needs to comfortably
+        // cover the common "look around a bit, then answer" case rather
+        // than the worst one.
+        maxRounds: 6,
         // Deliberately FALSE, unlike taskRunner/scheduler. Those fire tasks
         // the user authored specifically to change something, so a run that
         // mutates nothing is a real failure (headlessRunner forces
@@ -1221,6 +1400,20 @@ export default function App() {
         // "what's in my README", "how big is the build" — and answering it
         // without touching a file is a correct outcome, not a failure.
         expectSideEffects: false,
+        // WP7.27: the puck's 3-dot "thinking" indicator gave no sense that
+        // anything was actually happening during a multi-round tool-calling
+        // run — asked for, live, after the ArcGIS round-limit investigation
+        // above made the round-by-round nature of this path visible. Each
+        // resolved tool call gets a fire-and-forget event over to the
+        // overlay window with a short label; QuickInvoke.tsx renders
+        // whatever the latest one is next to the puck. Never awaited/
+        // blocking — a dropped event just means the label doesn't update
+        // for one step, not a stalled run.
+        onStep: (label) => {
+          void emit("quick-progress", { label }).catch((err) =>
+            console.error("[quick-invoke] quick-progress emit failed:", err),
+          );
+        },
       });
 
       // WP7.6 debug timing — full per-round breakdown ([+X.Xs] markers, see

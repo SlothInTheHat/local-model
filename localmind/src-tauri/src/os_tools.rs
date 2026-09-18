@@ -8,6 +8,7 @@
 //! a runtime "unsupported on this platform" `Err` instead of panicking.
 
 use std::process::Command;
+use tauri::{AppHandle, Manager};
 
 /// Launch an application (or open a document/URL) by name via the OS shell,
 /// mirroring what typing the same name into Start/Spotlight/`xdg-open` would
@@ -112,11 +113,25 @@ pub struct WindowInfo {
 /// `Clone` is needed so `capture_region` (WP7.1) can both return this to its
 /// caller AND stash a copy in `PENDING_REGION` for `take_screenshot` to pick
 /// up later — the two consumers need independent owned values.
+///
+/// WP7.28: `monitor_x/y/width/height` (physical virtual-desktop pixels, the
+/// same space `tauri::Monitor::position()`/`size()` use) record exactly
+/// which monitor this capture came from — no longer always the primary one.
+/// Callers that need to convert a coordinate normalized against the SAVED
+/// IMAGE (e.g. `highlight_element`'s vision-model bounding-box fallback in
+/// src/lib/tools.ts) back into real screen pixels must use THESE fields,
+/// not assume `primaryMonitor()` — a vision call on a secondary-monitor
+/// capture converted against the primary monitor's size/position would
+/// misplace the highlight ring by the difference between the two.
 #[derive(serde::Serialize, Clone)]
 pub struct ScreenshotResult {
     pub path: String,
     pub ocr_text: String,
     pub ocr_available: bool,
+    pub monitor_x: i32,
+    pub monitor_y: i32,
+    pub monitor_width: i32,
+    pub monitor_height: i32,
 }
 
 // ─── Region capture (WP7.1: "circle what you care about") ─────────────────
@@ -151,16 +166,35 @@ fn now_epoch_ms() -> u128 {
         .unwrap_or(0)
 }
 
-/// Capture exactly the given rectangle (physical pixels, screen-origin
-/// coordinates) of the primary monitor, save it as a PNG using the same
-/// filename pattern `take_screenshot` uses, OCR the cropped pixels, and stash
-/// the result for `take_screenshot` to hand to the agent next. Called by the
-/// annotate overlay right after the user finishes drawing.
+/// Capture exactly the given rectangle (physical pixels, relative to the
+/// overlay window's own current monitor — see below) of that monitor, save
+/// it as a PNG using the same filename pattern `take_screenshot` uses, OCR
+/// the cropped pixels, and stash the result for `take_screenshot` to hand to
+/// the agent next. Called by the quick-invoke overlay right after the user
+/// finishes drawing (or for its own whole-window auto-screenshot).
+///
+/// WP7.28: `x`/`y` are resolved against whichever monitor the "overlay"
+/// window is CURRENTLY sized to — not a freshly re-queried cursor position.
+/// The frontend computes these coordinates relative to that same window
+/// (see QuickInvoke.tsx's submitWithRegion/submitWithAutoScreenshot, both of
+/// which rely on `window.innerWidth/Height` being exactly that monitor's
+/// size), and toggle_overlay (tray.rs) already positions the overlay on the
+/// cursor's monitor at hotkey-press time — reusing that SAME committed
+/// monitor here, rather than asking "where's the cursor now," guarantees
+/// the two can never disagree even if the mouse moved to a different
+/// monitor during the hide→wait→capture sequence in between.
 #[tauri::command]
-pub fn capture_region(x: i32, y: i32, width: u32, height: u32) -> Result<ScreenshotResult, String> {
+pub fn capture_region(app: AppHandle, x: i32, y: i32, width: u32, height: u32) -> Result<ScreenshotResult, String> {
     #[cfg(target_os = "windows")]
     {
-        let result = windows_impl::capture_region(x, y, width, height)?;
+        let monitor_rect = app.get_webview_window("overlay").and_then(|win| {
+            win.current_monitor().ok().flatten().map(|m| {
+                let pos = m.position();
+                let size = m.size();
+                (pos.x, pos.y, size.width as i32, size.height as i32)
+            })
+        });
+        let result = windows_impl::capture_region(monitor_rect, x, y, width, height)?;
         if let Ok(mut slot) = PENDING_REGION.lock() {
             *slot = Some((result.clone(), now_epoch_ms()));
         }
@@ -168,7 +202,7 @@ pub fn capture_region(x: i32, y: i32, width: u32, height: u32) -> Result<Screens
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (x, y, width, height);
+        let _ = (app, x, y, width, height);
         Err("Screen capture is only supported on Windows".to_string())
     }
 }
@@ -483,12 +517,14 @@ pub fn adjust_volume(action: String) -> Result<String, String> {
     }
 }
 
-/// Capture the primary monitor, save a PNG to the temp dir, run OCR over it,
-/// and return the OCR text plus the saved path. If no OCR language pack is
+/// Capture whichever monitor the OS cursor is currently over (WP7.28 — used
+/// to always be the primary monitor regardless of where the user was
+/// actually looking), save a PNG to the temp dir, run OCR over it, and
+/// return the OCR text plus the saved path. If no OCR language pack is
 /// installed (or OCR otherwise fails), the capture still succeeds — the
 /// result just carries a note that OCR was unavailable instead of an error.
 #[tauri::command]
-pub fn take_screenshot() -> Result<ScreenshotResult, String> {
+pub fn take_screenshot(app: AppHandle) -> Result<ScreenshotResult, String> {
     // WP7.1 seam: if the user recently circled a region via the annotate
     // overlay, hand back THAT cropped capture instead of grabbing the whole
     // screen again — this is what makes "circle what you care about" work
@@ -511,10 +547,21 @@ pub fn take_screenshot() -> Result<ScreenshotResult, String> {
 
     #[cfg(target_os = "windows")]
     {
-        windows_impl::take_screenshot()
+        // Fresh cursor query, not the overlay window's own current monitor
+        // (unlike capture_region — see that command's doc comment for why
+        // the split): a general take_screenshot call has no frontend rect
+        // that needs to stay coordinate-consistent with anything, so
+        // "wherever the cursor is right now" is simply the most correct
+        // answer, and works identically whether this came from quick-invoke
+        // or a normal chat/agent tool call that never touched the overlay.
+        let monitor_rect = app
+            .get_webview_window("overlay")
+            .and_then(|win| crate::cursor_monitor_rect(&win));
+        windows_impl::take_screenshot(monitor_rect)
     }
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = app;
         Err("Screen capture is only supported on Windows".to_string())
     }
 }
@@ -880,14 +927,22 @@ mod windows_impl {
         }
     }
 
-    /// Captures the primary monitor via GDI `BitBlt` and returns the raw
-    /// top-down BGRA32 pixel buffer plus its dimensions.
-    fn capture_primary_monitor() -> Result<(Vec<u8>, i32, i32), String> {
+    /// Captures an arbitrary monitor's pixels via GDI `BitBlt` and returns the
+    /// raw top-down BGRA32 buffer plus its dimensions. `origin_x`/`origin_y`
+    /// are that monitor's top-left in virtual-desktop physical pixels — the
+    /// same space `tauri::Monitor::position()` uses, which can be negative
+    /// for a monitor placed above/left of the primary one — and `width`/
+    /// `height` are its full size (see this module's callers, which resolve
+    /// that rect via crate::cursor_monitor_rect/monitor_at_point before
+    /// calling here). `GetDC(None)` already covers the FULL virtual desktop
+    /// (all monitors, one shared coordinate space), so BitBlt-ing from any
+    /// monitor's own origin instead of always (0,0) is the entire change
+    /// needed to capture something other than the primary monitor — no
+    /// separate per-monitor DC to acquire.
+    fn capture_monitor(origin_x: i32, origin_y: i32, width: i32, height: i32) -> Result<(Vec<u8>, i32, i32), String> {
         unsafe {
-            let width = GetSystemMetrics(SM_CXSCREEN);
-            let height = GetSystemMetrics(SM_CYSCREEN);
             if width <= 0 || height <= 0 {
-                return Err("Failed to read primary monitor dimensions".to_string());
+                return Err("Invalid monitor dimensions".to_string());
             }
 
             let screen_dc = GetDC(None);
@@ -910,7 +965,7 @@ mod windows_impl {
             let _guard = CaptureGuard { screen_dc, mem_dc, bitmap };
 
             let old_obj = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
-            let blt = BitBlt(mem_dc, 0, 0, width, height, Some(screen_dc), 0, 0, SRCCOPY);
+            let blt = BitBlt(mem_dc, 0, 0, width, height, Some(screen_dc), origin_x, origin_y, SRCCOPY);
             SelectObject(mem_dc, old_obj); // restore before any further use of mem_dc
             blt.map_err(|e| format!("BitBlt failed: {e}"))?;
 
@@ -1003,11 +1058,14 @@ mod windows_impl {
         width: u32,
         height: u32,
     ) -> Result<(Vec<u8>, i32, i32, i32, i32), String> {
-        // Clamp the requested rect to the captured bounds. `x`/`y` can be
-        // negative (multi-monitor setups place secondary monitors at
-        // negative coordinates) but this capture is always of the PRIMARY
-        // monitor at origin (0, 0), so clamp against [0, full_width) /
-        // [0, full_height) directly.
+        // Clamp the requested rect to the captured bounds. The buffer this
+        // crops is always the chosen MONITOR's own pixels with its own
+        // top-left as local origin (0, 0) — capture_monitor already
+        // translated whatever that monitor's real virtual-desktop position
+        // is (which can itself be negative) into this buffer's coordinate
+        // space — so `x`/`y` here are monitor-relative and clamping against
+        // [0, full_width) / [0, full_height) is correct regardless of which
+        // monitor was actually captured.
         let clamped_x = x.clamp(0, full_width);
         let clamped_y = y.clamp(0, full_height);
         let requested_right = clamped_x.saturating_add(width as i32);
@@ -1049,19 +1107,43 @@ mod windows_impl {
             .map_err(|e| format!("Failed to save screenshot PNG: {e}"))
     }
 
-    /// Capture only the given rectangle of the primary monitor (WP7.1: the
-    /// "circle what you care about" annotate flow). Reuses
-    /// `capture_primary_monitor` for the underlying GDI grab — there's no
-    /// cheaper Win32 path to a sub-rect capture than blitting the whole
-    /// screen and cropping in memory — then crops, saves under the exact
-    /// same `localmind-screenshot-<epoch_ms>.png` pattern `take_screenshot`
-    /// uses (critical: `read_image_base64`'s allowlist only accepts that
+    /// Falls back to the primary monitor's own bounds (GetSystemMetrics,
+    /// origin (0,0)) — today's exact old behavior — whenever the caller
+    /// couldn't resolve a real monitor rect (no overlay window, monitor
+    /// query failed). Never a hard failure: a screenshot that used to work
+    /// before multi-monitor support existed must keep working.
+    fn resolve_capture_rect(rect: Option<(i32, i32, i32, i32)>) -> (i32, i32, i32, i32) {
+        rect.unwrap_or_else(|| unsafe { (0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) })
+    }
+
+    /// Capture only the given rectangle of `monitor_rect` (WP7.1: the
+    /// "circle what you care about" quick-invoke draw flow; WP7.28: now
+    /// multi-monitor aware — `monitor_rect` is whichever monitor the
+    /// overlay window is CURRENTLY sized to, resolved by the caller via
+    /// crate::monitor_at_point, not always the primary one). `x`/`y` are
+    /// relative to that monitor's own top-left, matching what the frontend
+    /// already computes them relative to (the overlay window itself, which
+    /// spans exactly that monitor's bounds — see QuickInvoke.tsx's
+    /// submitWithRegion/submitWithAutoScreenshot). Reuses `capture_monitor`
+    /// for the underlying GDI grab — there's no cheaper Win32 path to a
+    /// sub-rect capture than blitting the whole monitor and cropping in
+    /// memory — then crops, saves under the exact same
+    /// `localmind-screenshot-<epoch_ms>.png` pattern `take_screenshot` uses
+    /// (critical: `read_image_base64`'s allowlist only accepts that
     /// pattern), and OCRs the CROPPED pixels so the recognized text matches
-    /// what's actually in the saved image rather than the whole screen.
-    pub fn capture_region(x: i32, y: i32, width: u32, height: u32) -> Result<ScreenshotResult, String> {
-        let (bgra, full_width, full_height) = capture_primary_monitor()?;
-        let (cropped, crop_width, crop_height, _clamped_x, _clamped_y) =
+    /// what's actually in the saved image rather than the whole monitor.
+    pub fn capture_region(monitor_rect: Option<(i32, i32, i32, i32)>, x: i32, y: i32, width: u32, height: u32) -> Result<ScreenshotResult, String> {
+        let (mx, my, mw, mh) = resolve_capture_rect(monitor_rect);
+        let (bgra, full_width, full_height) = capture_monitor(mx, my, mw, mh)?;
+        let (cropped, crop_width, crop_height, clamped_x, clamped_y) =
             crop_bgra(&bgra, full_width, full_height, x, y, width, height)?;
+
+        // The SAVED IMAGE is this crop, not the whole monitor — so the
+        // monitor_* fields (see ScreenshotResult's doc comment) describe the
+        // crop's own absolute virtual-desktop rect: the monitor's origin
+        // plus however far the clamp shifted the requested rect, exactly
+        // matching what actually got written to `path` below.
+        let (result_x, result_y) = (mx + clamped_x, my + clamped_y);
 
         let epoch_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1077,17 +1159,35 @@ mod windows_impl {
                 path: path_str,
                 ocr_text: text,
                 ocr_available: true,
+                monitor_x: result_x,
+                monitor_y: result_y,
+                monitor_width: crop_width,
+                monitor_height: crop_height,
             }),
             Err(e) => Ok(ScreenshotResult {
                 path: path_str,
                 ocr_text: format!("(OCR unavailable: {e})"),
                 ocr_available: false,
+                monitor_x: result_x,
+                monitor_y: result_y,
+                monitor_width: crop_width,
+                monitor_height: crop_height,
             }),
         }
     }
 
-    pub fn take_screenshot() -> Result<ScreenshotResult, String> {
-        let (bgra, width, height) = capture_primary_monitor()?;
+    /// WP7.28: `monitor_rect` is whichever monitor the OS cursor is
+    /// currently over (resolved by the caller via crate::cursor_monitor_rect
+    /// — a fresh query, unlike capture_region's use of the overlay window's
+    /// own current monitor, since a general take_screenshot call has no
+    /// frontend-computed rect that needs to stay consistent with anything
+    /// else — "capture what I'm looking at right now" is the more correct
+    /// default for this general-purpose call). Falls back to the primary
+    /// monitor (resolve_capture_rect) if that resolution fails for any
+    /// reason.
+    pub fn take_screenshot(monitor_rect: Option<(i32, i32, i32, i32)>) -> Result<ScreenshotResult, String> {
+        let (mx, my, mw, mh) = resolve_capture_rect(monitor_rect);
+        let (bgra, width, height) = capture_monitor(mx, my, mw, mh)?;
 
         let epoch_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1103,10 +1203,18 @@ mod windows_impl {
                 path: path_str,
                 ocr_text: text,
                 ocr_available: true,
+                monitor_x: mx,
+                monitor_y: my,
+                monitor_width: width,
+                monitor_height: height,
             }),
             Err(e) => Ok(ScreenshotResult {
                 path: path_str,
                 ocr_text: format!("(OCR unavailable: {e})"),
+                monitor_x: mx,
+                monitor_y: my,
+                monitor_width: width,
+                monitor_height: height,
                 ocr_available: false,
             }),
         }

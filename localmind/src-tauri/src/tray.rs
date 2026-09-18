@@ -96,10 +96,23 @@ pub fn toggle_overlay(app: &AppHandle) {
     if win.is_visible().unwrap_or(false) {
         let _ = win.hide();
     } else {
+        // Multi-monitor fix: this used to be win.current_monitor() — the
+        // monitor the (hidden, tiny 100x100 placeholder) overlay window
+        // happened to be sitting on from last time, which is NOT where the
+        // user is looking now. Hitting the hotkey while the mouse is on a
+        // different monitor always popped the puck up on the wrong screen.
+        // Resolving by CURSOR position instead — the same point-in-rect
+        // scan highlight_screen_rect already uses, shared via
+        // crate::monitor_at_point — means the overlay always appears on
+        // whichever monitor the user is actually pointing at, and every
+        // physical-pixel rect os_tools.rs's take_screenshot/capture_region
+        // computes downstream from THIS window's own bounds automatically
+        // lands on the same monitor too (see those functions' own comments).
         let monitor = win
-            .current_monitor()
+            .cursor_position()
             .ok()
-            .flatten()
+            .and_then(|pos| crate::monitor_at_point(&win, pos.x, pos.y))
+            .or_else(|| win.current_monitor().ok().flatten())
             .or_else(|| win.primary_monitor().ok().flatten());
 
         if let Some(monitor) = monitor {

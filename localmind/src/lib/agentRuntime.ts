@@ -89,10 +89,35 @@ const READ_ONLY_ALIASES = [
  * (if a user's MCP setup ever genuinely has one) is found first and this
  * never overrides it.
  */
+/**
+ * OpenRouter's literal wording when the selected model has no backend that
+ * accepts image input at all (observed live: a quick-invoke answer was
+ * opened in the full chat window, then a screenshot attached as a
+ * follow-up, sent to a text-only OpenRouter model). Unlike a context-
+ * overflow error, retrying/compacting can't fix this — the MODEL itself is
+ * the problem, so the actionable message is "switch models," surfaced the
+ * same way isContextOverflowError's cases already replace a cryptic raw
+ * provider string with a plain-English, actionable one.
+ */
+function isImageUnsupportedError(message: string | undefined | null): boolean {
+  if (!message) return false;
+  return /no endpoints? found[\s\S]{0,60}image input/i.test(message) || /does(?:n't| not) support image/i.test(message);
+}
+
 const HALLUCINATED_TOOL_FALLBACKS: Record<string, string> = {
   browser__browser_take_screenshot: "take_screenshot",
   browser__take_screenshot: "take_screenshot",
   browser_take_screenshot: "take_screenshot",
+  // Observed live in a quick-invoke run: asked to verify a filled-in web
+  // form's values, the model reached for a Playwright-MCP-shaped
+  // "snapshot"/DOM-dump tool it was never actually offered (quick-invoke
+  // never connects MCP servers at all), got denied with no recovery path,
+  // and burned its remaining rounds before giving up with a fabricated
+  // "message got cut off" excuse — never trying the take_screenshot call
+  // that was sitting right there the whole time and would have answered it.
+  browser__browser_snapshot: "take_screenshot",
+  browser__snapshot: "take_screenshot",
+  browser_snapshot: "take_screenshot",
 };
 
 export interface OpenFileInfo {
@@ -1475,6 +1500,10 @@ export async function runAgentSession(
           } else if (isContextOverflowError(event.error)) {
             config.onTextDelta?.(
               `\n\n*[This model's context window (numCtx=${numCtx}) is too small for this conversation even after aggressive compaction — try a model with a larger context window, or start a new chat.]*`,
+            );
+          } else if (isImageUnsupportedError(event.error)) {
+            config.onTextDelta?.(
+              `\n\n*[${config.modelRef} can't process images — switch to a vision-capable model (a local llava/qwen2-vl pull, or an OpenRouter model that supports image input) and try again.]*`,
             );
           } else {
             config.onTextDelta?.(`\n\n*[Agent error: ${event.error}]*`);

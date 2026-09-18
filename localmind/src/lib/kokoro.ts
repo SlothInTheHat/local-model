@@ -32,6 +32,12 @@ export interface KokoroStatus {
   /** Informational only — whether setup detected an NVIDIA GPU and picked
    *  onnxruntime-gpu over the plain CPU-only package. */
   gpu_detected: boolean;
+  /** espeak-ng — a separate, non-pip-installable system dependency Kokoro's
+   *  phonemizer needs to actually run. Checked independently of venv/model
+   *  readiness since it's an OS-level install LocalMind never performs
+   *  itself; false here is why kokoro_speak would otherwise hang for a full
+   *  minute before failing instead of erroring immediately. */
+  espeak_ready: boolean;
 }
 
 export function getKokoroStatus(): Promise<KokoroStatus> {

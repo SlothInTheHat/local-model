@@ -99,6 +99,39 @@ fn find_system_python() -> Option<(&'static str, Vec<&'static str>)> {
     None
 }
 
+/// Kokoro's phonemizer needs espeak-ng's native library — a real system
+/// install, not something pip can provide. The official Windows distribution
+/// (an .msi, the only one available) always installs to this fixed path, so
+/// checking there directly — rather than only hoping it's on PATH — also
+/// lets spawn_daemon point PHONEMIZER_ESPEAK_LIBRARY/PHONEMIZER_ESPEAK_PATH
+/// at it explicitly. That's not just a convenience: kokoro's own bundled
+/// espeak loader is documented to hard-code a build-time path that doesn't
+/// exist on an end user's machine, so relying on its auto-detection alone is
+/// unreliable even once espeak-ng genuinely is installed — this is the
+/// actual fix for a real observed failure (kokoro_speak hanging for a full
+/// minute before timing out, with no error, on a machine that had never
+/// installed espeak-ng at all).
+#[cfg(target_os = "windows")]
+const ESPEAK_NG_DEFAULT_DIR: &str = r"C:\Program Files\eSpeak NG";
+
+#[cfg(target_os = "windows")]
+fn espeak_ng_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(ESPEAK_NG_DEFAULT_DIR);
+    dir.join("libespeak-ng.dll").exists().then_some(dir)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn espeak_ng_dir() -> Option<PathBuf> {
+    None
+}
+
+/// Where to point the user — kokoro-onnx needs the actual native library,
+/// which LocalMind cannot silently install system-wide on someone's behalf
+/// (same reasoning as find_system_python's "install Python yourself, then
+/// come back" message above).
+const ESPEAK_NG_DOWNLOAD_URL: &str =
+    "https://github.com/espeak-ng/espeak-ng/releases/download/1.52.0/espeak-ng.msi";
+
 /// Cheap presence check for setup-time package selection (onnxruntime-gpu vs
 /// plain onnxruntime — see kokoro_setup's doc comment for why this is a
 /// package-choice decision here, unlike faster-whisper's single wheel that
@@ -122,6 +155,11 @@ pub struct KokoroStatus {
     /// Informational only — surfaced so Settings can tell the user why setup
     /// is about to download the (larger) GPU-capable onnxruntime package.
     gpu_detected: bool,
+    /// Whether espeak-ng (a separate, non-pip-installable system dependency —
+    /// see espeak_ng_dir's doc comment) was found. Checked independently of
+    /// venv_ready/model_ready since it's an OS-level install LocalMind never
+    /// performs itself, and can go missing/present independent of either.
+    espeak_ready: bool,
 }
 
 #[tauri::command]
@@ -132,6 +170,7 @@ pub fn kokoro_status(app: tauri::AppHandle) -> Result<KokoroStatus, String> {
         venv_ready: venv_python(&root).exists(),
         model_ready: model_path(&root).exists() && voices_path(&root).exists(),
         gpu_detected: has_nvidia_gpu(),
+        espeak_ready: espeak_ng_dir().is_some(),
     })
 }
 
@@ -190,8 +229,16 @@ pub fn kokoro_setup(app: tauri::AppHandle) -> Result<String, String> {
     std::fs::write(daemon_script_path(&root), KOKORO_DAEMON_SOURCE)
         .map_err(|e| format!("Failed to write kokoro_daemon.py: {e}"))?;
 
+    let espeak_note = if espeak_ng_dir().is_none() {
+        format!(
+            " Kokoro also needs espeak-ng, a separate system install LocalMind can't perform for you — \
+             download and run the Windows installer from {ESPEAK_NG_DOWNLOAD_URL}, then come back here."
+        )
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "Kokoro is set up ({onnx_package}) — download the voice model next."
+        "Kokoro is set up ({onnx_package}) — download the voice model next.{espeak_note}"
     ))
 }
 
@@ -235,7 +282,14 @@ pub fn kokoro_download_model(app: tauri::AppHandle) -> Result<String, String> {
 
 // ─── Warm Kokoro daemon (mirrors transcribe.rs's whisper daemon exactly) ───
 
-const DAEMON_READ_TIMEOUT: Duration = Duration::from_secs(60);
+// 60s was too tight even for legitimate cold-start synthesis, independent of
+// the espeak-ng hang this now fails fast on above: a cold daemon's FIRST
+// request pays model load (~7s measured) plus a one-time ONNX kernel/thread
+// warm-up on its first-ever inference call (~10s measured for a single short
+// sentence, well above Kokoro's steady-state "2x+ real-time" benchmarks) —
+// and quick-invoke answers run up to 3000 chars (see App.tsx's speakText
+// call), not one sentence. Bumped to match whisper's own daemon timeout.
+const DAEMON_READ_TIMEOUT: Duration = Duration::from_secs(90);
 
 type DaemonLine = Result<String, String>;
 
@@ -266,6 +320,17 @@ fn spawn_daemon(root: &Path) -> Result<DaemonHandle, String> {
     if !model_path(root).exists() || !voices_path(root).exists() {
         return Err("Kokoro's voice model isn't downloaded yet — download it in Settings first.".to_string());
     }
+    // Fail fast and clearly instead of the daemon silently hanging inside
+    // kokoro.create() until DAEMON_READ_TIMEOUT fires — this is exactly the
+    // failure that motivated checking espeak-ng explicitly (see
+    // espeak_ng_dir's doc comment) rather than only discovering its absence
+    // however kokoro-onnx itself eventually would have.
+    let espeak_dir = espeak_ng_dir().ok_or_else(|| {
+        format!(
+            "espeak-ng isn't installed — Kokoro needs it to turn text into speech sounds. \
+             Download and run the Windows installer from {ESPEAK_NG_DOWNLOAD_URL}, then try again."
+        )
+    })?;
 
     // Re-written on every spawn (not just at setup time) so an app update
     // always runs the latest daemon script against an already-set-up venv —
@@ -278,6 +343,11 @@ fn spawn_daemon(root: &Path) -> Result<DaemonHandle, String> {
         .arg(model_path(root))
         .arg(voices_path(root))
         .env("PATH", effective_path())
+        // Explicit, not auto-detected — see espeak_ng_dir's doc comment for
+        // why kokoro's own bundled-loader auto-detection can't be trusted
+        // even when espeak-ng genuinely is installed at this exact path.
+        .env("PHONEMIZER_ESPEAK_LIBRARY", espeak_dir.join("libespeak-ng.dll"))
+        .env("PHONEMIZER_ESPEAK_PATH", &espeak_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -3,6 +3,7 @@ import type { ToolDef, ToolCall } from "./tools";
 import { TOOL_DEFINITIONS } from "./tools";
 import { TauriDirectoryHandle } from "./tauriFs";
 import { runAgentSession, DEFAULT_MAX_ROUNDS } from "./agentRuntime";
+import { runAgentTurnForModel } from "./chatProvider";
 import type { AgentRuntimeConfig } from "./agentRuntime";
 import type { HardwareInfo } from "./hardware";
 import type { AppView } from "../types/app";
@@ -117,7 +118,42 @@ export interface HeadlessTaskOpts {
    * as a round candidate, most of them irrelevant to what it's for.
    */
   restrictToolsToAllowlist?: boolean;
+  /**
+   * WP7.27: fires with a super-short, user-facing label (see
+   * shortStepLabel below) each time a tool call resolves mid-run — quick-
+   * invoke's own request, so the puck can show "what's happening right
+   * now" instead of an opaque spinner for the whole round-tripping loop
+   * (observed live: users had no signal progress was happening at all
+   * during a multi-round run). Deliberately separate from the
+   * onToolCallResolved-driven `steps` array already built below, which is
+   * a developer-facing `[+X.Xs] label → summary` debug trail, not a UI
+   * string. Optional and unused by every other caller (scheduler/
+   * task-queue/subagent/workflow runs never render it).
+   */
+  onStep?: (label: string) => void;
   signal?: AbortSignal;
+}
+
+/** Super-short, glance-and-forget labels for the live progress indicator —
+ *  deliberately NOT the same as the [+X.Xs] debug `label`/`summary` used in
+ *  `steps`, which is meant for a developer reading console output. Falls
+ *  back to a generic "Working…" for any tool not worth a bespoke phrase
+ *  (quick-invoke's own allowlist is small and mostly covered here already). */
+const QUICK_STEP_LABELS: Record<string, string> = {
+  list_windows: "Checking what's open…",
+  uia_list_elements: "Scanning the screen…",
+  highlight_element: "Pointing at it…",
+  take_screenshot: "Looking at your screen…",
+  propose_walkthrough_steps: "Planning the steps…",
+  find_files: "Searching files…",
+  read_file: "Reading a file…",
+  grep_files: "Searching text…",
+  list_directory: "Looking through files…",
+  read_clipboard: "Checking your clipboard…",
+};
+
+function shortStepLabel(toolName: string): string {
+  return QUICK_STEP_LABELS[toolName] ?? "Working…";
 }
 
 /** One step of a model-proposed guided walkthrough — see the
@@ -254,6 +290,7 @@ export async function runHeadlessTask(opts: HeadlessTaskOpts): Promise<HeadlessT
     },
     onApprovalNeeded: (call: ToolCall) => Promise.resolve(allowlist.includes(call.name)),
     onToolCallResolved: (call, label, _result, summary) => {
+      opts.onStep?.(shortStepLabel(call.name));
       // [+X.Xs] prefix — WP7.6 debug timing. Each tool-call resolution is a
       // full model round completing (decide-to-call-this-tool included), so
       // the deltas between consecutive steps below approximate per-round
@@ -302,6 +339,38 @@ export async function runHeadlessTask(opts: HeadlessTaskOpts): Promise<HeadlessT
     roundsUsed = result.roundsUsed;
     hadSideEffects = result.hadSideEffects;
     outcome = result.wasAborted ? "aborted" : result.hitRoundLimit ? "hit_round_limit" : "completed";
+
+    // WP7.26: hitting the round cap while the LAST round was still a tool
+    // call (increasingly common now that some callers — quick-invoke, see
+    // App.tsx — set a deliberately small maxRounds) means transcript is
+    // often completely empty: onTextDelta only ever fires for real text
+    // tokens, and every round here was a tool call, none of them text.
+    // Observed live: an ArcGIS Pro question resolved list_windows →
+    // uia_list_elements → highlight_element → take_screenshot, all useful
+    // groundwork, then hit the cap one round short of ever writing an
+    // answer — the user got nothing. Rather than surface that as blank,
+    // spend ONE more round with NO tools offered (forcing a text-only
+    // reply) over the exact history already built up, so whatever was
+    // actually found still reaches the user instead of being discarded a
+    // round short of finishing. Only when transcript is genuinely empty —
+    // a run that hit the cap AFTER already writing something (rare, but
+    // possible if text and a final tool call interleave) keeps that text
+    // as-is rather than risking a second, possibly worse answer.
+    if (result.hitRoundLimit && !transcript.trim() && config.toolsSupported) {
+      try {
+        const finalPrompt: ChatMessage = {
+          role: "user",
+          content:
+            "No more tool calls are available now — based on everything above, give your best answer in plain text immediately.",
+        };
+        for await (const event of runAgentTurnForModel(opts.modelRef, [...result.finalHistory, finalPrompt], [], signal)) {
+          if (event.type === "text_delta" && event.content) transcript += event.content;
+        }
+      } catch (err) {
+        console.error("[headless] forced final-answer round failed:", err);
+      }
+    }
+
     // Marks the end of generation even when zero tool calls happened at all
     // (a plain text-only answer never fires onToolCallResolved) — without
     // this, a run with no tool calls would show an empty [+Xs] trail despite

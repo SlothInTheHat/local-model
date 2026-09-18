@@ -354,8 +354,24 @@ export function QuickInvoke() {
   // Dictation (WP7.2) state machine — mirrors ChatInput.tsx's
   // idle/recording/transcribing exactly, minus the Web Speech browser-dev
   // fallback (the overlay only ever runs inside Tauri).
-  const [micState, setMicState] = useState<"idle" | "recording" | "transcribing">("idle");
+  // WP7.25: "starting" is the async gap between the hotkey opening the
+  // overlay and the mic actually being ready to capture (getUserMedia +
+  // MediaRecorder setup — a real device-negotiation cost, typically a few
+  // hundred ms). It used to be invisible: micState stayed "idle" the whole
+  // time, so nothing distinguished "not listening yet" from "listening,
+  // nothing said" — the user had no way to know the first words of anything
+  // said immediately on hotkey-press could be silently lost. See the puck
+  // JSX below for what this renders as.
+  const [micState, setMicState] = useState<"idle" | "starting" | "recording" | "transcribing">("idle");
   const [micError, setMicError] = useState<string | null>(null);
+  // WP7.27: the "running" phase's 3-dot indicator gave no sense that
+  // anything was actually happening during a multi-round tool-calling run —
+  // this holds the latest super-short step label App.tsx emits per resolved
+  // tool call (see handleQuickInvokeWidget's onStep), rendered next to the
+  // puck for exactly that phase. null outside "running" (or for a run with
+  // no tool calls at all, e.g. the fast path — there's simply nothing to
+  // report then, and the plain 3-dot indicator alone is correct).
+  const [progressLabel, setProgressLabel] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const dictationSessionRef = useRef<DictationSession | null>(null);
   // Web Speech recognizer, when the "Browser speech" dictation engine is on.
@@ -419,6 +435,11 @@ export function QuickInvoke() {
   // its right each frame, so the dot's own centering point never shifts as
   // the text next to it grows/shrinks while typing.
   const puckTextRef = useRef<HTMLDivElement>(null);
+  // WP7.27: positioned identically to puckTextRef (same imperative
+  // left/top math in the render loop) but shown only during "running" —
+  // the two are never mounted at the same time (listening vs. running are
+  // mutually exclusive phases), so there's no need to share one element.
+  const progressTextRef = useRef<HTMLDivElement>(null);
 
   // ─── Puck spring-physics ("glides... sways a bit to feel alive") ───────
   //
@@ -910,6 +931,7 @@ export function QuickInvoke() {
       setMicError("Microphone capture isn't supported in this build.");
       return;
     }
+    setMicState("starting");
     try {
       // onSilence: once the user stops talking, stop and auto-submit rather
       // than waiting for another click/Ctrl+M — this is the hands-free loop
@@ -946,6 +968,7 @@ export function QuickInvoke() {
    */
   async function beginWalkthroughListening(): Promise<void> {
     if (!isDictationSupported()) return;
+    setMicState("starting");
     try {
       const session = await startDictation({ onSilence: () => void handleWalkthroughSilence(), onLevel: handleAudioLevel });
       dictationSessionRef.current = session;
@@ -1017,7 +1040,7 @@ export function QuickInvoke() {
    *  escape, since this window has no error-boundary machinery worth
    *  disturbing over a failed mic click. */
   async function toggleDictation(): Promise<void> {
-    if (micState === "transcribing") return; // ignore clicks/Ctrl+M mid-transcription
+    if (micState === "transcribing" || micState === "starting") return; // ignore clicks/Ctrl+M mid-transcription or while the mic is still opening
 
     // "Browser speech" engine: stream words in real time via the Web Speech
     // API instead of the record-then-transcribe whisper path.
@@ -1113,6 +1136,13 @@ export function QuickInvoke() {
       }
     };
     rec.onend = () => setMicState("idle");
+    // onstart fires once the recognition service has actually opened the
+    // mic and begun listening — the real "ready" signal, same reasoning as
+    // beginListening's "starting" state below. Before this, setMicState
+    // stayed "recording" the instant .start() was CALLED, not once
+    // recognition actually began, hiding the exact same device-open gap.
+    rec.onstart = () => setMicState("recording");
+    setMicState("starting");
     try {
       rec.start();
     } catch {
@@ -1120,7 +1150,6 @@ export function QuickInvoke() {
       return;
     }
     recognitionRef.current = rec;
-    setMicState("recording");
   }
 
   /**
@@ -1412,30 +1441,33 @@ export function QuickInvoke() {
       startHoverWatch();
       return () => stopHoverWatch();
     }
-    if (phase === "running") {
+    if (phase === "running" || micState === "transcribing") {
       // WP7.19 (actual fix — the WP7.10 comment this replaces claimed this
       // already worked, but the code below it set ignoreCursorEvents(false)
       // for "running" too, i.e. fully INTERACTIVE, which is backwards: that
-      // makes this window swallow every click across the whole screen for
-      // as long as a request is in flight — exactly "can't interact with my
-      // computer while it's thinking." The puck's onClick/onContextMenu are
-      // both explicitly gated to phase === "listening" only (see the puck
-      // JSX below) — there is nothing clickable on screen during "running",
-      // so unlike "listening" this phase has no reason to ever accept
-      // input at all.
+      // makes this window swallow every click/scroll across the whole
+      // screen for as long as a request is in flight — exactly "can't click
+      // or scroll while it's thinking/transcribing." The puck's
+      // onClick/onContextMenu are both explicitly gated to
+      // phase === "listening" only (see the puck JSX below), and
+      // toggleDictation itself no-ops mid-transcription — so neither
+      // "running" nor a "listening" phase currently stuck transcribing has
+      // anything clickable on screen, and neither has any reason to ever
+      // accept input at all.
       stopHoverWatch();
       setWindowIgnoreCursorEvents(true);
       return;
     }
-    // "listening" — the puck IS click/right-click interactive (stop
-    // dictation, arm Draw mode) and follows the cursor everywhere, so
-    // there's no FIXED region to hover-watch against the way showing-result/
-    // walkthrough-active have — the whole window has to stay interactive
-    // for the entire phase. A click landing elsewhere on screen while still
-    // composing a prompt is the accepted trade-off this phase makes.
+    // "listening", actively recording or idle (NOT transcribing, handled
+    // above) — the puck IS click/right-click interactive (stop dictation,
+    // arm Draw mode) and follows the cursor everywhere, so there's no FIXED
+    // region to hover-watch against the way showing-result/walkthrough-active
+    // have — the whole window has to stay interactive for the entire phase.
+    // A click landing elsewhere on screen while still composing a prompt is
+    // the accepted trade-off this phase makes.
     stopHoverWatch();
     setWindowIgnoreCursorEvents(false);
-  }, [phase, highlightOnly]);
+  }, [phase, highlightOnly, micState]);
 
   // ─── quick-result: the widget-mode run's progress/answer (WP7.4, ported
   // from the deleted src/result/ResultWidget.tsx) ─────────────────────────
@@ -1452,6 +1484,7 @@ export function QuickInvoke() {
 
       if (event.payload.status === "running") {
         setPhase("running");
+        setProgressLabel(null);
         // submitWithRegion/submitWithAutoScreenshot hid this window right
         // before capturing a clean screenshot — bring it back now that the
         // pet (still chasing the cursor — see WP7.10) has something to show
@@ -1459,6 +1492,7 @@ export function QuickInvoke() {
         showWithoutFocus();
         return;
       }
+      setProgressLabel(null);
 
       // done | error — WP7.10: THIS is where the pet actually freezes, at
       // wherever the spring animation currently is (not the raw cursor
@@ -1488,6 +1522,27 @@ export function QuickInvoke() {
           );
         }
       }
+    });
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  // ─── WP7.27: live "what's happening" progress label ────────────────────
+  //
+  // Fired by App.tsx's handleQuickInvokeWidget (onStep) once per resolved
+  // tool call, mid-run — a super-short label ("Pointing at it…", "Looking
+  // at your screen…") so the puck's 3-dot indicator isn't the only signal
+  // that a multi-round tool-calling run is actually making progress, not
+  // just stuck. No handshake to worry about, same reasoning as quick-result
+  // above: registered on mount, long before any run could emit one. A
+  // stray event arriving after the run's own "running"/"done" transitions
+  // (a slow IPC round-trip landing late) is harmless — it just briefly
+  // shows a stale label until the next phase change clears it via the
+  // quick-result listener above.
+  useEffect(() => {
+    const unlistenPromise = listen<{ label: string }>("quick-progress", (event) => {
+      setProgressLabel(event.payload.label);
     });
     return () => {
       void unlistenPromise.then((unlisten) => unlisten());
@@ -1724,6 +1779,10 @@ export function QuickInvoke() {
           const dotSize = micStateRef.current === "recording" ? PUCK_RECORDING_SIZE_PX : PUCK_IDLE_SIZE_PX;
           puckTextRef.current.style.left = `${renderedX + dotSize / 2 + 8}px`;
           puckTextRef.current.style.top = `${renderedY}px`;
+        }
+        if (progressTextRef.current) {
+          progressTextRef.current.style.left = `${renderedX + PUCK_IDLE_SIZE_PX / 2 + 8}px`;
+          progressTextRef.current.style.top = `${renderedY}px`;
         }
 
         if (micStateRef.current === "recording") {
@@ -2303,9 +2362,11 @@ export function QuickInvoke() {
               phase === "walkthrough-active"
                 ? "Walkthrough in progress"
                 : phase === "running"
-                ? "Thinking…"
+                ? progressLabel ?? "Thinking…"
                 : micState === "transcribing"
                 ? "Transcribing…"
+                : micState === "starting"
+                ? "Opening microphone — wait a moment before speaking…"
                 : drawMode
                 ? "Drawing armed — right-click to stop"
                 : micState === "recording"
@@ -2313,7 +2374,35 @@ export function QuickInvoke() {
                 : "Click to dictate, right-click to draw a region"
             }
           >
-            {micState === "transcribing" ? (
+            {phase === "running" ? (
+              // WP7.20: "..." thinking indicator, replacing the old plain
+              // animate-pulse dot — three small dots with a staggered
+              // animate-bounce delay so they ripple rather than bounce in
+              // unison, the universal "thinking" visual. Checked before the
+              // micState branches below since "running" only ever starts
+              // once micState is already back to "idle" (recording/
+              // transcribing both belong to composing the prompt, before
+              // submit) — this always wins once a request is actually
+              // in flight.
+              <div
+                className="flex items-center justify-center gap-[3px]"
+                style={{
+                  width: PUCK_IDLE_SIZE_PX,
+                  height: PUCK_IDLE_SIZE_PX,
+                  borderRadius: "9999px",
+                  background: BUTTON_DARK,
+                  boxShadow: "0 4px 12px rgba(0,0,0,0.25)",
+                }}
+              >
+                {[0, 150, 300].map((delayMs) => (
+                  <div
+                    key={delayMs}
+                    className="rounded-full bg-white animate-bounce"
+                    style={{ width: 3, height: 3, animationDelay: `${delayMs}ms` }}
+                  />
+                ))}
+              </div>
+            ) : micState === "transcribing" ? (
               // WP7.11: the transcribing spinner used to live in the
               // separate text-row element, offset to the dot's right —
               // reported as looking wrong ("not on top of the circle, to
@@ -2333,6 +2422,26 @@ export function QuickInvoke() {
               >
                 <Loader2 className="animate-spin text-white" style={{ width: PUCK_IDLE_SIZE_PX * 0.6, height: PUCK_IDLE_SIZE_PX * 0.6 }} />
               </div>
+            ) : micState === "starting" ? (
+              // WP7.25: the mic is opening (getUserMedia/MediaRecorder or
+              // SpeechRecognition device negotiation — a real few-hundred-ms
+              // cost) but isn't capturing yet — anything said right now would
+              // be lost. Dimmed + pulsing, same size/position as the idle
+              // dot, so it reads as "not ready" without introducing a whole
+              // new shape the user has to learn — deliberately distinct from
+              // both the solid idle dot (ready) and the waveform (actually
+              // hearing you).
+              <div
+                className="animate-pulse"
+                style={{
+                  width: PUCK_IDLE_SIZE_PX,
+                  height: PUCK_IDLE_SIZE_PX,
+                  borderRadius: "9999px",
+                  background: BUTTON_DARK,
+                  opacity: 0.45,
+                  boxShadow: "0 4px 12px rgba(0,0,0,0.25)",
+                }}
+              />
             ) : micState === "recording" ? (
               // Waveform: live mic level (dictation.ts's onLevel, via
               // levelHistoryRef), bars updated imperatively every frame in
@@ -2365,9 +2474,10 @@ export function QuickInvoke() {
             ) : (
               // Idle dot — "a little cursor," not a button. drawMode gets
               // the ink color so it's visible at a glance that drawing is
-              // armed even at this size.
+              // armed even at this size. phase === "running" is handled
+              // above now (the three-dot indicator), so this is only ever
+              // reached while still "listening" and idle.
               <div
-                className={phase === "running" ? "animate-pulse" : ""}
                 style={{
                   width: PUCK_IDLE_SIZE_PX,
                   height: PUCK_IDLE_SIZE_PX,
@@ -2381,6 +2491,22 @@ export function QuickInvoke() {
               />
             )}
           </div>
+
+          {/* WP7.27: live "what's happening" label — same plain-text,
+              no-chrome treatment as the input below, positioned the same
+              way next to the puck. Only rendered once there's an actual
+              label to show (a run with zero tool calls, e.g. the fast
+              path, has nothing to report and correctly shows nothing here,
+              just the 3-dot indicator). */}
+          {phase === "running" && progressLabel && (
+            <div
+              ref={progressTextRef}
+              className="absolute z-10 flex items-center pointer-events-none"
+              style={{ left: 0, top: 0, transform: "translateY(-50%)" }}
+            >
+              <span className="text-sm font-sans text-muted-foreground whitespace-nowrap">{progressLabel}</span>
+            </div>
+          )}
 
           {/* Typed/transcribed text — plain, no background/border/pill (per
               product decision: "make it like a little cursor," not a search

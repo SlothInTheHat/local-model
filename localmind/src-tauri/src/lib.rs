@@ -523,6 +523,50 @@ pub(crate) fn effective_path() -> &'static str {
     EFFECTIVE_PATH.get_or_init(compute_effective_path)
 }
 
+/// Finds whichever monitor (from `win.available_monitors()`) contains the
+/// given point, in physical virtual-desktop pixels — falls back to the
+/// primary monitor if the point doesn't land inside any of them (should be
+/// unreachable on a real display, but cheap insurance against a monitor
+/// hot-unplugged between the point being sampled and this call). Reused by
+/// `toggle_overlay` (tray.rs — position the overlay on the CURSOR's
+/// monitor, not wherever it happened to be last) and by the screenshot
+/// capture commands in os_tools.rs (capture the RIGHT monitor on a
+/// multi-monitor setup instead of always the primary one). Mirrors the
+/// exact point-in-rect scan `highlight_screen_rect` (tray.rs) already used
+/// for its own target rect's center point — kept here, not there, so
+/// os_tools.rs can reuse it too without a cross-module dependency on tray.
+pub(crate) fn monitor_at_point(win: &tauri::WebviewWindow, x: f64, y: f64) -> Option<tauri::Monitor> {
+    let monitors = win.available_monitors().ok()?;
+    monitors
+        .into_iter()
+        .find(|m| {
+            let pos = m.position();
+            let size = m.size();
+            x >= pos.x as f64
+                && x < pos.x as f64 + size.width as f64
+                && y >= pos.y as f64
+                && y < pos.y as f64 + size.height as f64
+        })
+        .or_else(|| win.primary_monitor().ok().flatten())
+}
+
+/// The monitor (physical virtual-desktop origin + size, as `(x, y, width,
+/// height)`) the OS cursor is currently over — `None` only if no monitor
+/// could be resolved at all (essentially unreachable on a real machine, no
+/// display attached). Queries cursor position via `win`'s own
+/// `cursor_position()`, a global OS query independent of that particular
+/// window's own position/visibility (see `get_cursor_position`'s doc
+/// comment in tray.rs) — any live window works as the handle to call it
+/// through, so callers just pass whichever one they already have (in
+/// practice always "overlay", the only window guaranteed to exist).
+pub(crate) fn cursor_monitor_rect(win: &tauri::WebviewWindow) -> Option<(i32, i32, i32, i32)> {
+    let cursor = win.cursor_position().ok()?;
+    let monitor = monitor_at_point(win, cursor.x, cursor.y)?;
+    let pos = monitor.position();
+    let size = monitor.size();
+    Some((pos.x, pos.y, size.width as i32, size.height as i32))
+}
+
 mod mcp;
 use mcp::{mcp_start_server, mcp_stop_server, mcp_send_request};
 

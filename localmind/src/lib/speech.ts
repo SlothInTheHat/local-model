@@ -91,8 +91,20 @@ export function speakUtterance(text: string, voice: SpeechSynthesisVoice | null)
 export async function speakText(text: string, selectedVoiceName: string | null): Promise<void> {
   const kokoroVoice = decodeKokoroVoiceSelection(selectedVoiceName);
   if (kokoroVoice) {
-    await speakWithKokoro(text, kokoroVoice);
-    return;
+    try {
+      await speakWithKokoro(text, kokoroVoice);
+      return;
+    } catch (err) {
+      // Never let a Kokoro failure (daemon hiccup, a transient timeout, a
+      // playback error) produce total silence with no indication anything
+      // went wrong — callers only .catch()-and-log this function's
+      // rejection (see QuickInvoke.tsx), so a thrown error here was
+      // observed live as "no audio at all, nothing in the UI." Falling
+      // through to the Web Speech voice below means a Kokoro failure is
+      // at worst audible-but-robotic instead of silent, and still logged
+      // for anyone who does check devtools.
+      console.error("[speech] Kokoro synthesis failed, falling back to Web Speech:", err);
+    }
   }
 
   if (typeof window === "undefined" || !("speechSynthesis" in window)) {

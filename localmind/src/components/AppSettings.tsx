@@ -894,6 +894,13 @@ function DesktopIntegrationSection() {
               <p className="text-xs font-medium text-foreground">
                 Kokoro — offline neural voices (much less robotic than the system ones above)
               </p>
+              {kokoroStatus && !kokoroStatus.espeak_ready && (
+                <p className="text-[11px] text-destructive">
+                  espeak-ng isn't installed — Kokoro needs it to actually speak (a separate system install, not
+                  something LocalMind can set up for you). Download and run the Windows installer from{" "}
+                  https://github.com/espeak-ng/espeak-ng/releases/download/1.52.0/espeak-ng.msi, then come back here.
+                </p>
+              )}
               {!kokoroStatus ? (
                 <p className="text-[11px] text-muted-foreground italic">Checking status…</p>
               ) : !kokoroStatus.venv_ready ? (
